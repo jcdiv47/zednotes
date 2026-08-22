@@ -6,7 +6,7 @@
 
 **Status:** ready-for-human
 
-- [~] Fork of current Zed exists with `origin` (personal) and `upstream` (zed-industries/zed) remotes configured — `upstream` configured (push disabled); `origin` deliberately deferred, see Comments
+- [x] Fork of current Zed exists with `origin` (personal) and `upstream` (zed-industries/zed) remotes configured — `origin` points to `jcdiv47/zednotes`; `upstream` push remains disabled
 - [x] The existing zednotes repo content (source spec, AGENTS.md, docs/agents, .scratch) is preserved in or alongside the fork per the user's preference — nothing lost
 - [x] A new `notes_app` crate is registered in the Cargo workspace as a binary
 - [x] `cargo run -p notes_app` opens an empty GPUI window with native macOS traffic lights and a working window lifecycle (close quits cleanly)
@@ -52,3 +52,15 @@ could not be screenshotted or queried from here.
 **Environment note:** building requires the macOS Metal toolchain
 (`xcodebuild -downloadComponent MetalToolchain`, ~690 MB) — `gpui_apple`'s build script compiles
 `shaders.metal` and fails without it.
+
+**2026-08-22 — acceptance verification completed.**
+
+Configured `origin` as `https://github.com/jcdiv47/zednotes.git`; `git ls-remote origin` completed
+successfully. The GitHub repository is currently empty and has not been pushed to as part of this
+ticket verification. `upstream` still fetches from `zed-industries/zed` and has its push URL disabled.
+
+Computer Use inspected a live build launched from a temporary app bundle. macOS exposed native
+close, full-screen, and minimize accessibility controls, matching the visible red, green, and yellow
+traffic lights. Clicking green entered full screen; clicking yellow minimized the window and the
+window could be raised again; clicking red closed the last window, after which the app was no longer
+running. This completes the previously outstanding visual and close-to-quit verification.

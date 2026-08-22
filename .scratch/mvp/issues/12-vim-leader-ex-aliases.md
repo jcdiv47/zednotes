@@ -1,0 +1,14 @@
+# 12 — Vim leader layer + Ex command aliases
+
+**What to build:** The Space leader layer that makes the whole app home-row reachable, mapped onto the actions earlier tickets created (no duplicate implementations): `<Space>ff` quick open, `<Space>fg` search all notes, `<Space>fn` new note, `<Space>fr` recent note, `<Space>p` command palette, `<Space>e` toggle explorer, `<Space>v` toggle preview, `<Space>b n/p/d` buffer next/previous/close, `<Space>w h/j/k/l` pane focus, `<Space>w v/s` splits, `<Space>s f/p` search file/workspace. Plus the Ex command line: keep Zed's `:`-into-palette approach with `:w :q :wq :q! :x :e` and app aliases `:preview :explorer :notes :search`.
+
+**Blocked by:** 04 — Markdown preview; 05 — Quick open + command palette; 07 — Workspace full-text search.
+
+**Status:** ready-for-agent
+
+- [ ] All listed `<Space>` mappings fire the same GPUI actions as their `Cmd` shortcuts and palette entries
+- [ ] Leader mappings only apply in Vim NORMAL mode in the editor; `<Space>` in INSERT mode types a space
+- [ ] The leader key is configurable via settings (`vim.leader`)
+- [ ] `:w :q :wq :q! :x :e` work; `:preview :explorer :notes :search` invoke the corresponding app actions
+- [ ] `<Space>w v`/`<Space>w s` create vertical/horizontal splits; `<Space>w h/j/k/l` move focus between panes; two notes side by side works
+- [ ] Notes-specific Vim mapping tests exist for `<Space>ff`, `<Space>fg`, `<Space>e`, `<Space>v`

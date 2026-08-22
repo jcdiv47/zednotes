@@ -11270,6 +11270,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "notes_app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "gpui_platform",
+]
+
+[[package]]
 name = "notifications"
 version = "0.1.0"
 dependencies = [

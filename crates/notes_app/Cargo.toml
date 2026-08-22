@@ -1,0 +1,25 @@
+[package]
+name = "notes_app"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/notes_app.rs"
+doctest = false
+
+[[bin]]
+name = "notes_app"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+gpui_platform = { workspace = true, features = ["font-kit"] }
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

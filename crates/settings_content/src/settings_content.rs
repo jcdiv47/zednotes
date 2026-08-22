@@ -1238,6 +1238,15 @@ pub struct MarkdownPreviewSettingsContent {
     ///
     /// Default: 800
     pub max_width: Option<PixelSetting>,
+    /// Whether images referenced by HTTP or HTTPS URLs may be loaded.
+    ///
+    /// Default: true
+    pub allow_remote_images: Option<bool>,
+    /// The maximum Markdown source size, in bytes, that renders without
+    /// explicit confirmation. `null` disables the size guard.
+    ///
+    /// Default: null
+    pub max_file_size_bytes: Option<u64>,
 }
 
 /// The settings for the image viewer.

@@ -11,12 +11,13 @@ use client::{Client, UserStore};
 use editor::Editor;
 use fs::{Fs, RealFs};
 use gpui::{
-    App, AppContext as _, BorrowAppContext as _, Bounds, KeyBinding, Menu, MenuItem,
-    PathPromptOptions, TaskExt as _, TitlebarOptions, Window, WindowBounds, WindowHandle,
+    App, AppContext as _, BorrowAppContext as _, Bounds, Focusable as _, KeyBinding, Menu,
+    MenuItem, PathPromptOptions, TaskExt as _, TitlebarOptions, Window, WindowBounds, WindowHandle,
     WindowOptions, actions, px, size,
 };
 use http_client::BlockedHttpClient;
 use language::{Language, LanguageRegistry};
+use markdown_preview::markdown_preview_view::MarkdownPreviewView;
 use node_runtime::NodeRuntime;
 use project::{LocalProjectFlags, Project};
 use project_panel::{EntryFilter, ProjectPanel, project_panel_settings::ProjectPanelSettings};
@@ -28,11 +29,13 @@ use settings::{DockSide, KeybindSource, KeymapFile, Settings as _, SettingsStore
 use theme::{ActiveTheme as _, LoadThemes};
 use vim::ModeIndicator;
 use workspace as zed_workspace;
-use zed_workspace::{AppState, MultiWorkspace, Workspace, WorkspaceStore};
+use zed_workspace::{AppState, MultiWorkspace, SaveIntent, Workspace, WorkspaceStore};
 
 const APP_NAME: &str = "zednotes";
 const NOTE_FILE_NAME: &str = "spike.md";
 const DEFAULT_EXCLUDED_PATHS: &[&str] = &[".git", ".DS_Store", "node_modules", "target"];
+const DEFAULT_PREVIEW_MAX_WIDTH: u32 = 760;
+const DEFAULT_PREVIEW_MAX_FILE_SIZE_BYTES: u64 = 5 * 1024 * 1024;
 
 actions!(
     notes,
@@ -60,11 +63,38 @@ actions!(
     ]
 );
 
+actions!(
+    note,
+    [
+        /// Toggles a preview split for the active note.
+        TogglePreview,
+        /// Opens the active note as a preview-only tab.
+        OpenPreview,
+    ]
+);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ExplorerSettings {
     markdown_only: bool,
     show_hidden: bool,
     excluded_paths: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PreviewSettings {
+    max_width: u32,
+    allow_remote_images: bool,
+    max_file_size_bytes: Option<u64>,
+}
+
+impl Default for PreviewSettings {
+    fn default() -> Self {
+        Self {
+            max_width: DEFAULT_PREVIEW_MAX_WIDTH,
+            allow_remote_images: false,
+            max_file_size_bytes: Some(DEFAULT_PREVIEW_MAX_FILE_SIZE_BYTES),
+        }
+    }
 }
 
 impl Default for ExplorerSettings {
@@ -84,6 +114,7 @@ impl Default for ExplorerSettings {
 struct NotesSettingsContent {
     explorer: Option<ExplorerSettingsContent>,
     files: Option<FileSettingsContent>,
+    preview: Option<PreviewSettingsContent>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -95,6 +126,13 @@ struct ExplorerSettingsContent {
 #[derive(Debug, Default, Deserialize)]
 struct FileSettingsContent {
     exclude: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PreviewSettingsContent {
+    max_width: Option<u32>,
+    allow_remote_images: Option<bool>,
+    max_file_size_bytes: Option<u64>,
 }
 
 fn parse_explorer_settings(content: &str) -> Result<ExplorerSettings> {
@@ -111,6 +149,20 @@ fn parse_explorer_settings(content: &str) -> Result<ExplorerSettings> {
     Ok(settings)
 }
 
+fn parse_preview_settings(content: &str) -> Result<PreviewSettings> {
+    let content = settings::parse_json_with_comments::<NotesSettingsContent>(content)
+        .context("failed to parse zednotes settings")?;
+    let mut settings = PreviewSettings::default();
+    if let Some(preview) = content.preview {
+        settings.max_width = preview.max_width.unwrap_or(settings.max_width);
+        settings.allow_remote_images = preview
+            .allow_remote_images
+            .unwrap_or(settings.allow_remote_images);
+        settings.max_file_size_bytes = preview.max_file_size_bytes.or(settings.max_file_size_bytes);
+    }
+    Ok(settings)
+}
+
 fn explorer_settings_path() -> PathBuf {
     paths::home_dir()
         .join(".config")
@@ -122,6 +174,14 @@ fn load_explorer_settings() -> Result<ExplorerSettings> {
     match std::fs::read_to_string(explorer_settings_path()) {
         Ok(content) => parse_explorer_settings(&content),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(ExplorerSettings::default()),
+        Err(error) => Err(error).context("failed to read zednotes settings"),
+    }
+}
+
+fn load_preview_settings() -> Result<PreviewSettings> {
+    match std::fs::read_to_string(explorer_settings_path()) {
+        Ok(content) => parse_preview_settings(&content),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(PreviewSettings::default()),
         Err(error) => Err(error).context("failed to read zednotes settings"),
     }
 }
@@ -210,6 +270,7 @@ fn init_editor_subsystems(cx: &mut App) -> Result<()> {
     zed_actions::init();
     command_palette::init(cx);
     editor::init(cx);
+    markdown_preview::init(cx);
     project_panel::init(cx);
     search::init(cx);
     vim::init(cx);
@@ -228,6 +289,7 @@ fn init_editor_subsystems(cx: &mut App) -> Result<()> {
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-shift-v", TogglePreview, None),
         KeyBinding::new(
             "cmd-s",
             zed_workspace::Save { save_intent: None },
@@ -237,6 +299,10 @@ fn init_editor_subsystems(cx: &mut App) -> Result<()> {
     cx.set_menus([
         Menu::new(APP_NAME).items([MenuItem::action("Quit", Quit)]),
         Menu::new("File").items([MenuItem::action("Open Folder…", OpenFolder)]),
+        Menu::new("Note").items([
+            MenuItem::action("Toggle Preview", TogglePreview),
+            MenuItem::action("Open Preview", OpenPreview),
+        ]),
         Menu::new("View").items([MenuItem::action("Toggle Hidden Files", ToggleHiddenFiles)]),
     ]);
     cx.on_window_closed(|cx, _window_id| {
@@ -277,6 +343,71 @@ fn apply_explorer_settings(settings: &ExplorerSettings, cx: &mut App) {
             }
         });
     });
+}
+
+fn apply_preview_settings(settings: &PreviewSettings, cx: &mut App) {
+    cx.update_global::<SettingsStore, _>(|store, cx| {
+        store.update_default_settings(cx, |content| {
+            let preview = content.markdown_preview.get_or_insert_default();
+            preview.limit_content_width = Some(true);
+            preview.max_width = Some((settings.max_width as f32).into());
+            preview.allow_remote_images = Some(settings.allow_remote_images);
+            preview.max_file_size_bytes = settings.max_file_size_bytes;
+        });
+    });
+}
+
+fn close_preview(
+    workspace: &mut Workspace,
+    preview: gpui::Entity<MarkdownPreviewView>,
+    window: &mut Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    let source_editor = preview.read(cx).source_editor();
+    let Some(pane) = workspace.pane_for_item_id(preview.entity_id()) else {
+        return;
+    };
+    pane.update(cx, |pane, cx| {
+        pane.close_item_by_id(preview.entity_id(), SaveIntent::Skip, window, cx)
+    })
+    .detach_and_log_err(cx);
+    if let Some(source_editor) = source_editor {
+        source_editor.focus_handle(cx).focus(window, cx);
+    }
+}
+
+fn toggle_preview(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    if let Some(preview) = workspace.active_item_as::<MarkdownPreviewView>(cx) {
+        close_preview(workspace, preview, window, cx);
+        return;
+    }
+
+    let Some(editor) = MarkdownPreviewView::resolve_active_item_as_markdown_editor(workspace, cx)
+    else {
+        return;
+    };
+    let existing_preview = workspace
+        .items_of_type::<MarkdownPreviewView>(cx)
+        .find(|preview| preview.read(cx).is_previewing_editor(&editor, cx));
+    if let Some(preview) = existing_preview {
+        close_preview(workspace, preview, window, cx);
+    } else {
+        let pane = workspace.active_pane().clone();
+        MarkdownPreviewView::open_preview_to_the_side_of_pane(workspace, editor, pane, window, cx);
+    }
+}
+
+fn open_preview(workspace: &mut Workspace, window: &mut Window, cx: &mut gpui::Context<Workspace>) {
+    let Some(editor) = MarkdownPreviewView::resolve_active_item_as_markdown_editor(workspace, cx)
+    else {
+        return;
+    };
+    let pane = workspace.active_pane().clone();
+    MarkdownPreviewView::open_preview_in_pane(workspace, editor, pane, window, cx);
 }
 
 fn init_workspace_composition(
@@ -321,6 +452,12 @@ fn init_workspace_composition(
         workspace.register_action(|workspace, _: &FocusEditor, window, cx| {
             workspace.focus_center_pane(window, cx);
         });
+        workspace.register_action(|workspace, _: &TogglePreview, window, cx| {
+            toggle_preview(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &OpenPreview, window, cx| {
+            open_preview(workspace, window, cx);
+        });
 
         let panel_task = cx.spawn_in(window, {
             let entry_filter = entry_filter.clone();
@@ -350,7 +487,9 @@ pub fn init(session: Session, cx: &mut App) -> Result<Arc<AppState>> {
     settings::init(cx);
     theme_settings::init(LoadThemes::All(Box::new(Assets)), cx);
     let explorer_settings = load_explorer_settings()?;
+    let preview_settings = load_preview_settings()?;
     apply_explorer_settings(&explorer_settings, cx);
+    apply_preview_settings(&preview_settings, cx);
 
     let fs: Arc<dyn Fs> = Arc::new(RealFs::new(None, cx.background_executor().clone()));
     <dyn Fs>::set_global(fs.clone(), cx);
@@ -478,7 +617,7 @@ mod tests {
     use super::*;
     use command_palette_hooks::GlobalCommandPaletteInterceptor;
     use fs::FakeFs;
-    use gpui::{Focusable as _, TestAppContext, VisualTestContext};
+    use gpui::{TestAppContext, VisualTestContext};
     use project::ProjectPath;
     use serde_json::{Value, json};
     use settings::SettingsStore;
@@ -509,6 +648,7 @@ mod tests {
             AppState::set_global(app_state.clone(), cx);
             zed_workspace::init(app_state.clone(), cx);
             apply_explorer_settings(&explorer_settings, cx);
+            apply_preview_settings(&PreviewSettings::default(), cx);
             init_editor_subsystems(cx).expect("failed to initialize editor test subsystems");
             init_workspace_composition(app_state.clone(), explorer_settings, cx);
             app_state
@@ -750,6 +890,108 @@ mod tests {
                 excluded_paths: vec!["drafts".to_owned(), "**/*.tmp".to_owned()],
             }
         );
+    }
+
+    #[test]
+    fn test_parses_preview_settings_from_jsonc() {
+        let settings = parse_preview_settings(
+            r#"
+            {
+                "preview": {
+                    "max_width": 680,
+                    "allow_remote_images": true,
+                    "max_file_size_bytes": 2048,
+                },
+            }
+            "#,
+        )
+        .expect("settings should parse");
+
+        assert_eq!(
+            settings,
+            PreviewSettings {
+                max_width: 680,
+                allow_remote_images: true,
+                max_file_size_bytes: Some(2048),
+            }
+        );
+    }
+
+    #[gpui::test]
+    async fn test_preview_defaults_are_readable_offline_and_guard_large_files(
+        cx: &mut TestAppContext,
+    ) {
+        let _test = test_window(cx).await;
+
+        let settings = cx.update(|cx| {
+            *markdown_preview::markdown_preview_settings::MarkdownPreviewSettings::get_global(cx)
+        });
+        assert_eq!(settings.max_width, Some(px(760.)));
+        assert!(!settings.allow_remote_images);
+        assert_eq!(
+            settings.max_file_size_bytes,
+            Some(DEFAULT_PREVIEW_MAX_FILE_SIZE_BYTES)
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cmd_shift_v_toggles_editor_preview_split(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+
+        test.cx.simulate_keystrokes("cmd-shift-v");
+        test.cx.run_until_parked();
+
+        let workspace = test
+            .window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("failed to read the notes window");
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.panes().len()),
+            2
+        );
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .items_of_type::<MarkdownPreviewView>(cx)
+                .count()),
+            1
+        );
+        test.cx.update(|window, cx| {
+            assert!(test.editor.read(cx).focus_handle(cx).is_focused(window));
+        });
+
+        test.cx.simulate_keystrokes("cmd-shift-v");
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.panes().len()),
+            1
+        );
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .items_of_type::<MarkdownPreviewView>(cx)
+                .count()),
+            0
+        );
+    }
+
+    #[gpui::test]
+    async fn test_open_preview_opens_preview_only_in_the_editor_pane(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+
+        test.cx.dispatch_action(OpenPreview);
+        test.cx.run_until_parked();
+
+        test.window
+            .read_with(cx, |multi_workspace, cx| {
+                let workspace = multi_workspace.workspace().read(cx);
+                assert_eq!(workspace.panes().len(), 1);
+                assert!(
+                    workspace
+                        .active_item_as::<MarkdownPreviewView>(cx)
+                        .is_some()
+                );
+            })
+            .expect("failed to read the notes window");
     }
 
     #[gpui::test]

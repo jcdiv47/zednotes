@@ -29,7 +29,8 @@ use theme::{SystemAppearance, Theme, ThemeRegistry};
 use theme_settings::ThemeSettings;
 use ui::utils::WithRemSize;
 use ui::{
-    ContextMenu, LinkPreview, ScrollAxes, Scrollbars, WithScrollbar, prelude::*, right_click_menu,
+    Button, ButtonStyle, ContextMenu, LinkPreview, ScrollAxes, Scrollbars, WithScrollbar,
+    prelude::*, right_click_menu,
 };
 use util::{
     ResultExt,
@@ -53,7 +54,7 @@ use crate::{
 };
 use crate::{ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, ScrollUp, ScrollUpByItem};
 
-const REPARSE_DEBOUNCE: Duration = Duration::from_millis(200);
+const REPARSE_DEBOUNCE: Duration = Duration::from_millis(150);
 
 pub struct MarkdownPreviewView {
     workspace: WeakEntity<Workspace>,
@@ -66,6 +67,9 @@ pub struct MarkdownPreviewView {
     image_cache: Entity<RetainAllImageCache>,
     base_directory: Option<PathBuf>,
     pending_update_task: Option<Task<Result<()>>>,
+    pending_update_is_debounced: bool,
+    large_document_size: Option<u64>,
+    large_document_rendering_approved: bool,
     hovered_url: Option<SharedString>,
     mode: MarkdownPreviewMode,
     /// Search results depend on the parsed markdown, which lags behind the source while a
@@ -111,6 +115,16 @@ pub enum MarkdownPreviewEvent {
 enum PreviewLinkTarget {
     Heading(SharedString),
     Position { row: u32, column: u32 },
+}
+
+enum MarkdownUpdate {
+    Render {
+        contents: SharedString,
+        selection_start: usize,
+    },
+    Disabled {
+        source_size: u64,
+    },
 }
 
 impl MarkdownPreviewView {
@@ -232,6 +246,21 @@ impl MarkdownPreviewView {
         })
     }
 
+    pub fn is_previewing_editor(&self, editor: &Entity<Editor>, cx: &App) -> bool {
+        editor
+            .read(cx)
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .is_some_and(|buffer| self.is_previewing(&buffer, cx))
+    }
+
+    pub fn source_editor(&self) -> Option<Entity<Editor>> {
+        self.active_editor
+            .as_ref()
+            .map(|state| state.editor.clone())
+    }
+
     pub fn resolve_active_item_as_markdown_editor(
         workspace: &Workspace,
         cx: &mut Context<Workspace>,
@@ -327,6 +356,9 @@ impl MarkdownPreviewView {
                 image_cache: RetainAllImageCache::new(cx),
                 base_directory: None,
                 pending_update_task: None,
+                pending_update_is_debounced: false,
+                large_document_size: None,
+                large_document_rendering_approved: false,
                 hovered_url: None,
                 mode,
                 markdown_parse_pending: false,
@@ -481,6 +513,8 @@ impl MarkdownPreviewView {
 
         self.base_directory = Self::get_folder_for_active_editor(editor.read(cx), cx);
         self.hovered_url = None;
+        self.large_document_size = None;
+        self.large_document_rendering_approved = false;
         self.active_editor = Some(EditorState {
             editor,
             _subscription: subscription,
@@ -539,10 +573,13 @@ impl MarkdownPreviewView {
         cx: &mut Context<Self>,
     ) {
         if let Some(state) = &self.active_editor {
-            // if there is already a task to update the ui and the current task is also debounced (not high priority), do nothing
-            if wait_for_debounce && self.pending_update_task.is_some() {
+            if wait_for_debounce
+                && self.pending_update_task.is_some()
+                && !self.pending_update_is_debounced
+            {
                 return;
             }
+            self.pending_update_is_debounced = wait_for_debounce;
             self.pending_update_task = Some(self.schedule_markdown_update(
                 wait_for_debounce,
                 should_reveal,
@@ -576,34 +613,71 @@ impl MarkdownPreviewView {
                     return None;
                 }
 
+                let maximum_source_size =
+                    MarkdownPreviewSettings::get_global(cx).max_file_size_bytes;
+                let rendering_approved = view.large_document_rendering_approved;
                 editor.update(cx, |editor, cx| {
-                    let contents = editor
-                        .buffer()
-                        .read(cx)
-                        .as_singleton()?
-                        .read(cx)
-                        .as_rope()
-                        .to_string()
-                        .into();
+                    let buffer = editor.buffer().read(cx).as_singleton()?;
+                    let source_size = buffer.read(cx).as_rope().len() as u64;
                     let selection_start = Self::selected_source_index(editor, cx)?;
-                    Some((contents, selection_start))
+                    if !rendering_approved
+                        && maximum_source_size.is_some_and(|maximum| source_size > maximum)
+                    {
+                        return Some(MarkdownUpdate::Disabled { source_size });
+                    }
+                    let contents = buffer.read(cx).as_rope().to_string().into();
+                    Some(MarkdownUpdate::Render {
+                        contents,
+                        selection_start,
+                    })
                 })
             })?;
 
             view.update(cx, move |view, cx| {
-                if let Some((contents, selection_start)) = update {
-                    view.hovered_url = None;
-                    view.markdown.update(cx, |markdown, cx| {
-                        markdown.reset(contents, cx);
-                    });
-                    view.markdown_parse_pending = view.markdown.read(cx).is_parsing();
-                    view.sync_preview_to_source_index(selection_start, should_reveal_selection, cx);
-                    cx.emit(SearchEvent::MatchesInvalidated);
+                match update {
+                    Some(MarkdownUpdate::Render {
+                        contents,
+                        selection_start,
+                    }) => {
+                        view.large_document_size = None;
+                        view.hovered_url = None;
+                        view.markdown.update(cx, |markdown, cx| {
+                            markdown.reset(contents, cx);
+                        });
+                        view.markdown_parse_pending = view.markdown.read(cx).is_parsing();
+                        view.sync_preview_to_source_index(
+                            selection_start,
+                            should_reveal_selection,
+                            cx,
+                        );
+                        cx.emit(SearchEvent::MatchesInvalidated);
+                    }
+                    Some(MarkdownUpdate::Disabled { source_size }) => {
+                        view.large_document_size = Some(source_size);
+                        view.hovered_url = None;
+                        view.markdown.update(cx, |markdown, cx| {
+                            markdown.reset(SharedString::default(), cx);
+                        });
+                        view.markdown_parse_pending = false;
+                        cx.emit(SearchEvent::MatchesInvalidated);
+                    }
+                    None => {}
                 }
                 view.pending_update_task = None;
+                view.pending_update_is_debounced = false;
                 cx.notify();
             })
         })
+    }
+
+    fn render_large_document(
+        &mut self,
+        _: &gpui::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.large_document_rendering_approved = true;
+        self.update_markdown_from_active_editor(false, true, window, cx);
     }
 
     fn selected_source_index(editor: &Editor, cx: &mut App) -> Option<usize> {
@@ -990,7 +1064,14 @@ impl MarkdownPreviewView {
             .show_root_block_markers()
             .image_resolver({
                 let base_directory = self.base_directory.clone();
+                let allow_remote_images =
+                    MarkdownPreviewSettings::get_global(cx).allow_remote_images;
                 move |dest_url, cx| {
+                    if !allow_remote_images
+                        && (dest_url.starts_with("http://") || dest_url.starts_with("https://"))
+                    {
+                        return None;
+                    }
                     resolve_preview_image(
                         dest_url,
                         base_directory.as_deref(),
@@ -1645,6 +1726,100 @@ impl Render for MarkdownPreviewView {
             .unwrap_or_else(|| cx.theme().colors().editor_background);
         let preview_font_size = ThemeSettings::get_global(cx).markdown_preview_font_size(cx);
         let hovered_url = self.hovered_url.clone();
+        let preview_content = if let Some(source_size) = self.large_document_size {
+            div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    v_flex()
+                        .items_center()
+                        .gap_3()
+                        .child("Preview disabled for large document")
+                        .child(
+                            div()
+                                .text_color(cx.theme().colors().text_muted)
+                                .child(format!(
+                                    "This note is {:.1} MiB.",
+                                    source_size as f64 / (1024.0 * 1024.0)
+                                )),
+                        )
+                        .child(
+                            Button::new("render-large-markdown", "Render Anyway")
+                                .style(ButtonStyle::Filled)
+                                .on_click(cx.listener(Self::render_large_document)),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            let markdown_element = self.render_markdown_element(&preview_theme, window, cx);
+            let markdown = self.markdown.clone();
+            let max_width = MarkdownPreviewSettings::get_global(cx).max_width;
+            let content = right_click_menu("markdown-preview-context-menu")
+                .trigger(move |_, _, _| markdown_element)
+                .maybe_menu(move |window, cx| {
+                    let focus = window.focused(cx);
+                    let markdown = markdown.read(cx);
+                    let context_menu_link = markdown.context_menu_link().cloned();
+                    let selected_text = markdown.context_menu_selected_text().cloned();
+                    let selected_markdown = markdown.context_menu_selected_markdown().cloned();
+                    if context_menu_link.is_none()
+                        && selected_text.is_none()
+                        && selected_markdown.is_none()
+                    {
+                        return None;
+                    }
+                    Some(ContextMenu::build(window, cx, move |menu, _, _cx| {
+                        menu.when_some(focus, |menu, focus| menu.context(focus))
+                            .when_some(selected_text, |menu, text| {
+                                menu.entry("Copy", Some(Box::new(markdown::Copy)), move |_, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        text.to_string(),
+                                    ));
+                                })
+                            })
+                            .when_some(selected_markdown, |menu, text| {
+                                menu.entry(
+                                    "Copy as Markdown",
+                                    Some(Box::new(markdown::CopyAsMarkdown)),
+                                    move |_, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            text.to_string(),
+                                        ));
+                                    },
+                                )
+                            })
+                            .when_some(context_menu_link, |menu, url| {
+                                menu.entry("Copy Link", None, move |_, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        url.to_string(),
+                                    ));
+                                })
+                            })
+                    }))
+                });
+            WithRemSize::new(preview_font_size)
+                .size_full()
+                .child(
+                    div()
+                        .id("markdown-preview-scroll-container")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll_handle)
+                        .restrict_scroll_to_axis()
+                        .p_4()
+                        .child(
+                            div()
+                                .w_full()
+                                .when_some(max_width, |this, max_width| {
+                                    this.max_w(max_width).mx_auto()
+                                })
+                                .child(content),
+                        ),
+                )
+                .into_any_element()
+        };
         div()
             .image_cache(self.image_cache.clone())
             .id("MarkdownPreview")
@@ -1672,82 +1847,7 @@ impl Render for MarkdownPreviewView {
             .min_h_0()
             .relative()
             .bg(bg_color)
-            .child(
-                WithRemSize::new(preview_font_size).size_full().child(
-                    div()
-                        .id("markdown-preview-scroll-container")
-                        .size_full()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.scroll_handle)
-                        .restrict_scroll_to_axis()
-                        .p_4()
-                        .child({
-                            let markdown_element =
-                                self.render_markdown_element(&preview_theme, window, cx);
-                            let markdown = self.markdown.clone();
-                            let max_width = MarkdownPreviewSettings::get_global(cx).max_width;
-                            let content = right_click_menu("markdown-preview-context-menu")
-                                .trigger(move |_, _, _| markdown_element)
-                                .maybe_menu(move |window, cx| {
-                                    let focus = window.focused(cx);
-                                    let markdown = markdown.read(cx);
-                                    let context_menu_link = markdown.context_menu_link().cloned();
-                                    let selected_text =
-                                        markdown.context_menu_selected_text().cloned();
-                                    let selected_markdown =
-                                        markdown.context_menu_selected_markdown().cloned();
-                                    if context_menu_link.is_none()
-                                        && selected_text.is_none()
-                                        && selected_markdown.is_none()
-                                    {
-                                        return None;
-                                    }
-                                    Some(ContextMenu::build(window, cx, move |menu, _, _cx| {
-                                        menu.when_some(focus, |menu, focus| menu.context(focus))
-                                            .when_some(selected_text, |menu, text| {
-                                                menu.entry(
-                                                    "Copy",
-                                                    Some(Box::new(markdown::Copy)),
-                                                    move |_, cx| {
-                                                        cx.write_to_clipboard(
-                                                            ClipboardItem::new_string(
-                                                                text.to_string(),
-                                                            ),
-                                                        );
-                                                    },
-                                                )
-                                            })
-                                            .when_some(selected_markdown, |menu, text| {
-                                                menu.entry(
-                                                    "Copy as Markdown",
-                                                    Some(Box::new(markdown::CopyAsMarkdown)),
-                                                    move |_, cx| {
-                                                        cx.write_to_clipboard(
-                                                            ClipboardItem::new_string(
-                                                                text.to_string(),
-                                                            ),
-                                                        );
-                                                    },
-                                                )
-                                            })
-                                            .when_some(context_menu_link, |menu, url| {
-                                                menu.entry("Copy Link", None, move |_, cx| {
-                                                    cx.write_to_clipboard(
-                                                        ClipboardItem::new_string(url.to_string()),
-                                                    );
-                                                })
-                                            })
-                                    }))
-                                });
-                            div()
-                                .w_full()
-                                .when_some(max_width, |this, max_width| {
-                                    this.max_w(max_width).mx_auto()
-                                })
-                                .child(content)
-                        }),
-                ),
-            )
+            .child(preview_content)
             .custom_scrollbars(
                 Scrollbars::for_settings::<EditorSettingsScrollbarProxy>()
                     .show_along(ScrollAxes::Vertical)
@@ -2095,11 +2195,13 @@ mod tests {
     use editor::Editor;
     use fs::FakeFs;
     use gpui::{
-        App, AppContext as _, Entity, Focusable as _, Modifiers, TestAppContext, WindowHandle, px,
+        App, AppContext as _, BorrowAppContext as _, Entity, Focusable as _, Modifiers,
+        TestAppContext, WindowHandle, px,
     };
     use language::{Buffer, DiskState, Point};
     use project::{Project, ProjectPath};
     use serde_json::json;
+    use settings::SettingsStore;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
@@ -3428,6 +3530,91 @@ mod tests {
             })
             .unwrap();
         (multi_workspace, editor)
+    }
+
+    #[gpui::test]
+    async fn preview_refresh_debounce_restarts_after_each_edit(cx: &mut TestAppContext) {
+        let (multi_workspace, editor) = open_markdown_file(cx, "note.md", "initial").await;
+        let preview = open_preview_for_active_editor(cx, &multi_workspace);
+        cx.run_until_parked();
+
+        editor.update(cx, |editor, cx| {
+            let end = editor.buffer().read(cx).snapshot(cx).len();
+            editor.edit([(end..end, " first")], cx);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+
+        editor.update(cx, |editor, cx| {
+            let end = editor.buffer().read(cx).snapshot(cx).len();
+            editor.edit([(end..end, " second")], cx);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(51));
+        cx.run_until_parked();
+
+        assert_eq!(
+            preview.read_with(cx, |preview, cx| preview
+                .markdown
+                .read(cx)
+                .source()
+                .to_string()),
+            "initial",
+            "the first edit's timer must not refresh while a newer edit is still settling"
+        );
+
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        assert_eq!(
+            preview.read_with(cx, |preview, cx| preview
+                .markdown
+                .read(cx)
+                .source()
+                .to_string()),
+            "initial first second"
+        );
+    }
+
+    #[gpui::test]
+    async fn large_documents_require_explicit_render_approval(cx: &mut TestAppContext) {
+        let (multi_workspace, _) =
+            open_markdown_file(cx, "large.md", "# Larger than the configured limit\n").await;
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_default_settings(cx, |settings| {
+                    settings
+                        .markdown_preview
+                        .get_or_insert_default()
+                        .max_file_size_bytes = Some(8);
+                });
+            });
+        });
+        let preview = open_preview_for_active_editor(cx, &multi_workspace);
+        cx.run_until_parked();
+
+        preview.read_with(cx, |preview, cx| {
+            assert!(preview.large_document_size.is_some());
+            assert!(preview.markdown.read(cx).source().is_empty());
+        });
+
+        multi_workspace
+            .update(cx, |_, window, cx| {
+                preview.update(cx, |preview, cx| {
+                    preview.large_document_rendering_approved = true;
+                    preview.update_markdown_from_active_editor(false, true, window, cx);
+                });
+            })
+            .expect("failed to approve the large preview");
+        cx.run_until_parked();
+
+        preview.read_with(cx, |preview, cx| {
+            assert_eq!(preview.large_document_size, None);
+            assert_eq!(
+                preview.markdown.read(cx).source().as_ref(),
+                "# Larger than the configured limit\n"
+            );
+        });
     }
 
     fn open_preview_for_active_editor(

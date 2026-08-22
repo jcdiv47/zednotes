@@ -11287,6 +11287,7 @@ dependencies = [
  "grammars",
  "http_client",
  "language",
+ "markdown_preview",
  "node_runtime",
  "paths",
  "project",

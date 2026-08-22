@@ -125,6 +125,11 @@
     // The maximum width, in pixels, of the rendered markdown content when
     // limit_content_width is enabled.
     "max_width": 800,
+    // Whether images referenced by HTTP or HTTPS URLs may be loaded.
+    "allow_remote_images": true,
+    // Maximum Markdown source size, in bytes, that renders without explicit
+    // confirmation. Set to null to disable the size guard.
+    "max_file_size_bytes": null,
   },
   // Determines the modifier to be used to add multiple cursors with the mouse. The open hover link mouse gestures will adapt such that it do not conflict with the multicursor modifier.
   //

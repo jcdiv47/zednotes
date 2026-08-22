@@ -3,7 +3,7 @@
 //! Everything notes-specific lives in this crate rather than in the generic Zed
 //! crates of the fork, so that merges from `upstream` stay cheap.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{io::ErrorKind, path::Path, path::PathBuf, sync::Arc};
 
 use anyhow::{Context as _, Result};
 use assets::Assets;
@@ -11,23 +11,28 @@ use client::{Client, UserStore};
 use editor::Editor;
 use fs::{Fs, RealFs};
 use gpui::{
-    App, AppContext as _, BorrowAppContext as _, Bounds, KeyBinding, Menu, MenuItem, TaskExt as _,
-    TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions, actions, px, size,
+    App, AppContext as _, BorrowAppContext as _, Bounds, KeyBinding, Menu, MenuItem,
+    PathPromptOptions, TaskExt as _, TitlebarOptions, Window, WindowBounds, WindowHandle,
+    WindowOptions, actions, px, size,
 };
 use http_client::BlockedHttpClient;
 use language::{Language, LanguageRegistry};
 use node_runtime::NodeRuntime;
 use project::{LocalProjectFlags, Project};
+use project_panel::{EntryFilter, ProjectPanel, project_panel_settings::ProjectPanelSettings};
 use search::BufferSearchBar;
 use semver::Version;
+use serde::Deserialize;
 use session::{AppSession, Session};
-use settings::{KeybindSource, KeymapFile, SettingsStore};
+use settings::{DockSide, KeybindSource, KeymapFile, Settings as _, SettingsStore};
 use theme::{ActiveTheme as _, LoadThemes};
 use vim::ModeIndicator;
-use workspace::{AppState, MultiWorkspace, Workspace, WorkspaceStore};
+use workspace as zed_workspace;
+use zed_workspace::{AppState, MultiWorkspace, Workspace, WorkspaceStore};
 
 const APP_NAME: &str = "zednotes";
 const NOTE_FILE_NAME: &str = "spike.md";
+const DEFAULT_EXCLUDED_PATHS: &[&str] = &[".git", ".DS_Store", "node_modules", "target"];
 
 actions!(
     notes,
@@ -36,6 +41,112 @@ actions!(
         Quit,
     ]
 );
+
+actions!(
+    workspace,
+    [
+        /// Opens a directory as the notes workspace.
+        OpenFolder,
+    ]
+);
+
+actions!(
+    explorer,
+    [
+        /// Toggles hidden files in the explorer.
+        ToggleHiddenFiles,
+        /// Returns focus from the explorer to the active editor.
+        FocusEditor,
+    ]
+);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExplorerSettings {
+    markdown_only: bool,
+    show_hidden: bool,
+    excluded_paths: Vec<String>,
+}
+
+impl Default for ExplorerSettings {
+    fn default() -> Self {
+        Self {
+            markdown_only: true,
+            show_hidden: false,
+            excluded_paths: DEFAULT_EXCLUDED_PATHS
+                .iter()
+                .map(|path| (*path).to_owned())
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct NotesSettingsContent {
+    explorer: Option<ExplorerSettingsContent>,
+    files: Option<FileSettingsContent>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ExplorerSettingsContent {
+    markdown_only: Option<bool>,
+    show_hidden: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileSettingsContent {
+    exclude: Option<Vec<String>>,
+}
+
+fn parse_explorer_settings(content: &str) -> Result<ExplorerSettings> {
+    let content = settings::parse_json_with_comments::<NotesSettingsContent>(content)
+        .context("failed to parse zednotes settings")?;
+    let mut settings = ExplorerSettings::default();
+    if let Some(explorer) = content.explorer {
+        settings.markdown_only = explorer.markdown_only.unwrap_or(settings.markdown_only);
+        settings.show_hidden = explorer.show_hidden.unwrap_or(settings.show_hidden);
+    }
+    if let Some(excluded_paths) = content.files.and_then(|files| files.exclude) {
+        settings.excluded_paths = excluded_paths;
+    }
+    Ok(settings)
+}
+
+fn explorer_settings_path() -> PathBuf {
+    paths::home_dir()
+        .join(".config")
+        .join(APP_NAME)
+        .join("settings.json")
+}
+
+fn load_explorer_settings() -> Result<ExplorerSettings> {
+    match std::fs::read_to_string(explorer_settings_path()) {
+        Ok(content) => parse_explorer_settings(&content),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(ExplorerSettings::default()),
+        Err(error) => Err(error).context("failed to read zednotes settings"),
+    }
+}
+
+fn exclusion_glob(path: &str) -> String {
+    if path.contains('/') || path.contains('*') || path.contains('?') {
+        path.to_owned()
+    } else {
+        format!("**/{path}")
+    }
+}
+
+fn markdown_entry_filter(markdown_only: bool) -> EntryFilter {
+    Arc::new(move |path: &Path, is_directory| {
+        is_directory
+            || !markdown_only
+            || path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("md")
+                        || extension.eq_ignore_ascii_case("markdown")
+                })
+    })
+}
 
 fn hard_coded_note_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(NOTE_FILE_NAME)
@@ -73,6 +184,25 @@ fn load_editor_keymaps(cx: &mut App) -> Result<()> {
         }
         cx.bind_keys(key_bindings);
     }
+    cx.bind_keys([
+        KeyBinding::new("cmd-o", OpenFolder, None),
+        KeyBinding::new(
+            "enter",
+            project_panel::OpenPermanent,
+            Some("ProjectPanel && not_editing"),
+        ),
+        KeyBinding::new(
+            "o",
+            project_panel::OpenPermanent,
+            Some("ProjectPanel && not_editing"),
+        ),
+        KeyBinding::new(
+            "l",
+            project_panel::OpenPermanent,
+            Some("ProjectPanel && not_editing"),
+        ),
+        KeyBinding::new("q", FocusEditor, Some("ProjectPanel && not_editing")),
+    ]);
     Ok(())
 }
 
@@ -80,6 +210,7 @@ fn init_editor_subsystems(cx: &mut App) -> Result<()> {
     zed_actions::init();
     command_palette::init(cx);
     editor::init(cx);
+    project_panel::init(cx);
     search::init(cx);
     vim::init(cx);
     // Vim activates its settings observer at the end of this effect cycle, so
@@ -97,14 +228,17 @@ fn init_editor_subsystems(cx: &mut App) -> Result<()> {
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-w", workspace::CloseWindow, None),
         KeyBinding::new(
             "cmd-s",
-            workspace::Save { save_intent: None },
+            zed_workspace::Save { save_intent: None },
             Some("Editor"),
         ),
     ]);
-    cx.set_menus([Menu::new(APP_NAME).items([MenuItem::action("Quit", Quit)])]);
+    cx.set_menus([
+        Menu::new(APP_NAME).items([MenuItem::action("Quit", Quit)]),
+        Menu::new("File").items([MenuItem::action("Open Folder…", OpenFolder)]),
+        Menu::new("View").items([MenuItem::action("Toggle Hidden Files", ToggleHiddenFiles)]),
+    ]);
     cx.on_window_closed(|cx, _window_id| {
         if cx.windows().is_empty() {
             cx.quit();
@@ -115,12 +249,108 @@ fn init_editor_subsystems(cx: &mut App) -> Result<()> {
     Ok(())
 }
 
+fn apply_explorer_settings(settings: &ExplorerSettings, cx: &mut App) {
+    let excluded_paths = settings
+        .excluded_paths
+        .iter()
+        .map(|path| exclusion_glob(path))
+        .collect::<Vec<_>>();
+    let hide_hidden = !settings.show_hidden;
+    cx.update_global::<SettingsStore, _>(|store, cx| {
+        store.update_default_settings(cx, |content| {
+            let project_panel = content.project_panel.get_or_insert_default();
+            project_panel.dock = Some(DockSide::Left);
+            project_panel.starts_open = Some(true);
+            project_panel.hide_gitignore = Some(true);
+            project_panel.hide_hidden = Some(hide_hidden);
+            project_panel.auto_fold_dirs = Some(false);
+
+            let exclusions = content
+                .project
+                .worktree
+                .file_scan_exclusions
+                .get_or_insert_default();
+            for excluded_path in excluded_paths {
+                if !exclusions.0.contains(&excluded_path) {
+                    exclusions.0.push(excluded_path);
+                }
+            }
+        });
+    });
+}
+
+fn init_workspace_composition(
+    app_state: Arc<AppState>,
+    explorer_settings: ExplorerSettings,
+    cx: &mut App,
+) {
+    let entry_filter = markdown_entry_filter(explorer_settings.markdown_only);
+    cx.observe_new(move |workspace: &mut Workspace, window, cx| {
+        let Some(window) = window else {
+            return;
+        };
+
+        configure_workspace(workspace, window, cx);
+
+        workspace.register_action({
+            let app_state = app_state.clone();
+            move |workspace, _: &OpenFolder, window, cx| {
+                zed_workspace::prompt_for_open_path_and_open(
+                    workspace,
+                    app_state.clone(),
+                    PathPromptOptions {
+                        files: false,
+                        directories: true,
+                        multiple: false,
+                        prompt: Some("Open Notes Folder".into()),
+                    },
+                    false,
+                    window,
+                    cx,
+                );
+            }
+        });
+        workspace.register_action(|_: &mut Workspace, _: &ToggleHiddenFiles, _, cx| {
+            let hide_hidden = ProjectPanelSettings::get_global(cx).hide_hidden;
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_default_settings(cx, |content| {
+                    content.project_panel.get_or_insert_default().hide_hidden = Some(!hide_hidden);
+                });
+            });
+        });
+        workspace.register_action(|workspace, _: &FocusEditor, window, cx| {
+            workspace.focus_center_pane(window, cx);
+        });
+
+        let panel_task = cx.spawn_in(window, {
+            let entry_filter = entry_filter.clone();
+            async move |workspace, cx| {
+                let panel = ProjectPanel::load_with_entry_filter(
+                    workspace.clone(),
+                    entry_filter,
+                    cx.clone(),
+                )
+                .await?;
+                workspace.update_in(cx, |workspace, window, cx| {
+                    workspace.add_panel(panel, window, cx);
+                    workspace.finish_dock_restoration(cx);
+                })?;
+                anyhow::Ok(())
+            }
+        });
+        workspace.set_panels_task(panel_task);
+    })
+    .detach();
+}
+
 /// Initializes the local-only services needed by the file-backed editor.
 pub fn init(session: Session, cx: &mut App) -> Result<Arc<AppState>> {
     release_channel::init(Version::new(0, 1, 0), cx);
     gpui_tokio::init(cx);
     settings::init(cx);
     theme_settings::init(LoadThemes::All(Box::new(Assets)), cx);
+    let explorer_settings = load_explorer_settings()?;
+    apply_explorer_settings(&explorer_settings, cx);
 
     let fs: Arc<dyn Fs> = Arc::new(RealFs::new(None, cx.background_executor().clone()));
     <dyn Fs>::set_global(fs.clone(), cx);
@@ -147,8 +377,9 @@ pub fn init(session: Session, cx: &mut App) -> Result<Arc<AppState>> {
     });
 
     AppState::set_global(app_state.clone(), cx);
-    workspace::init(app_state.clone(), cx);
+    zed_workspace::init(app_state.clone(), cx);
     init_editor_subsystems(cx)?;
+    init_workspace_composition(app_state.clone(), explorer_settings, cx);
     Ok(app_state)
 }
 
@@ -189,22 +420,26 @@ fn open_notes_window_for_path(
     path: PathBuf,
     cx: &mut App,
 ) -> Result<WindowHandle<MultiWorkspace>> {
+    let root_path = path
+        .parent()
+        .context("the initial note must have a parent directory")?
+        .to_owned();
+    let worktree = project.update(cx, |project, cx| {
+        project.find_or_create_worktree(root_path, true, cx)
+    });
     let buffer = project.update(cx, |project, cx| project.open_local_buffer(&path, cx));
     let options = notes_window_options(None, cx);
     let window_handle = cx.open_window(options, {
         let project = project.clone();
         move |window, cx| {
             window.set_window_title(APP_NAME);
-            let workspace = cx.new(|cx| {
-                let mut workspace = Workspace::new(None, project, app_state, window, cx);
-                configure_workspace(&mut workspace, window, cx);
-                workspace
-            });
+            let workspace = cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
             cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
         }
     })?;
 
     cx.spawn(async move |cx| {
+        worktree.await?;
         let buffer = buffer.await?;
         window_handle.update(cx, |multi_workspace, window, cx| {
             let workspace = multi_workspace.workspace().clone();
@@ -243,28 +478,44 @@ mod tests {
     use super::*;
     use command_palette_hooks::GlobalCommandPaletteInterceptor;
     use fs::FakeFs;
-    use gpui::{TestAppContext, VisualTestContext};
-    use serde_json::json;
+    use gpui::{Focusable as _, TestAppContext, VisualTestContext};
+    use project::ProjectPath;
+    use serde_json::{Value, json};
     use settings::SettingsStore;
     use std::path::Path;
+    use util::rel_path::rel_path;
 
     const TEST_NOTE_PATH: &str = "/notes/spike.md";
     const TEST_NOTE: &str = "# Spike\n\n- **fast** editing\n";
 
-    async fn test_window(
+    struct TestWindow {
+        fs: Arc<FakeFs>,
+        project: gpui::Entity<Project>,
+        editor: gpui::Entity<Editor>,
+        window: WindowHandle<MultiWorkspace>,
+        cx: VisualTestContext,
+    }
+
+    async fn test_window_with(
         cx: &mut TestAppContext,
-    ) -> (Arc<FakeFs>, gpui::Entity<Editor>, VisualTestContext) {
-        cx.update(|cx| {
+        explorer_settings: ExplorerSettings,
+        tree: Value,
+        initial_note_path: &str,
+    ) -> TestWindow {
+        let app_state = cx.update(|cx| {
             let settings = SettingsStore::test(cx);
             cx.set_global(settings);
-            theme_settings::init(LoadThemes::JustBase, cx);
+            let app_state = AppState::test(cx);
+            AppState::set_global(app_state.clone(), cx);
+            zed_workspace::init(app_state.clone(), cx);
+            apply_explorer_settings(&explorer_settings, cx);
             init_editor_subsystems(cx).expect("failed to initialize editor test subsystems");
+            init_workspace_composition(app_state.clone(), explorer_settings, cx);
+            app_state
         });
 
-        let app_state = cx.update(AppState::test);
         let fs = app_state.fs.as_fake().clone();
-        fs.insert_tree("/notes", json!({ "spike.md": TEST_NOTE }))
-            .await;
+        fs.insert_tree("/notes", tree).await;
         let project = Project::test(app_state.fs.clone(), [Path::new("/notes")], cx).await;
         project.read_with(cx, |project, _| {
             project.languages().add(
@@ -279,7 +530,12 @@ mod tests {
 
         let window = cx
             .update(|cx| {
-                open_notes_window_for_path(app_state, project, PathBuf::from(TEST_NOTE_PATH), cx)
+                open_notes_window_for_path(
+                    app_state,
+                    project.clone(),
+                    PathBuf::from(initial_note_path),
+                    cx,
+                )
             })
             .expect("failed to open the notes window");
         let window_cx = VisualTestContext::from_window(window.into(), cx);
@@ -293,7 +549,84 @@ mod tests {
                     .expect("the Markdown editor should be active")
             })
             .expect("failed to read the notes window");
-        (fs, editor, window_cx)
+        TestWindow {
+            fs,
+            project,
+            editor,
+            window,
+            cx: window_cx,
+        }
+    }
+
+    async fn test_window(cx: &mut TestAppContext) -> TestWindow {
+        test_window_with(
+            cx,
+            ExplorerSettings::default(),
+            json!({ "spike.md": TEST_NOTE }),
+            TEST_NOTE_PATH,
+        )
+        .await
+    }
+
+    fn project_path(
+        project: &gpui::Entity<Project>,
+        path: &str,
+        cx: &TestAppContext,
+    ) -> ProjectPath {
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .visible_worktrees(cx)
+                .next()
+                .expect("test project should have a visible worktree")
+                .read(cx)
+                .id()
+        });
+        ProjectPath {
+            worktree_id,
+            path: rel_path(path).into(),
+        }
+    }
+
+    fn focus_project_path(test: &mut TestWindow, path: &str, cx: &mut TestAppContext) {
+        let project_path = project_path(&test.project, path, cx);
+        test.cx.update(|window, cx| {
+            let workspace =
+                Workspace::for_window(window, cx).expect("test window should contain a workspace");
+            let panel = workspace
+                .read(cx)
+                .panel::<ProjectPanel>(cx)
+                .expect("notes workspace should contain a project panel");
+            panel.update(cx, |panel, cx| {
+                panel.select_path_for_test(project_path, cx);
+            });
+            workspace.update(cx, |workspace, cx| {
+                workspace.focus_panel::<ProjectPanel>(window, cx);
+            });
+        });
+    }
+
+    fn active_editor_path(test: &TestWindow, cx: &TestAppContext) -> PathBuf {
+        test.window
+            .read_with(cx, |multi_workspace, cx| {
+                let editor = multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .active_item_as::<Editor>(cx)
+                    .expect("an editor should be active");
+                editor
+                    .read(cx)
+                    .buffer()
+                    .read(cx)
+                    .as_singleton()
+                    .and_then(|buffer| {
+                        buffer
+                            .read(cx)
+                            .file()
+                            .and_then(|file| file.as_local().map(|file| file.abs_path(cx)))
+                    })
+                    .expect("active editor should be file-backed")
+            })
+            .expect("failed to read the notes window")
     }
 
     #[gpui::test]
@@ -311,7 +644,8 @@ mod tests {
 
     #[gpui::test]
     async fn test_opens_markdown_in_vim_mode(cx: &mut TestAppContext) {
-        let (_fs, editor, mut window_cx) = test_window(cx).await;
+        let mut test = test_window(cx).await;
+        let editor = test.editor;
 
         let (language_name, has_grammar) = editor.read_with(cx, |editor, cx| {
             editor
@@ -329,7 +663,7 @@ mod tests {
         assert_eq!(language_name, "Markdown");
         assert!(has_grammar, "Markdown syntax highlighting needs a grammar");
 
-        window_cx.simulate_keystrokes("i x escape");
+        test.cx.simulate_keystrokes("i x escape");
         assert_eq!(
             editor.read_with(cx, |editor, cx| editor.text(cx)),
             format!("x{TEST_NOTE}")
@@ -338,28 +672,29 @@ mod tests {
 
     #[gpui::test]
     async fn test_cmd_s_saves_the_editor_buffer(cx: &mut TestAppContext) {
-        let (fs, _editor, mut window_cx) = test_window(cx).await;
+        let mut test = test_window(cx).await;
 
-        window_cx.simulate_keystrokes("i x escape cmd-s");
-        window_cx.run_until_parked();
+        test.cx.simulate_keystrokes("i x escape cmd-s");
+        test.cx.run_until_parked();
 
         assert_eq!(
-            fs.load(Path::new(TEST_NOTE_PATH)).await.unwrap(),
+            test.fs.load(Path::new(TEST_NOTE_PATH)).await.unwrap(),
             format!("x{TEST_NOTE}")
         );
     }
 
     #[gpui::test]
     async fn test_vim_write_saves_the_editor_buffer(cx: &mut TestAppContext) {
-        let (fs, _editor, mut window_cx) = test_window(cx).await;
+        let mut test = test_window(cx).await;
 
-        window_cx.simulate_keystrokes("i x escape");
+        test.cx.simulate_keystrokes("i x escape");
         assert!(
-            window_cx.update(|_, cx| cx.has_global::<GlobalCommandPaletteInterceptor>()),
+            test.cx
+                .update(|_, cx| cx.has_global::<GlobalCommandPaletteInterceptor>()),
             "Vim should install its command-line interceptor"
         );
-        window_cx.simulate_keystrokes(":");
-        let has_command_palette = window_cx.update(|window, cx| {
+        test.cx.simulate_keystrokes(":");
+        let has_command_palette = test.cx.update(|window, cx| {
             Workspace::for_window(window, cx)
                 .expect("the Vim command line needs a workspace")
                 .read(cx)
@@ -370,10 +705,10 @@ mod tests {
             has_command_palette,
             "colon should open the Vim command line"
         );
-        window_cx.simulate_keystrokes("w");
-        window_cx.run_until_parked();
-        window_cx.simulate_keystrokes("enter");
-        let has_command_palette = window_cx.update(|window, cx| {
+        test.cx.simulate_keystrokes("w");
+        test.cx.run_until_parked();
+        test.cx.simulate_keystrokes("enter");
+        let has_command_palette = test.cx.update(|window, cx| {
             Workspace::for_window(window, cx)
                 .expect("the Vim command line needs a workspace")
                 .read(cx)
@@ -381,27 +716,294 @@ mod tests {
                 .is_some()
         });
         assert!(!has_command_palette, "enter should submit the Vim command");
-        window_cx.run_until_parked();
+        test.cx.run_until_parked();
 
         assert_eq!(
-            fs.load(Path::new(TEST_NOTE_PATH)).await.unwrap(),
+            test.fs.load(Path::new(TEST_NOTE_PATH)).await.unwrap(),
             format!("x{TEST_NOTE}")
         );
     }
 
-    #[gpui::test]
-    async fn test_cmd_w_closes_the_notes_window(cx: &mut TestAppContext) {
-        let (_fs, _editor, mut window_cx) = test_window(cx).await;
+    #[test]
+    fn test_parses_explorer_settings_from_jsonc() {
+        let settings = parse_explorer_settings(
+            r#"
+            {
+                // Non-Markdown files are useful in mixed vaults.
+                "explorer": {
+                    "markdown_only": false,
+                    "show_hidden": true,
+                },
+                "files": {
+                    "exclude": ["drafts", "**/*.tmp"],
+                },
+            }
+            "#,
+        )
+        .expect("settings should parse");
 
-        let close_bindings =
-            window_cx.update(|window, _| window.bindings_for_action(&workspace::CloseWindow));
-        assert!(
-            !close_bindings.is_empty(),
-            "the focused editor should expose the notes close binding"
+        assert_eq!(
+            settings,
+            ExplorerSettings {
+                markdown_only: false,
+                show_hidden: true,
+                excluded_paths: vec!["drafts".to_owned(), "**/*.tmp".to_owned()],
+            }
         );
-        window_cx.simulate_keystrokes("cmd-w");
-        window_cx.run_until_parked();
+    }
 
-        assert!(cx.windows().is_empty());
+    #[gpui::test]
+    async fn test_cmd_o_prompts_for_one_directory(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+        test.fs
+            .insert_tree("/other-notes", json!({ "other.md": "# Other\n" }))
+            .await;
+
+        test.cx.simulate_keystrokes("cmd-o");
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|options| {
+            assert!(!options.files);
+            assert!(options.directories);
+            assert!(!options.multiple);
+            Some(vec![PathBuf::from("/other-notes")])
+        });
+        test.cx.run_until_parked();
+
+        let root_path = test
+            .window
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .project()
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .next()
+                    .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+            })
+            .expect("failed to read the notes window")
+            .expect("the selected folder should become a visible worktree");
+        assert_eq!(root_path, PathBuf::from("/other-notes"));
+    }
+
+    #[gpui::test]
+    async fn test_explorer_filters_non_markdown_files_by_default(cx: &mut TestAppContext) {
+        let mut test = test_window_with(
+            cx,
+            ExplorerSettings::default(),
+            json!({
+                "alpha.md": "# Alpha\n",
+                "beta.txt": "not a note\n",
+            }),
+            "/notes/alpha.md",
+        )
+        .await;
+
+        focus_project_path(&mut test, "alpha.md", cx);
+        test.cx.simulate_keystrokes("j enter");
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/alpha.md")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_markdown_only_false_shows_other_files(cx: &mut TestAppContext) {
+        let mut explorer_settings = ExplorerSettings::default();
+        explorer_settings.markdown_only = false;
+        let mut test = test_window_with(
+            cx,
+            explorer_settings,
+            json!({
+                "alpha.md": "# Alpha\n",
+                "beta.txt": "not a note\n",
+            }),
+            "/notes/alpha.md",
+        )
+        .await;
+
+        focus_project_path(&mut test, "alpha.md", cx);
+        test.cx.simulate_keystrokes("j enter");
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/beta.txt")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_toggle_hidden_files_updates_the_explorer(cx: &mut TestAppContext) {
+        let mut test = test_window_with(
+            cx,
+            ExplorerSettings::default(),
+            json!({
+                ".hidden.md": "# Hidden\n",
+                "alpha.md": "# Alpha\n",
+            }),
+            "/notes/alpha.md",
+        )
+        .await;
+
+        focus_project_path(&mut test, "", cx);
+        test.cx.simulate_keystrokes("j enter");
+        test.cx.run_until_parked();
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/alpha.md")
+        );
+
+        test.cx.dispatch_action(ToggleHiddenFiles);
+        test.cx.run_until_parked();
+        focus_project_path(&mut test, "", cx);
+        test.cx.simulate_keystrokes("j enter");
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/.hidden.md")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_explorer_keeps_directories_and_excludes_configured_paths(
+        cx: &mut TestAppContext,
+    ) {
+        let mut test = test_window_with(
+            cx,
+            ExplorerSettings::default(),
+            json!({
+                "alpha.md": "# Alpha\n",
+                "nested": {
+                    "beta.markdown": "# Beta\n",
+                },
+                "node_modules": {
+                    "ignored.md": "# Ignored\n",
+                },
+                "target": {
+                    "ignored.md": "# Ignored\n",
+                },
+            }),
+            "/notes/alpha.md",
+        )
+        .await;
+
+        focus_project_path(&mut test, "", cx);
+        test.cx.simulate_keystrokes("j l");
+        test.cx.run_until_parked();
+        test.cx.simulate_keystrokes("j enter");
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/nested/beta.markdown")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_explorer_vim_bindings_open_tabs_and_return_focus_to_editor(
+        cx: &mut TestAppContext,
+    ) {
+        let mut test = test_window_with(
+            cx,
+            ExplorerSettings::default(),
+            json!({
+                "alpha.md": "# Alpha\n",
+                "beta.md": "# Beta\n",
+            }),
+            "/notes/alpha.md",
+        )
+        .await;
+
+        focus_project_path(&mut test, "beta.md", cx);
+        test.cx.simulate_keystrokes("o");
+        test.cx.run_until_parked();
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/beta.md")
+        );
+        assert_eq!(
+            test.window
+                .read_with(cx, |multi_workspace, cx| multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .active_pane()
+                    .read(cx)
+                    .items_len())
+                .expect("failed to read the notes window"),
+            2
+        );
+
+        test.cx.simulate_keystrokes("cmd-{");
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/alpha.md")
+        );
+        test.cx.simulate_keystrokes("cmd-}");
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/beta.md")
+        );
+
+        focus_project_path(&mut test, "beta.md", cx);
+        test.cx.simulate_keystrokes("q");
+        test.cx.update(|window, cx| {
+            let editor = Workspace::for_window(window, cx)
+                .expect("test window should contain a workspace")
+                .read(cx)
+                .active_item_as::<Editor>(cx)
+                .expect("an editor should be active");
+            assert!(
+                editor
+                    .read(cx)
+                    .focus_handle(cx)
+                    .contains_focused(window, cx)
+            );
+        });
+
+        test.cx.simulate_keystrokes("cmd-w");
+        test.cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 1);
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/alpha.md")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cmd_b_toggles_the_left_explorer(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+        let workspace = test
+            .window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("failed to read the notes window");
+        assert!(workspace.read_with(cx, |workspace, cx| workspace.left_dock().read(cx).is_open()));
+
+        test.cx.simulate_keystrokes("cmd-b");
+
+        assert!(!workspace.read_with(cx, |workspace, cx| workspace.left_dock().read(cx).is_open()));
+    }
+
+    #[gpui::test]
+    async fn test_cmd_w_closes_the_active_tab_without_closing_the_window(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+
+        test.cx.simulate_keystrokes("cmd-w");
+        test.cx.run_until_parked();
+
+        assert_eq!(cx.windows().len(), 1);
+        assert_eq!(
+            test.window
+                .read_with(cx, |multi_workspace, cx| multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .active_pane()
+                    .read(cx)
+                    .items_len())
+                .expect("failed to read the notes window"),
+            0
+        );
     }
 }

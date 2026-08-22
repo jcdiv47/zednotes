@@ -92,6 +92,12 @@ use crate::{
 const PROJECT_PANEL_KEY: &str = "ProjectPanel";
 const NEW_ENTRY_ID: ProjectEntryId = ProjectEntryId::MAX;
 
+/// Decides whether an entry should be displayed by a project panel.
+///
+/// Directories are passed to the filter as well so callers can choose whether
+/// an empty directory should remain navigable.
+pub type EntryFilter = Arc<dyn Fn(&Path, bool) -> bool + Send + Sync>;
+
 struct VisibleEntriesForWorktree {
     worktree_id: WorktreeId,
     entries: Vec<GitEntry>,
@@ -136,6 +142,7 @@ impl State {
 
 pub struct ProjectPanel {
     project: Entity<Project>,
+    entry_filter: Option<EntryFilter>,
     fs: Arc<dyn Fs>,
     focus_handle: FocusHandle,
     scroll_handle: UniformListScrollHandle,
@@ -666,6 +673,15 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
+        Self::new_with_entry_filter(workspace, None, window, cx)
+    }
+
+    fn new_with_entry_filter(
+        workspace: &mut Workspace,
+        entry_filter: Option<EntryFilter>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<Self> {
         let project = workspace.project().clone();
         let git_store = project.read(cx).git_store().clone();
         let path_style = project.read(cx).path_style(cx);
@@ -841,6 +857,7 @@ impl ProjectPanel {
             let weak_project_panel = cx.weak_entity();
             let mut this = Self {
                 project: project.clone(),
+                entry_filter,
                 hover_scroll_task: None,
                 fs: workspace.app_state().fs.clone(),
                 focus_handle,
@@ -981,6 +998,16 @@ impl ProjectPanel {
     ) -> Result<Entity<Self>> {
         workspace.update_in(&mut cx, |workspace, window, cx| {
             ProjectPanel::new(workspace, window, cx)
+        })
+    }
+
+    pub async fn load_with_entry_filter(
+        workspace: WeakEntity<Workspace>,
+        entry_filter: EntryFilter,
+        mut cx: AsyncWindowContext,
+    ) -> Result<Entity<Self>> {
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            ProjectPanel::new_with_entry_filter(workspace, Some(entry_filter), window, cx)
         })
     }
 
@@ -4283,6 +4310,7 @@ impl ProjectPanel {
         let hide_gitignore = settings.hide_gitignore;
         let sort_mode = settings.sort_mode;
         let sort_order = settings.sort_order;
+        let entry_filter = self.entry_filter.clone();
         let project = self.project.read(cx);
         let repo_snapshots = project.git_store().read(cx).display_repo_snapshots(cx);
 
@@ -4400,6 +4428,9 @@ impl ProjectPanel {
                             auto_folded_ancestors.clear();
                             if (!hide_gitignore || !entry.is_ignored)
                                 && (!hide_hidden || !entry.is_hidden)
+                                && entry_filter.as_ref().is_none_or(|filter| {
+                                    filter(entry.path.as_std_path(), entry.is_dir())
+                                })
                             {
                                 visible_worktree_entries.push(entry.to_owned());
                             }

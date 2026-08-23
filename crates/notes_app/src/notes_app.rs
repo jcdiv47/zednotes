@@ -25,9 +25,9 @@ use futures::StreamExt as _;
 use gpui::WindowHandle;
 use gpui::{
     Action as _, AnyElement, App, AppContext as _, AsyncApp, BorrowAppContext as _, Bounds,
-    DismissEvent, Entity, Focusable as _, Global, KeyBinding, Menu, MenuItem, PathPromptOptions,
-    Render, Subscription, Task, TaskExt as _, TitlebarOptions, WeakEntity, Window, WindowBounds,
-    WindowOptions, actions, div, prelude::*, px, size,
+    DismissEvent, Entity, Focusable as _, Global, KeyBinding, Keystroke, Menu, MenuItem,
+    PathPromptOptions, Render, Subscription, Task, TaskExt as _, TitlebarOptions, WeakEntity,
+    Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
 };
 use http_client::BlockedHttpClient;
 use language::{Buffer, BufferEvent, Capability, DiskState, Language, LanguageRegistry};
@@ -45,9 +45,9 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use session::{AppSession, Session};
 use settings::{
-    AutosaveSetting, BufferLineHeight, DockSide, FontFamilyName, KeybindSource, KeymapFile,
-    KeymapFileLoadResult, Settings as _, SettingsStore, SoftWrap, ThemeAppearanceMode, ThemeName,
-    ThemeSelection,
+    AutosaveSetting, BufferLineHeight, CommandAliasTarget, DockSide, FontFamilyName, KeybindSource,
+    KeymapFile, KeymapFileLoadResult, Settings as _, SettingsStore, SoftWrap, ThemeAppearanceMode,
+    ThemeName, ThemeSelection,
 };
 use theme::{ActiveTheme as _, GlobalTheme, LoadThemes};
 use util::ResultExt as _;
@@ -73,12 +73,17 @@ const DEFAULT_EXPLORER_WIDTH: u32 = 240;
 const DEFAULT_EDITOR_FONT_FAMILY: &str = ".ZedMono";
 const DEFAULT_EDITOR_FONT_SIZE: f32 = 15.0;
 const DEFAULT_EDITOR_LINE_HEIGHT: f32 = 1.55;
+const DEFAULT_VIM_LEADER: &str = "space";
 const RECENT_NOTES_KEY: &str = "notes_recent_usage";
 const MAX_RECENT_NOTES: usize = 512;
 const INITIAL_SETTINGS_CONTENT: &str = r#"{
   // system, light, or dark
   "theme": "system",
   "vim_mode": true,
+
+  "vim": {
+    "leader": "space",
+  },
 
   "editor": {
     "font_family": ".ZedMono",
@@ -222,11 +227,24 @@ struct AutosaveSettings {
     delay_ms: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NotesVimSettings {
+    leader: String,
+}
+
 impl Default for AutosaveSettings {
     fn default() -> Self {
         Self {
             enabled: true,
             delay_ms: DEFAULT_AUTOSAVE_DELAY_MS,
+        }
+    }
+}
+
+impl Default for NotesVimSettings {
+    fn default() -> Self {
+        Self {
+            leader: DEFAULT_VIM_LEADER.to_owned(),
         }
     }
 }
@@ -259,6 +277,7 @@ impl Default for ExplorerSettings {
 struct NotesSettings {
     theme: NotesTheme,
     vim_mode: bool,
+    vim: NotesVimSettings,
     editor: NotesEditorSettings,
     autosave: AutosaveSettings,
     explorer: ExplorerSettings,
@@ -270,6 +289,7 @@ impl Default for NotesSettings {
         Self {
             theme: NotesTheme::System,
             vim_mode: true,
+            vim: NotesVimSettings::default(),
             editor: NotesEditorSettings::default(),
             autosave: AutosaveSettings::default(),
             explorer: ExplorerSettings::default(),
@@ -282,6 +302,11 @@ impl Default for NotesSettings {
 struct CurrentNotesSettings(NotesSettings);
 
 impl Global for CurrentNotesSettings {}
+
+#[derive(Default)]
+struct CurrentUserKeyBindings(Vec<KeyBinding>);
+
+impl Global for CurrentUserKeyBindings {}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct RecentNotes {
@@ -548,11 +573,17 @@ impl PickerDelegate for RecentWorkspacePickerDelegate {
 struct NotesSettingsContent {
     theme: Option<NotesTheme>,
     vim_mode: Option<bool>,
+    vim: Option<NotesVimSettingsContent>,
     editor: Option<NotesEditorSettingsContent>,
     autosave: Option<AutosaveSettingsContent>,
     explorer: Option<ExplorerSettingsContent>,
     files: Option<FileSettingsContent>,
     preview: Option<PreviewSettingsContent>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct NotesVimSettingsContent {
+    leader: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -595,6 +626,9 @@ fn parse_notes_settings(content: &str) -> Result<NotesSettings> {
     let mut settings = NotesSettings::default();
     settings.theme = content.theme.unwrap_or(settings.theme);
     settings.vim_mode = content.vim_mode.unwrap_or(settings.vim_mode);
+    if let Some(vim) = content.vim {
+        settings.vim.leader = vim.leader.unwrap_or(settings.vim.leader);
+    }
     if let Some(editor) = content.editor {
         settings.editor.font_family = editor.font_family.unwrap_or(settings.editor.font_family);
         settings.editor.font_size = editor.font_size.unwrap_or(settings.editor.font_size);
@@ -640,6 +674,12 @@ fn parse_notes_settings(content: &str) -> Result<NotesSettings> {
         settings.editor.line_height >= 1.0,
         "editor.line_height must be at least 1.0"
     );
+    anyhow::ensure!(
+        !settings.vim.leader.is_empty() && !settings.vim.leader.chars().any(char::is_whitespace),
+        "vim.leader must be one GPUI keystroke"
+    );
+    Keystroke::parse(&settings.vim.leader)
+        .with_context(|| format!("invalid vim.leader {:?}", settings.vim.leader))?;
     anyhow::ensure!(
         settings.explorer.width > 0,
         "explorer.width must be positive"
@@ -948,6 +988,61 @@ fn markdown_languages(cx: &App) -> Result<Arc<LanguageRegistry>> {
     Ok(languages)
 }
 
+fn notes_vim_key_bindings(leader: &str) -> Vec<KeyBinding> {
+    const CONTEXT: Option<&str> = Some("Editor && VimControl && vim_mode == normal");
+    let keys = |suffix: &str| format!("{leader} {suffix}");
+
+    vec![
+        KeyBinding::new(leader, gpui::NoAction, CONTEXT),
+        KeyBinding::new(
+            &keys("f f"),
+            zed_workspace::ToggleFileFinder::default(),
+            CONTEXT,
+        ),
+        KeyBinding::new(&keys("f g"), Search, CONTEXT),
+        KeyBinding::new(&keys("f n"), New, CONTEXT),
+        KeyBinding::new(&keys("f r"), OpenRecentNote, CONTEXT),
+        KeyBinding::new(&keys("p"), zed_actions::command_palette::Toggle, CONTEXT),
+        KeyBinding::new(&keys("e"), ToggleExplorer, CONTEXT),
+        KeyBinding::new(&keys("v"), TogglePreview, CONTEXT),
+        KeyBinding::new(
+            &keys("b n"),
+            zed_workspace::ActivateNextItem::default(),
+            CONTEXT,
+        ),
+        KeyBinding::new(
+            &keys("b p"),
+            zed_workspace::ActivatePreviousItem::default(),
+            CONTEXT,
+        ),
+        KeyBinding::new(
+            &keys("b d"),
+            zed_workspace::CloseActiveItem::default(),
+            CONTEXT,
+        ),
+        KeyBinding::new(&keys("w h"), zed_workspace::ActivatePaneLeft, CONTEXT),
+        KeyBinding::new(&keys("w j"), zed_workspace::ActivatePaneDown, CONTEXT),
+        KeyBinding::new(&keys("w k"), zed_workspace::ActivatePaneUp, CONTEXT),
+        KeyBinding::new(&keys("w l"), zed_workspace::ActivatePaneRight, CONTEXT),
+        KeyBinding::new(
+            &keys("w v"),
+            zed_workspace::SplitVertical::default(),
+            CONTEXT,
+        ),
+        KeyBinding::new(
+            &keys("w s"),
+            zed_workspace::SplitHorizontal::default(),
+            CONTEXT,
+        ),
+        KeyBinding::new(
+            &keys("s f"),
+            zed_actions::buffer_search::Deploy::find(),
+            CONTEXT,
+        ),
+        KeyBinding::new(&keys("s p"), Search, CONTEXT),
+    ]
+}
+
 fn bind_default_editor_keymaps(cx: &mut App) -> Result<()> {
     for (path, source) in [
         (settings::DEFAULT_KEYMAP_PATH, KeybindSource::Default),
@@ -959,6 +1054,12 @@ fn bind_default_editor_keymaps(cx: &mut App) -> Result<()> {
         }
         cx.bind_keys(key_bindings);
     }
+    let mut leader_bindings =
+        notes_vim_key_bindings(&cx.global::<CurrentNotesSettings>().0.vim.leader);
+    for key_binding in &mut leader_bindings {
+        key_binding.set_meta(KeybindSource::Vim.meta());
+    }
+    cx.bind_keys(leader_bindings);
     cx.bind_keys([
         KeyBinding::new("cmd-,", OpenSettings, Some("Workspace")),
         KeyBinding::new("cmd-o", OpenFolder, None),
@@ -1027,6 +1128,13 @@ fn reload_editor_keymaps(mut user_key_bindings: Vec<KeyBinding>, cx: &mut App) -
     bind_default_editor_keymaps(cx)?;
     for key_binding in &mut user_key_bindings {
         key_binding.set_meta(KeybindSource::User.meta());
+    }
+    if cx.has_global::<CurrentUserKeyBindings>() {
+        cx.update_global::<CurrentUserKeyBindings, _>(|current, _| {
+            current.0 = user_key_bindings.clone()
+        });
+    } else {
+        cx.set_global(CurrentUserKeyBindings(user_key_bindings.clone()));
     }
     cx.bind_keys(user_key_bindings);
     Ok(())
@@ -1229,6 +1337,9 @@ fn apply_autosave_settings(settings: AutosaveSettings, cx: &mut App) {
 }
 
 fn apply_notes_settings(settings: NotesSettings, cx: &mut App) {
+    let leader_changed = cx
+        .try_global::<CurrentNotesSettings>()
+        .is_some_and(|current| current.0.vim.leader != settings.vim.leader);
     apply_theme_setting(settings.theme, cx);
     apply_editor_settings(&settings.editor, cx);
     apply_explorer_settings(&settings.explorer, cx);
@@ -1238,12 +1349,32 @@ fn apply_notes_settings(settings: NotesSettings, cx: &mut App) {
         store.update_default_settings(cx, |content| {
             content.vim_mode = Some(settings.vim_mode);
             content.helix_mode = Some(false);
+            for (alias, target) in [
+                ("preview", "note::TogglePreview"),
+                ("explorer", "view::ToggleExplorer"),
+                ("notes", "file_finder::Toggle"),
+                ("search", "workspace::Search"),
+            ] {
+                content
+                    .workspace
+                    .command_aliases
+                    .entry(alias.to_owned())
+                    .or_insert_with(|| CommandAliasTarget::new(target));
+            }
         });
     });
     if cx.has_global::<CurrentNotesSettings>() {
         cx.update_global::<CurrentNotesSettings, _>(|current, _| current.0 = settings);
     } else {
         cx.set_global(CurrentNotesSettings(settings));
+    }
+    if leader_changed {
+        let user_key_bindings = cx
+            .try_global::<CurrentUserKeyBindings>()
+            .map(|bindings| bindings.0.clone());
+        if let Some(user_key_bindings) = user_key_bindings {
+            reload_editor_keymaps(user_key_bindings, cx).log_err();
+        }
     }
     cx.refresh_windows();
 }
@@ -2525,6 +2656,20 @@ mod tests {
         test.cx.run_until_parked();
     }
 
+    fn execute_vim_command(test: &mut TestWindow, command: &str, cx: &mut TestAppContext) {
+        test.cx.simulate_keystrokes(":");
+        assert!(
+            workspace(test, cx).read_with(cx, |workspace, cx| workspace
+                .active_modal::<command_palette::CommandPalette>(cx)
+                .is_some()),
+            "colon should open the Vim command line"
+        );
+        test.cx.simulate_input(command);
+        test.cx.run_until_parked();
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+    }
+
     #[gpui::test]
     fn test_notes_windows_keep_the_native_macos_titlebar(cx: &mut TestAppContext) {
         let titlebar = cx
@@ -3095,6 +3240,9 @@ mod tests {
             {
                 "theme": "dark",
                 "vim_mode": false,
+                "vim": {
+                    "leader": "ctrl-space",
+                },
                 "editor": {
                     "font_family": "Test Mono",
                     "font_size": 18.5,
@@ -3112,6 +3260,7 @@ mod tests {
 
         assert_eq!(settings.theme, NotesTheme::Dark);
         assert!(!settings.vim_mode);
+        assert_eq!(settings.vim.leader, "ctrl-space");
         assert_eq!(settings.editor.font_family, "Test Mono");
         assert_eq!(settings.editor.font_size, 18.5);
         assert_eq!(settings.editor.line_height, 1.4);
@@ -3126,6 +3275,9 @@ mod tests {
     fn test_invalid_settings_are_rejected_for_the_loader_to_fall_back() {
         assert!(parse_notes_settings("{ invalid").is_err());
         assert!(parse_notes_settings(r#"{ "editor": { "line_height": 0.5 } }"#).is_err());
+        assert!(parse_notes_settings(r#"{ "vim": { "leader": "" } }"#).is_err());
+        assert!(parse_notes_settings(r#"{ "vim": { "leader": "g g" } }"#).is_err());
+        assert!(parse_notes_settings(r#"{ "vim": { "leader": "ctrl-alt-x-y" } }"#).is_err());
     }
 
     #[gpui::test]
@@ -3190,7 +3342,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_user_keymap_rebinds_in_workspace_context(cx: &mut TestAppContext) {
+    async fn test_user_keymap_rebind_survives_vim_leader_reload(cx: &mut TestAppContext) {
         let mut test = test_window(cx).await;
         cx.update(|cx| {
             reload_editor_keymap_content(
@@ -3208,6 +3360,11 @@ mod tests {
             )
             .expect("user keymap should load");
         });
+        let mut settings = cx.update(|cx| cx.global::<CurrentNotesSettings>().0.clone());
+        settings.vim.leader = "ctrl-space".to_owned();
+        cx.update(|cx| apply_notes_settings(settings, cx));
+        test.cx.run_until_parked();
+
         let workspace = workspace(&test, cx);
         assert!(workspace.read_with(cx, |workspace, cx| workspace.left_dock().read(cx).is_open()));
 
@@ -3831,6 +3988,293 @@ mod tests {
             test.fs.load(Path::new(TEST_NOTE_PATH)).await.unwrap(),
             format!("x{TEST_NOTE}")
         );
+    }
+
+    #[gpui::test]
+    async fn test_vim_builtin_edit_quit_force_quit_write_quit_and_exit_commands(
+        cx: &mut TestAppContext,
+    ) {
+        let mut test = test_window_with(
+            cx,
+            ExplorerSettings::default(),
+            json!({
+                "alpha.md": "# Alpha\n",
+                "beta.md": "# Beta\n",
+            }),
+            "/notes/alpha.md",
+        )
+        .await;
+
+        execute_vim_command(&mut test, "e", cx);
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/alpha.md")
+        );
+
+        focus_project_path(&mut test, "beta.md", cx);
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+        execute_vim_command(&mut test, "q", cx);
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/alpha.md")
+        );
+
+        focus_project_path(&mut test, "beta.md", cx);
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+        test.cx.simulate_keystrokes("i x escape");
+        execute_vim_command(&mut test, "q!", cx);
+        assert_eq!(
+            test.fs.load(Path::new("/notes/beta.md")).await.unwrap(),
+            "# Beta\n"
+        );
+
+        focus_project_path(&mut test, "beta.md", cx);
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+        test.cx.simulate_keystrokes("i y escape");
+        execute_vim_command(&mut test, "wq", cx);
+        assert_eq!(
+            test.fs.load(Path::new("/notes/beta.md")).await.unwrap(),
+            "y# Beta\n"
+        );
+
+        focus_project_path(&mut test, "beta.md", cx);
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+        test.cx.simulate_keystrokes("i z escape");
+        execute_vim_command(&mut test, "x", cx);
+        assert_eq!(
+            test.fs.load(Path::new("/notes/beta.md")).await.unwrap(),
+            "zy# Beta\n"
+        );
+    }
+
+    #[test]
+    fn test_notes_vim_leader_maps_every_requested_action() {
+        let bindings = notes_vim_key_bindings("space")
+            .into_iter()
+            .map(|binding| {
+                let keystrokes = binding
+                    .keystrokes()
+                    .iter()
+                    .map(|keystroke| keystroke.unparse())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (keystrokes, binding.action().name().to_owned())
+            })
+            .collect::<Vec<_>>();
+
+        for (keystrokes, action_name) in [
+            ("space f f", "file_finder::Toggle"),
+            ("space f g", "workspace::Search"),
+            ("space f n", "note::New"),
+            ("space f r", "note::Open Recent"),
+            ("space p", "command_palette::Toggle"),
+            ("space e", "view::ToggleExplorer"),
+            ("space v", "note::TogglePreview"),
+            ("space b n", "pane::ActivateNextItem"),
+            ("space b p", "pane::ActivatePreviousItem"),
+            ("space b d", "pane::CloseActiveItem"),
+            ("space w h", "workspace::ActivatePaneLeft"),
+            ("space w j", "workspace::ActivatePaneDown"),
+            ("space w k", "workspace::ActivatePaneUp"),
+            ("space w l", "workspace::ActivatePaneRight"),
+            ("space w v", "pane::SplitVertical"),
+            ("space w s", "pane::SplitHorizontal"),
+            ("space s f", "buffer_search::Deploy"),
+            ("space s p", "workspace::Search"),
+        ] {
+            assert!(
+                bindings
+                    .iter()
+                    .any(|binding| binding == &(keystrokes.to_owned(), action_name.to_owned())),
+                "{keystrokes} should dispatch {action_name}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_vim_leader_ff_opens_quick_open(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+
+        test.cx.simulate_keystrokes("space f f");
+        test.cx.run_until_parked();
+
+        assert!(workspace(&test, cx).read_with(cx, |workspace, cx| {
+            workspace
+                .active_modal::<file_finder::FileFinder>(cx)
+                .is_some()
+        }));
+    }
+
+    #[gpui::test]
+    async fn test_vim_leader_fg_searches_all_notes(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+
+        test.cx.simulate_keystrokes("space f g");
+        test.cx.run_until_parked();
+
+        active_project_search(&test, cx);
+    }
+
+    #[gpui::test]
+    async fn test_vim_leader_e_toggles_explorer(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+        let workspace = workspace(&test, cx);
+        assert!(workspace.read_with(cx, |workspace, cx| workspace.left_dock().read(cx).is_open()));
+
+        test.cx.simulate_keystrokes("space e");
+
+        assert!(!workspace.read_with(cx, |workspace, cx| workspace.left_dock().read(cx).is_open()));
+    }
+
+    #[gpui::test]
+    async fn test_vim_leader_v_toggles_preview(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+
+        test.cx.simulate_keystrokes("space v");
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            workspace(&test, cx).read_with(cx, |workspace, cx| workspace
+                .items_of_type::<MarkdownPreviewView>(cx)
+                .count()),
+            1
+        );
+    }
+
+    #[gpui::test]
+    async fn test_vim_leader_is_configurable_and_insert_mode_still_types_space(
+        cx: &mut TestAppContext,
+    ) {
+        let mut test = test_window(cx).await;
+        let workspace = workspace(&test, cx);
+
+        test.cx.simulate_keystrokes("i space escape");
+        assert_eq!(
+            test.editor.read_with(cx, |editor, cx| editor.text(cx)),
+            format!(" {TEST_NOTE}")
+        );
+
+        let mut settings = cx.update(|cx| cx.global::<CurrentNotesSettings>().0.clone());
+        settings.vim.leader = "ctrl-space".to_owned();
+        cx.update(|cx| apply_notes_settings(settings, cx));
+        test.cx.run_until_parked();
+
+        test.cx.simulate_keystrokes("space e");
+        assert!(workspace.read_with(cx, |workspace, cx| workspace.left_dock().read(cx).is_open()));
+
+        test.cx.simulate_keystrokes("ctrl-space e");
+        assert!(!workspace.read_with(cx, |workspace, cx| workspace.left_dock().read(cx).is_open()));
+    }
+
+    #[gpui::test]
+    async fn test_vim_leader_splits_and_moves_focus_between_note_panes(cx: &mut TestAppContext) {
+        let mut test = test_window_with(
+            cx,
+            ExplorerSettings::default(),
+            json!({
+                "alpha.md": "# Alpha\n",
+                "beta.md": "# Beta\n",
+            }),
+            "/notes/alpha.md",
+        )
+        .await;
+        let workspace = workspace(&test, cx);
+        test.cx.simulate_keystrokes("space e");
+        let original_pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        test.cx.simulate_keystrokes("space w v");
+        test.cx.run_until_parked();
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.panes().len()),
+            2
+        );
+        test.cx.simulate_resize(size(px(1025.), px(700.)));
+        test.cx.run_until_parked();
+        let split_pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        assert_ne!(original_pane.entity_id(), split_pane.entity_id());
+        let focused_pane_id = |test: &mut TestWindow| {
+            test.cx.update(|window, cx| {
+                [&original_pane, &split_pane]
+                    .into_iter()
+                    .find(|pane| pane.focus_handle(cx).contains_focused(window, cx))
+                    .map(|pane| pane.entity_id())
+                    .expect("one notes pane should contain focus")
+            })
+        };
+        let focused_before_navigation = focused_pane_id(&mut test);
+
+        test.cx.simulate_keystrokes("space w h");
+        let focused_after_left = focused_pane_id(&mut test);
+        if focused_after_left == focused_before_navigation {
+            test.cx.simulate_keystrokes("space w l");
+            assert_ne!(focused_pane_id(&mut test), focused_before_navigation);
+        } else {
+            assert_ne!(focused_after_left, focused_before_navigation);
+        }
+
+        test.cx.simulate_keystrokes("space f f");
+        test.cx.simulate_input("beta");
+        test.cx.executor().advance_clock(Duration::from_millis(100));
+        test.cx.run_until_parked();
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+
+        let pane_paths = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panes()
+                .iter()
+                .filter_map(|pane| pane.read(cx).active_item())
+                .filter_map(|item| item.project_path(cx))
+                .filter_map(|project_path| {
+                    workspace
+                        .project()
+                        .read(cx)
+                        .absolute_path(&project_path, cx)
+                })
+                .collect::<Vec<_>>()
+        });
+        assert!(pane_paths.contains(&PathBuf::from("/notes/alpha.md")));
+        assert!(pane_paths.contains(&PathBuf::from("/notes/beta.md")));
+
+        test.cx.simulate_keystrokes("space w s");
+        test.cx.run_until_parked();
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.panes().len()),
+            3
+        );
+    }
+
+    #[gpui::test]
+    async fn test_vim_app_command_aliases_dispatch_notes_actions(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+        let workspace = workspace(&test, cx);
+
+        execute_vim_command(&mut test, "preview", cx);
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .items_of_type::<MarkdownPreviewView>(cx)
+                .count()),
+            1
+        );
+
+        execute_vim_command(&mut test, "explorer", cx);
+        assert!(!workspace.read_with(cx, |workspace, cx| workspace.left_dock().read(cx).is_open()));
+
+        execute_vim_command(&mut test, "notes", cx);
+        assert!(workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_modal::<file_finder::FileFinder>(cx)
+                .is_some()
+        }));
+        test.cx.simulate_keystrokes("escape");
+        test.cx.run_until_parked();
+
+        execute_vim_command(&mut test, "search", cx);
+        active_project_search(&test, cx);
     }
 
     #[test]

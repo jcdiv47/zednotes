@@ -3,7 +3,9 @@
 //! Everything notes-specific lives in this crate rather than in the generic Zed
 //! crates of the fork, so that merges from `upstream` stay cheap.
 
-use std::{io::ErrorKind, path::Path, path::PathBuf, sync::Arc};
+use std::{
+    cell::Cell, io::ErrorKind, path::Path, path::PathBuf, rc::Rc, sync::Arc, time::Duration,
+};
 
 use anyhow::{Context as _, Result};
 use assets::Assets;
@@ -16,7 +18,7 @@ use gpui::{
     WindowOptions, actions, px, size,
 };
 use http_client::BlockedHttpClient;
-use language::{Language, LanguageRegistry};
+use language::{Buffer, BufferEvent, Capability, DiskState, Language, LanguageRegistry};
 use markdown_preview::markdown_preview_view::MarkdownPreviewView;
 use node_runtime::NodeRuntime;
 use project::{LocalProjectFlags, Project};
@@ -28,13 +30,20 @@ use search::{BufferSearchBar, ProjectSearchView, project_search::ProjectSearchBa
 use semver::Version;
 use serde::Deserialize;
 use session::{AppSession, Session};
-use settings::{DockSide, KeybindSource, KeymapFile, Settings as _, SettingsStore};
+use settings::{
+    AutosaveSetting, DockSide, KeybindSource, KeymapFile, Settings as _, SettingsStore,
+};
 use theme::{ActiveTheme as _, LoadThemes};
+use util::ResultExt as _;
 use vim::ModeIndicator;
 use workspace as zed_workspace;
 use zed_workspace::{
-    AppState, Event as WorkspaceEvent, MultiWorkspace, Pane, SaveIntent, Toast, Workspace,
-    WorkspaceStore, dock::DockPosition, notifications::NotificationId,
+    AppState, CloseIntent, Event as WorkspaceEvent, ItemHandle as _, MultiWorkspace, Pane,
+    SaveIntent, SplitDirection, Toast, Workspace, WorkspaceStore,
+    dock::DockPosition,
+    item::SaveOptions,
+    notifications::{DetachAndPromptErr as _, NotificationId},
+    pane::Event as PaneEvent,
 };
 
 const APP_NAME: &str = "zednotes";
@@ -43,6 +52,7 @@ const DEFAULT_MARKDOWN_SEARCH_FILTER: &str = "**/*.md, **/*.markdown";
 const DEFAULT_EXCLUDED_PATHS: &[&str] = &[".git", ".DS_Store", "node_modules", "target"];
 const DEFAULT_PREVIEW_MAX_WIDTH: u32 = 760;
 const DEFAULT_PREVIEW_MAX_FILE_SIZE_BYTES: u64 = 5 * 1024 * 1024;
+const DEFAULT_AUTOSAVE_DELAY_MS: u64 = 750;
 
 actions!(
     notes,
@@ -114,6 +124,21 @@ struct PreviewSettings {
     max_file_size_bytes: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AutosaveSettings {
+    enabled: bool,
+    delay_ms: u64,
+}
+
+impl Default for AutosaveSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            delay_ms: DEFAULT_AUTOSAVE_DELAY_MS,
+        }
+    }
+}
+
 impl Default for PreviewSettings {
     fn default() -> Self {
         Self {
@@ -139,9 +164,16 @@ impl Default for ExplorerSettings {
 
 #[derive(Debug, Default, Deserialize)]
 struct NotesSettingsContent {
+    autosave: Option<AutosaveSettingsContent>,
     explorer: Option<ExplorerSettingsContent>,
     files: Option<FileSettingsContent>,
     preview: Option<PreviewSettingsContent>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AutosaveSettingsContent {
+    enabled: Option<bool>,
+    delay_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -190,6 +222,17 @@ fn parse_preview_settings(content: &str) -> Result<PreviewSettings> {
     Ok(settings)
 }
 
+fn parse_autosave_settings(content: &str) -> Result<AutosaveSettings> {
+    let content = settings::parse_json_with_comments::<NotesSettingsContent>(content)
+        .context("failed to parse zednotes settings")?;
+    let mut settings = AutosaveSettings::default();
+    if let Some(autosave) = content.autosave {
+        settings.enabled = autosave.enabled.unwrap_or(settings.enabled);
+        settings.delay_ms = autosave.delay_ms.unwrap_or(settings.delay_ms);
+    }
+    Ok(settings)
+}
+
 fn explorer_settings_path() -> PathBuf {
     paths::home_dir()
         .join(".config")
@@ -209,6 +252,14 @@ fn load_preview_settings() -> Result<PreviewSettings> {
     match std::fs::read_to_string(explorer_settings_path()) {
         Ok(content) => parse_preview_settings(&content),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(PreviewSettings::default()),
+        Err(error) => Err(error).context("failed to read zednotes settings"),
+    }
+}
+
+fn load_autosave_settings() -> Result<AutosaveSettings> {
+    match std::fs::read_to_string(explorer_settings_path()) {
+        Ok(content) => parse_autosave_settings(&content),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(AutosaveSettings::default()),
         Err(error) => Err(error).context("failed to read zednotes settings"),
     }
 }
@@ -313,11 +364,11 @@ fn load_editor_keymaps(cx: &mut App) -> Result<()> {
     Ok(())
 }
 
-fn init_editor_subsystems(cx: &mut App) -> Result<()> {
+fn init_editor_subsystems(autosave_settings: AutosaveSettings, cx: &mut App) -> Result<()> {
     zed_actions::init();
     command_palette::init(cx);
     editor::init(cx);
-    file_finder::init_with_file_filter(Arc::new(is_markdown_path), cx);
+    file_finder::init_with_file_filter_and_file_creation(Arc::new(is_markdown_path), false, cx);
     markdown_preview::init(cx);
     project_panel::init(cx);
     search::init(cx);
@@ -334,7 +385,8 @@ fn init_editor_subsystems(cx: &mut App) -> Result<()> {
     });
     load_editor_keymaps(cx)?;
 
-    cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+    cx.on_action(move |action: &Quit, cx| quit(action, autosave_settings, cx));
+    observe_external_file_changes(cx);
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-shift-v", TogglePreview, None),
@@ -416,6 +468,283 @@ fn apply_preview_settings(settings: &PreviewSettings, cx: &mut App) {
     });
 }
 
+fn apply_autosave_settings(settings: AutosaveSettings, cx: &mut App) {
+    cx.update_global::<SettingsStore, _>(|store, cx| {
+        store.update_default_settings(cx, |content| {
+            content.workspace.autosave = Some(if settings.enabled {
+                AutosaveSetting::AfterDelay {
+                    milliseconds: settings.delay_ms.into(),
+                }
+            } else {
+                AutosaveSetting::Off
+            });
+            content.workspace.close_on_file_delete = Some(false);
+        });
+    });
+}
+
+fn quit(_: &Quit, autosave_settings: AutosaveSettings, cx: &mut App) {
+    let windows = cx
+        .windows()
+        .into_iter()
+        .filter_map(|window| window.downcast::<MultiWorkspace>())
+        .collect::<Vec<_>>();
+
+    cx.spawn(async move |cx| {
+        for window in windows {
+            let workspaces = window
+                .update(cx, |multi_workspace, _, _| {
+                    multi_workspace.workspaces().cloned().collect::<Vec<_>>()
+                })
+                .log_err()
+                .unwrap_or_default();
+
+            for workspace in workspaces {
+                if autosave_settings.enabled {
+                    let save_tasks = window
+                        .update(cx, |_, window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| autosave_tasks(workspace, window, cx))
+                        })
+                        .log_err()
+                        .unwrap_or_default();
+                    for save_task in save_tasks {
+                        save_task.await?;
+                    }
+                }
+
+                let should_quit = window
+                    .update(cx, |_, window, cx| {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.prepare_to_close(CloseIntent::Quit, window, cx)
+                        })
+                    })
+                    .log_err();
+                if let Some(should_quit) = should_quit
+                    && !should_quit.await?
+                {
+                    return anyhow::Ok(());
+                }
+            }
+        }
+
+        cx.update(|cx| cx.quit());
+        anyhow::Ok(())
+    })
+    .detach_and_log_err(cx);
+}
+
+fn open_disk_comparison(
+    editor: gpui::Entity<Editor>,
+    workspace: gpui::Entity<Workspace>,
+    project: gpui::Entity<Project>,
+    path: PathBuf,
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui::Task<Result<()>> {
+    let fs = <dyn Fs>::global(cx).clone();
+    let language = editor
+        .read(cx)
+        .buffer()
+        .read(cx)
+        .as_singleton()
+        .and_then(|buffer| buffer.read(cx).language().cloned());
+    let title = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("{name} (On Disk)"))
+        .unwrap_or_else(|| "On Disk".to_owned());
+
+    window.spawn(cx, async move |cx| {
+        let disk_text = fs.load(&path).await?;
+        workspace.update_in(cx, |workspace, window, cx| {
+            let disk_buffer = cx.new(|cx| {
+                let mut buffer = Buffer::local(disk_text, cx);
+                buffer.set_capability(Capability::ReadOnly, cx);
+                if let Some(language) = language {
+                    buffer.set_language(Some(language), cx);
+                }
+                buffer
+            });
+            let disk_editor =
+                cx.new(|cx| Editor::for_buffer(disk_buffer, Some(project.clone()), window, cx));
+            let disk_multi_buffer = disk_editor.read(cx).buffer().clone();
+            disk_multi_buffer.update(cx, |buffer, cx| buffer.set_title(title, cx));
+            workspace.split_item(SplitDirection::Right, Box::new(disk_editor), window, cx);
+        })?;
+        Ok(())
+    })
+}
+
+fn prompt_for_external_file_change(
+    editor: &mut Editor,
+    buffer: gpui::Entity<Buffer>,
+    prompt_open: Rc<Cell<bool>>,
+    window: &mut Window,
+    cx: &mut gpui::Context<Editor>,
+) {
+    if prompt_open.get() {
+        return;
+    }
+    let (was_deleted, has_conflict, path) = {
+        let buffer = buffer.read(cx);
+        (
+            buffer
+                .file()
+                .is_some_and(|file| file.disk_state() == DiskState::Deleted),
+            buffer.has_conflict(),
+            buffer
+                .file()
+                .and_then(|file| file.as_local().map(|file| file.abs_path(cx))),
+        )
+    };
+    if !was_deleted && !has_conflict {
+        return;
+    }
+
+    let Some(workspace) = editor.workspace() else {
+        return;
+    };
+    if workspace
+        .read(cx)
+        .pane_for_item_id(cx.entity_id())
+        .is_none()
+    {
+        return;
+    }
+    let project = workspace.read(cx).project().clone();
+
+    prompt_open.set(true);
+    let (message, buttons): (&str, &[&str]) = if was_deleted {
+        (
+            "This note was deleted outside zednotes.",
+            &["Keep Open", "Save Again", "Close"],
+        )
+    } else {
+        (
+            "This note changed on disk while you have unsaved edits.",
+            &["Keep My Changes", "Reload from Disk", "Compare"],
+        )
+    };
+    let answer = window.prompt(gpui::PromptLevel::Warning, message, None, buttons, cx);
+    cx.spawn_in(window, async move |editor, cx| {
+        let answer = answer.await.ok();
+        prompt_open.set(false);
+        let Some(answer) = answer else {
+            return Ok(());
+        };
+        let Some(editor) = editor.upgrade() else {
+            return Ok(());
+        };
+
+        if was_deleted {
+            match answer {
+                0 => {}
+                1 => {
+                    let save = cx.update(|window, cx| {
+                        editor.save(
+                            SaveOptions {
+                                format: false,
+                                force_format: false,
+                                autosave: false,
+                            },
+                            project,
+                            window,
+                            cx,
+                        )
+                    })?;
+                    save.await?;
+                }
+                2 => {
+                    workspace.update_in(cx, |workspace, window, cx| {
+                        if let Some(pane) = workspace.pane_for_item_id(editor.entity_id()) {
+                            pane.update(cx, |pane, cx| {
+                                pane.remove_item(editor.entity_id(), true, false, window, cx);
+                            });
+                        }
+                    })?;
+                }
+                _ => {}
+            }
+        } else {
+            match answer {
+                0 => {}
+                1 => {
+                    let reload = cx.update(|window, cx| editor.reload(project, window, cx))?;
+                    reload.await?;
+                }
+                2 => {
+                    if let Some(path) = path {
+                        let compare = cx.update(|window, cx| {
+                            open_disk_comparison(editor, workspace, project, path, window, cx)
+                        })?;
+                        compare.await?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    })
+    .detach_and_prompt_err(
+        "Failed to handle the external note change",
+        window,
+        cx,
+        |_, _, _| None,
+    );
+}
+
+fn observe_external_file_changes(cx: &mut App) {
+    cx.observe_new(|editor: &mut Editor, window, cx| {
+        let Some(window) = window else {
+            return;
+        };
+        let Some(buffer) = editor.buffer().read(cx).as_singleton() else {
+            return;
+        };
+        let prompt_open = Rc::new(Cell::new(false));
+        let change_generation = Rc::new(Cell::new(0_u64));
+
+        cx.subscribe_in(
+            &buffer,
+            window,
+            move |_, buffer, event: &BufferEvent, window, cx| {
+                if matches!(event, BufferEvent::Saved | BufferEvent::Reloaded) {
+                    change_generation.set(change_generation.get().wrapping_add(1));
+                } else if event == &BufferEvent::FileHandleChanged {
+                    let generation = change_generation.get().wrapping_add(1);
+                    change_generation.set(generation);
+                    let change_generation = change_generation.clone();
+                    let buffer = buffer.clone();
+                    let prompt_open = prompt_open.clone();
+                    cx.spawn_in(window, async move |editor, cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(25))
+                            .await;
+                        if change_generation.get() != generation {
+                            return;
+                        }
+                        editor
+                            .update_in(cx, |editor, window, cx| {
+                                prompt_for_external_file_change(
+                                    editor,
+                                    buffer,
+                                    prompt_open,
+                                    window,
+                                    cx,
+                                );
+                            })
+                            .log_err();
+                    })
+                    .detach();
+                }
+            },
+        )
+        .detach();
+    })
+    .detach();
+}
+
 fn close_preview(
     workspace: &mut Workspace,
     preview: gpui::Entity<MarkdownPreviewView>,
@@ -489,6 +818,7 @@ fn dispatch_project_panel_action(
 fn init_workspace_composition(
     app_state: Arc<AppState>,
     explorer_settings: ExplorerSettings,
+    autosave_settings: AutosaveSettings,
     cx: &mut App,
 ) {
     let entry_filter = markdown_entry_filter(explorer_settings.markdown_only);
@@ -497,7 +827,7 @@ fn init_workspace_composition(
             return;
         };
 
-        configure_workspace(workspace, window, cx);
+        configure_workspace(workspace, autosave_settings, window, cx);
 
         workspace.register_action({
             let app_state = app_state.clone();
@@ -631,8 +961,10 @@ pub fn init(session: Session, cx: &mut App) -> Result<Arc<AppState>> {
     theme_settings::init(LoadThemes::All(Box::new(Assets)), cx);
     let explorer_settings = load_explorer_settings()?;
     let preview_settings = load_preview_settings()?;
+    let autosave_settings = load_autosave_settings()?;
     apply_explorer_settings(&explorer_settings, cx);
     apply_preview_settings(&preview_settings, cx);
+    apply_autosave_settings(autosave_settings, cx);
 
     let fs: Arc<dyn Fs> = Arc::new(RealFs::new(None, cx.background_executor().clone()));
     <dyn Fs>::set_global(fs.clone(), cx);
@@ -660,28 +992,35 @@ pub fn init(session: Session, cx: &mut App) -> Result<Arc<AppState>> {
 
     AppState::set_global(app_state.clone(), cx);
     zed_workspace::init(app_state.clone(), cx);
-    init_editor_subsystems(cx)?;
-    init_workspace_composition(app_state.clone(), explorer_settings, cx);
+    init_editor_subsystems(autosave_settings, cx)?;
+    init_workspace_composition(app_state.clone(), explorer_settings, autosave_settings, cx);
     Ok(app_state)
 }
 
 fn configure_workspace(
     workspace: &mut Workspace,
+    autosave_settings: AutosaveSettings,
     window: &mut Window,
     cx: &mut gpui::Context<Workspace>,
 ) {
     let active_pane = workspace.active_pane().clone();
-    configure_pane(workspace, &active_pane, window, cx);
+    configure_pane(workspace, &active_pane, autosave_settings, window, cx);
     let workspace_entity = cx.entity();
     cx.subscribe_in(
         &workspace_entity,
         window,
-        |workspace, _, event, window, cx| {
+        move |workspace, _, event, window, cx| {
             if let WorkspaceEvent::PaneAdded(pane) = event {
-                configure_pane(workspace, pane, window, cx);
+                configure_pane(workspace, pane, autosave_settings, window, cx);
             }
         },
     )
+    .detach();
+    cx.observe_window_activation(window, move |workspace, window, cx| {
+        if autosave_settings.enabled && !window.is_window_active() {
+            autosave_workspace(workspace, window, cx);
+        }
+    })
     .detach();
     workspace.status_bar().update(cx, |status_bar, cx| {
         let mode_indicator = cx.new(|cx| ModeIndicator::new(window, cx));
@@ -689,9 +1028,42 @@ fn configure_workspace(
     });
 }
 
+fn autosave_workspace(
+    workspace: &Workspace,
+    window: &mut Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    for task in autosave_tasks(workspace, window, cx) {
+        task.detach_and_log_err(cx);
+    }
+}
+
+fn autosave_tasks(
+    workspace: &Workspace,
+    window: &mut Window,
+    cx: &mut App,
+) -> Vec<gpui::Task<Result<()>>> {
+    let project = workspace.project().clone();
+    let items = workspace
+        .panes()
+        .iter()
+        .flat_map(|pane| {
+            pane.read(cx)
+                .items()
+                .map(|item| item.boxed_clone())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    items
+        .into_iter()
+        .map(|item| Pane::autosave_item(item.as_ref(), project.clone(), window, cx))
+        .collect()
+}
+
 fn configure_pane(
     workspace: &Workspace,
     pane: &gpui::Entity<Pane>,
+    autosave_settings: AutosaveSettings,
     window: &mut Window,
     cx: &mut gpui::Context<Workspace>,
 ) {
@@ -704,6 +1076,14 @@ fn configure_pane(
             toolbar.add_item(project_search_bar, window, cx);
         });
     });
+    if autosave_settings.enabled {
+        cx.subscribe_in(pane, window, |workspace, _, event, window, cx| {
+            if matches!(event, PaneEvent::ActivateItem { .. }) {
+                autosave_workspace(workspace, window, cx);
+            }
+        })
+        .detach();
+    }
 }
 
 fn notes_window_options(_display: Option<uuid::Uuid>, cx: &mut App) -> WindowOptions {
@@ -802,9 +1182,10 @@ mod tests {
         cx: VisualTestContext,
     }
 
-    async fn test_window_with(
+    async fn test_window_with_settings(
         cx: &mut TestAppContext,
         explorer_settings: ExplorerSettings,
+        autosave_settings: AutosaveSettings,
         tree: Value,
         initial_note_path: &str,
     ) -> TestWindow {
@@ -816,8 +1197,10 @@ mod tests {
             zed_workspace::init(app_state.clone(), cx);
             apply_explorer_settings(&explorer_settings, cx);
             apply_preview_settings(&PreviewSettings::default(), cx);
-            init_editor_subsystems(cx).expect("failed to initialize editor test subsystems");
-            init_workspace_composition(app_state.clone(), explorer_settings, cx);
+            apply_autosave_settings(autosave_settings, cx);
+            init_editor_subsystems(autosave_settings, cx)
+                .expect("failed to initialize editor test subsystems");
+            init_workspace_composition(app_state.clone(), explorer_settings, autosave_settings, cx);
             app_state
         });
 
@@ -863,6 +1246,22 @@ mod tests {
             window,
             cx: window_cx,
         }
+    }
+
+    async fn test_window_with(
+        cx: &mut TestAppContext,
+        explorer_settings: ExplorerSettings,
+        tree: Value,
+        initial_note_path: &str,
+    ) -> TestWindow {
+        test_window_with_settings(
+            cx,
+            explorer_settings,
+            AutosaveSettings::default(),
+            tree,
+            initial_note_path,
+        )
+        .await
     }
 
     async fn test_window(cx: &mut TestAppContext) -> TestWindow {
@@ -944,6 +1343,11 @@ mod tests {
         test.window
             .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
             .expect("failed to read the notes window")
+    }
+
+    fn settle_external_change(test: &TestWindow) {
+        test.cx.executor().advance_clock(Duration::from_millis(25));
+        test.cx.run_until_parked();
     }
 
     fn buffer_search_bar(test: &TestWindow, cx: &TestAppContext) -> gpui::Entity<BufferSearchBar> {
@@ -1034,6 +1438,340 @@ mod tests {
         assert_eq!(
             test.fs.load(Path::new(TEST_NOTE_PATH)).await.unwrap(),
             format!("x{TEST_NOTE}")
+        );
+    }
+
+    #[test]
+    fn test_parses_autosave_settings_from_jsonc() {
+        assert_eq!(
+            parse_autosave_settings("{}").expect("default settings should parse"),
+            AutosaveSettings {
+                enabled: true,
+                delay_ms: 750,
+            }
+        );
+
+        let settings = parse_autosave_settings(
+            r#"
+            {
+                "autosave": {
+                    "enabled": false,
+                    "delay_ms": 1250,
+                },
+            }
+            "#,
+        )
+        .expect("settings should parse");
+
+        assert_eq!(
+            settings,
+            AutosaveSettings {
+                enabled: false,
+                delay_ms: 1250,
+            }
+        );
+    }
+
+    #[gpui::test]
+    async fn test_autosave_uses_the_configured_trailing_delay(cx: &mut TestAppContext) {
+        let mut test = test_window_with_settings(
+            cx,
+            ExplorerSettings::default(),
+            AutosaveSettings {
+                enabled: true,
+                delay_ms: 2500,
+            },
+            json!({ "spike.md": TEST_NOTE }),
+            TEST_NOTE_PATH,
+        )
+        .await;
+
+        test.cx.simulate_keystrokes("i x escape");
+        test.cx
+            .executor()
+            .advance_clock(Duration::from_millis(1000));
+        test.cx.run_until_parked();
+        assert_eq!(
+            test.fs.load(Path::new(TEST_NOTE_PATH)).await.unwrap(),
+            TEST_NOTE
+        );
+
+        test.cx
+            .executor()
+            .advance_clock(Duration::from_millis(1500));
+        test.cx.run_until_parked();
+        assert_eq!(
+            test.fs.load(Path::new(TEST_NOTE_PATH)).await.unwrap(),
+            format!("x{TEST_NOTE}")
+        );
+        assert!(!cx.has_pending_prompt());
+    }
+
+    #[gpui::test]
+    async fn test_disabled_autosave_leaves_edits_unsaved(cx: &mut TestAppContext) {
+        let mut test = test_window_with_settings(
+            cx,
+            ExplorerSettings::default(),
+            AutosaveSettings {
+                enabled: false,
+                delay_ms: 1,
+            },
+            json!({ "spike.md": TEST_NOTE }),
+            TEST_NOTE_PATH,
+        )
+        .await;
+
+        test.cx.simulate_keystrokes("i x escape");
+        test.cx.executor().advance_clock(Duration::from_secs(2));
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            test.fs.load(Path::new(TEST_NOTE_PATH)).await.unwrap(),
+            TEST_NOTE
+        );
+    }
+
+    #[gpui::test]
+    async fn test_tab_switch_flushes_pending_autosave(cx: &mut TestAppContext) {
+        let mut test = test_window_with(
+            cx,
+            ExplorerSettings::default(),
+            json!({
+                "alpha.md": "# Alpha\n",
+                "beta.md": "# Beta\n",
+            }),
+            "/notes/alpha.md",
+        )
+        .await;
+
+        test.cx.simulate_keystrokes("i x escape");
+        focus_project_path(&mut test, "beta.md", cx);
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            test.fs.load(Path::new("/notes/alpha.md")).await.unwrap(),
+            "x# Alpha\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_window_deactivation_flushes_pending_autosave(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+
+        test.cx.update(|window, _| window.activate_window());
+        test.cx.run_until_parked();
+        test.cx.simulate_keystrokes("i x escape");
+        test.cx.deactivate_window();
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            test.fs.load(Path::new(TEST_NOTE_PATH)).await.unwrap(),
+            format!("x{TEST_NOTE}")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_quit_flushes_pending_autosave(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+
+        test.cx.simulate_keystrokes("i x escape");
+        test.cx.dispatch_action(Quit);
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            test.fs.load(Path::new(TEST_NOTE_PATH)).await.unwrap(),
+            format!("x{TEST_NOTE}")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_clean_external_edit_reloads_without_prompt(cx: &mut TestAppContext) {
+        let test = test_window(cx).await;
+
+        test.fs
+            .save(
+                Path::new(TEST_NOTE_PATH),
+                &"# Changed outside\n".into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        settle_external_change(&test);
+
+        assert_eq!(
+            test.editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "# Changed outside\n"
+        );
+        assert!(!cx.has_pending_prompt());
+    }
+
+    #[gpui::test]
+    async fn test_dirty_external_edit_can_keep_or_reload_changes(cx: &mut TestAppContext) {
+        let mut test = test_window_with_settings(
+            cx,
+            ExplorerSettings::default(),
+            AutosaveSettings {
+                enabled: false,
+                delay_ms: DEFAULT_AUTOSAVE_DELAY_MS,
+            },
+            json!({ "spike.md": TEST_NOTE }),
+            TEST_NOTE_PATH,
+        )
+        .await;
+
+        test.cx.simulate_keystrokes("i x escape");
+        test.fs
+            .save(
+                Path::new(TEST_NOTE_PATH),
+                &"# Changed outside\n".into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        settle_external_change(&test);
+
+        assert_eq!(
+            cx.pending_prompt()
+                .expect("conflict prompt should be open")
+                .0,
+            "This note changed on disk while you have unsaved edits."
+        );
+        cx.simulate_prompt_answer("Keep My Changes");
+        test.cx.run_until_parked();
+        assert_eq!(
+            test.editor.read_with(cx, |editor, cx| editor.text(cx)),
+            format!("x{TEST_NOTE}")
+        );
+
+        test.fs
+            .save(
+                Path::new(TEST_NOTE_PATH),
+                &"# Changed again\n".into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        settle_external_change(&test);
+        cx.simulate_prompt_answer("Reload from Disk");
+        test.cx.run_until_parked();
+        assert_eq!(
+            test.editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "# Changed again\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_dirty_external_edit_compare_opens_disk_copy_beside_buffer(
+        cx: &mut TestAppContext,
+    ) {
+        let mut test = test_window_with_settings(
+            cx,
+            ExplorerSettings::default(),
+            AutosaveSettings {
+                enabled: false,
+                delay_ms: DEFAULT_AUTOSAVE_DELAY_MS,
+            },
+            json!({ "spike.md": TEST_NOTE }),
+            TEST_NOTE_PATH,
+        )
+        .await;
+
+        test.cx.simulate_keystrokes("i x escape");
+        test.fs
+            .save(
+                Path::new(TEST_NOTE_PATH),
+                &"# Disk copy\n".into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        settle_external_change(&test);
+        cx.simulate_prompt_answer("Compare");
+        test.cx.run_until_parked();
+
+        let workspace = workspace(&test, cx);
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.panes().len()),
+            2
+        );
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .active_item_as::<Editor>(cx)
+                    .expect("the on-disk copy should be active")
+                    .read_with(cx, |editor, cx| editor.text(cx))
+            }),
+            "# Disk copy\n"
+        );
+        assert_eq!(
+            test.editor.read_with(cx, |editor, cx| editor.text(cx)),
+            format!("x{TEST_NOTE}")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_external_delete_can_keep_the_buffer_open(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+        test.cx.simulate_keystrokes("i x escape");
+
+        test.fs
+            .remove_file(Path::new(TEST_NOTE_PATH), Default::default())
+            .await
+            .unwrap();
+        settle_external_change(&test);
+        assert_eq!(
+            cx.pending_prompt().expect("delete prompt should be open").0,
+            "This note was deleted outside zednotes."
+        );
+        cx.simulate_prompt_answer("Keep Open");
+        test.cx.run_until_parked();
+        assert_eq!(
+            workspace(&test, cx).read_with(cx, |workspace, cx| workspace
+                .active_pane()
+                .read(cx)
+                .items_len()),
+            1
+        );
+        assert!(!test.fs.is_file(Path::new(TEST_NOTE_PATH)).await);
+    }
+
+    #[gpui::test]
+    async fn test_external_delete_can_save_the_buffer_again(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+        test.cx.simulate_keystrokes("i x escape");
+
+        test.fs
+            .remove_file(Path::new(TEST_NOTE_PATH), Default::default())
+            .await
+            .unwrap();
+        settle_external_change(&test);
+        cx.simulate_prompt_answer("Save Again");
+        test.cx.run_until_parked();
+        assert_eq!(
+            test.fs.load(Path::new(TEST_NOTE_PATH)).await.unwrap(),
+            format!("x{TEST_NOTE}")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_external_delete_can_close_the_orphaned_buffer(cx: &mut TestAppContext) {
+        let test = test_window(cx).await;
+
+        test.fs
+            .remove_file(Path::new(TEST_NOTE_PATH), Default::default())
+            .await
+            .unwrap();
+        settle_external_change(&test);
+        cx.simulate_prompt_answer("Close");
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            workspace(&test, cx).read_with(cx, |workspace, cx| workspace
+                .active_pane()
+                .read(cx)
+                .items_len()),
+            0
         );
     }
 
@@ -1728,6 +2466,70 @@ mod tests {
                 .active_modal::<file_finder::FileFinder>(cx)
                 .is_some()),
             "a non-Markdown query should have no selectable result"
+        );
+        test.cx.simulate_keystrokes("escape");
+    }
+
+    #[gpui::test]
+    async fn test_external_create_and_delete_refresh_explorer_and_quick_open(
+        cx: &mut TestAppContext,
+    ) {
+        let mut test = test_window_with(
+            cx,
+            ExplorerSettings::default(),
+            json!({
+                "alpha.md": "# Alpha\n",
+                "removed.md": "# Removed\n",
+            }),
+            "/notes/alpha.md",
+        )
+        .await;
+
+        test.fs
+            .insert_file("/notes/external.md", b"# External\n".to_vec())
+            .await;
+        test.cx.run_until_parked();
+        focus_project_path(&mut test, "external.md", cx);
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/external.md")
+        );
+
+        focus_project_path(&mut test, "alpha.md", cx);
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+        let worktree = test.project.read_with(cx, |project, cx| {
+            project.visible_worktrees(cx).next().unwrap()
+        });
+        test.fs
+            .remove_file(Path::new("/notes/removed.md"), Default::default())
+            .await
+            .unwrap();
+        worktree.next_event(cx).await;
+        test.cx.executor().advance_clock(Duration::from_millis(100));
+        test.cx.run_until_parked();
+        let removed_path = project_path(&test.project, "removed.md", cx);
+        assert!(test.project.read_with(cx, |project, cx| {
+            project.entry_for_path(&removed_path, cx).is_none()
+        }));
+
+        test.cx.simulate_keystrokes("cmd-p");
+        test.cx.simulate_input("removed.md");
+        test.cx.executor().advance_clock(Duration::from_millis(100));
+        test.cx.run_until_parked();
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/alpha.md")
+        );
+        assert!(
+            workspace(&test, cx).read_with(cx, |workspace, cx| workspace
+                .active_modal::<file_finder::FileFinder>(cx)
+                .is_some()),
+            "the deleted note must not remain selectable in quick open"
         );
         test.cx.simulate_keystrokes("escape");
     }

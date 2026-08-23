@@ -76,17 +76,33 @@ pub struct FileFinder {
 pub type FileFilter = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
 
 pub fn init(cx: &mut App) {
-    init_with_optional_file_filter(None, cx);
+    init_with_options(None, true, cx);
 }
 
 /// Initializes the file finder with an application-wide path filter.
 pub fn init_with_file_filter(file_filter: FileFilter, cx: &mut App) {
-    init_with_optional_file_filter(Some(file_filter), cx);
+    init_with_options(Some(file_filter), true, cx);
 }
 
-fn init_with_optional_file_filter(file_filter: Option<FileFilter>, cx: &mut App) {
+/// Initializes the file finder with an application-wide path filter and controls
+/// whether an exact query for a missing path offers to create that file.
+pub fn init_with_file_filter_and_file_creation(
+    file_filter: FileFilter,
+    allow_file_creation: bool,
+    cx: &mut App,
+) {
+    init_with_options(Some(file_filter), allow_file_creation, cx);
+}
+
+fn init_with_options(file_filter: Option<FileFilter>, allow_file_creation: bool, cx: &mut App) {
     cx.observe_new(move |workspace, window, cx| {
-        FileFinder::register(workspace, window, file_filter.clone(), cx)
+        FileFinder::register(
+            workspace,
+            window,
+            file_filter.clone(),
+            allow_file_creation,
+            cx,
+        )
     })
     .detach();
     cx.observe_new(OpenPathPrompt::register).detach();
@@ -98,6 +114,7 @@ impl FileFinder {
         workspace: &mut Workspace,
         _window: Option<&mut Window>,
         file_filter: Option<FileFilter>,
+        allow_file_creation: bool,
         _: &mut Context<Workspace>,
     ) {
         workspace.register_action({
@@ -109,6 +126,7 @@ impl FileFinder {
                         action.separate_history,
                         action.include_ignored,
                         file_filter.clone(),
+                        allow_file_creation,
                         window,
                         cx,
                     )
@@ -131,6 +149,7 @@ impl FileFinder {
         separate_history: bool,
         include_ignored: Option<bool>,
         file_filter: Option<FileFilter>,
+        allow_file_creation: bool,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Task<()> {
@@ -185,6 +204,7 @@ impl FileFinder {
                             separate_history,
                             include_ignored,
                             file_filter,
+                            allow_file_creation,
                             window,
                             cx,
                         );
@@ -407,6 +427,7 @@ pub struct FileFinderDelegate {
     focus_handle: FocusHandle,
     include_ignored: Option<bool>,
     file_filter: Option<FileFilter>,
+    allow_file_creation: bool,
     include_ignored_refresh: Task<()>,
     debounce_next_refresh: bool,
 }
@@ -993,6 +1014,7 @@ impl FileFinderDelegate {
         separate_history: bool,
         include_ignored: Option<bool>,
         file_filter: Option<FileFilter>,
+        allow_file_creation: bool,
         window: &mut Window,
         cx: &mut Context<FileFinder>,
     ) -> Self {
@@ -1037,6 +1059,7 @@ impl FileFinderDelegate {
             focus_handle: cx.focus_handle(),
             include_ignored: include_ignored.or(FileFinderSettings::get_global(cx).include_ignored),
             file_filter,
+            allow_file_creation,
             include_ignored_refresh: Task::ready(()),
             debounce_next_refresh: false,
         }
@@ -1255,7 +1278,9 @@ impl FileFinderDelegate {
             }
 
             let query_path = query.path_query();
-            if let Ok(mut query_path) = RelPath::new(Path::new(query_path), path_style) {
+            if self.allow_file_creation
+                && let Ok(mut query_path) = RelPath::new(Path::new(query_path), path_style)
+            {
                 let available_worktree = self
                     .project
                     .read(cx)

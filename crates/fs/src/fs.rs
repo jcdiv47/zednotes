@@ -37,7 +37,6 @@ use git::repository::{GitRepository, RealGitRepository};
 use is_executable::IsExecutable;
 use rope::Rope;
 use serde::{Deserialize, Serialize};
-use smol::io::AsyncWriteExt;
 #[cfg(feature = "test-support")]
 use std::path::Component;
 use std::{
@@ -932,6 +931,10 @@ impl Fs for RealFs {
             let mut tmp_file =
                 tempfile::NamedTempFile::new_in(path.parent().unwrap_or(paths::temp_dir()))?;
             tmp_file.write_all(data.as_bytes())?;
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                tmp_file.as_file().set_permissions(metadata.permissions())?;
+            }
+            tmp_file.as_file_mut().sync_all()?;
             tmp_file.persist(path)?;
             anyhow::Ok(())
         })
@@ -960,6 +963,10 @@ impl Fs for RealFs {
                 let temp_file_path = temp_dir.path().join("temp_file");
                 let mut file = std::fs::File::create_new(&temp_file_path)?;
                 file.write_all(data.as_bytes())?;
+                if let Ok(metadata) = std::fs::metadata(&path) {
+                    file.set_permissions(metadata.permissions())?;
+                }
+                file.sync_all()?;
                 temp_file_path
             };
             atomic_replace(path.as_path(), temp_file.as_path())?;
@@ -970,21 +977,15 @@ impl Fs for RealFs {
     }
 
     async fn save(&self, path: &Path, text: &Rope, line_ending: LineEnding) -> Result<()> {
-        let buffer_size = text.summary().len.min(10 * 1024);
-        if let Some(path) = path.parent() {
-            self.create_dir(path)
+        if let Some(parent) = path.parent() {
+            self.create_dir(parent)
                 .await
-                .with_context(|| format!("Failed to create directory at {:?}", path))?;
+                .with_context(|| format!("Failed to create directory at {:?}", parent))?;
         }
-        let file = smol::fs::File::create(path)
+        let content = text::chunks_with_line_ending(text, line_ending).collect::<String>();
+        self.atomic_write(path.to_path_buf(), content)
             .await
-            .with_context(|| format!("Failed to create file at {:?}", path))?;
-        let mut writer = smol::io::BufWriter::with_capacity(buffer_size, file);
-        for chunk in text::chunks_with_line_ending(text, line_ending) {
-            writer.write_all(chunk.as_bytes()).await?;
-        }
-        writer.flush().await?;
-        Ok(())
+            .with_context(|| format!("Failed to save file at {:?}", path))
     }
 
     async fn write(&self, path: &Path, content: &[u8]) -> Result<()> {

@@ -1,5 +1,7 @@
 mod fake_git_repo_tests;
 
+#[cfg(not(target_os = "windows"))]
+use std::io::{Read, Seek};
 use std::{
     collections::BTreeSet,
     io::Write,
@@ -455,6 +457,25 @@ async fn test_realfs_atomic_write_non_existing_file(executor: BackgroundExecutor
     gpui::block_on(fs.atomic_write(file_to_be_replaced.clone(), "Hello".into())).unwrap();
     let content = std::fs::read_to_string(&file_to_be_replaced).unwrap();
     assert_eq!(content, "Hello");
+}
+
+#[gpui::test]
+#[cfg(not(target_os = "windows"))]
+async fn test_realfs_save_replaces_existing_file_atomically(executor: BackgroundExecutor) {
+    let fs = RealFs::new(None, executor);
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("file.txt");
+    let mut old_file = std::fs::File::create_new(&path).unwrap();
+    old_file.write_all(b"old contents").unwrap();
+
+    let text = rope::Rope::from("new contents".to_owned());
+    gpui::block_on(fs.save(&path, &text, text::LineEnding::Unix)).unwrap();
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new contents");
+    old_file.rewind().unwrap();
+    let mut old_contents = String::new();
+    old_file.read_to_string(&mut old_contents).unwrap();
+    assert_eq!(old_contents, "old contents");
 }
 
 #[gpui::test]

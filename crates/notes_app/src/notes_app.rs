@@ -4,32 +4,44 @@
 //! crates of the fork, so that merges from `upstream` stay cheap.
 
 use std::{
-    cell::Cell, io::ErrorKind, path::Path, path::PathBuf, rc::Rc, sync::Arc, time::Duration,
+    cell::Cell,
+    cmp::Reverse,
+    io::ErrorKind,
+    path::Path,
+    path::PathBuf,
+    rc::Rc,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, Result};
 use assets::Assets;
 use client::{Client, UserStore};
+use db::kvp::KeyValueStore;
 use editor::Editor;
 use fs::{Fs, PathEventKind, RealFs};
 use futures::StreamExt as _;
+#[cfg(test)]
+use gpui::WindowHandle;
 use gpui::{
-    App, AppContext as _, BorrowAppContext as _, Bounds, Focusable as _, Global, KeyBinding, Menu,
-    MenuItem, PathPromptOptions, TaskExt as _, TitlebarOptions, Window, WindowBounds, WindowHandle,
-    WindowOptions, actions, px, size,
+    Action as _, AnyElement, App, AppContext as _, AsyncApp, BorrowAppContext as _, Bounds,
+    DismissEvent, Entity, Focusable as _, Global, KeyBinding, Menu, MenuItem, PathPromptOptions,
+    Render, Subscription, Task, TaskExt as _, TitlebarOptions, WeakEntity, Window, WindowBounds,
+    WindowOptions, actions, div, prelude::*, px, size,
 };
 use http_client::BlockedHttpClient;
 use language::{Buffer, BufferEvent, Capability, DiskState, Language, LanguageRegistry};
 use markdown_preview::markdown_preview_view::MarkdownPreviewView;
 use node_runtime::NodeRuntime;
-use project::{LocalProjectFlags, Project};
+use picker::{Picker, PickerDelegate};
+use project::Project;
 use project_panel::{
     EntryFilter, Event as ProjectPanelEvent, ProjectPanel, ProjectPanelOptions,
     project_panel_settings::ProjectPanelSettings,
 };
 use search::{BufferSearchBar, ProjectSearchView, project_search::ProjectSearchBar};
 use semver::Version;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use session::{AppSession, Session};
 use settings::{
     AutosaveSetting, BufferLineHeight, DockSide, FontFamilyName, KeybindSource, KeymapFile,
@@ -41,8 +53,9 @@ use util::ResultExt as _;
 use vim::ModeIndicator;
 use workspace as zed_workspace;
 use zed_workspace::{
-    AppState, CloseIntent, Event as WorkspaceEvent, ItemHandle as _, MultiWorkspace, OpenOptions,
-    OpenVisible, Pane, SaveIntent, SplitDirection, Toast, Workspace, WorkspaceStore,
+    AppState, CloseIntent, Event as WorkspaceEvent, ItemHandle as _, MultiWorkspace, OpenMode,
+    OpenOptions, OpenVisible, Pane, SaveIntent, SerializedWorkspaceLocation, SessionWorkspace,
+    SplitDirection, Toast, Workspace, WorkspaceStore,
     dock::DockPosition,
     item::SaveOptions,
     notifications::{DetachAndPromptErr as _, NotificationId},
@@ -50,7 +63,6 @@ use zed_workspace::{
 };
 
 const APP_NAME: &str = "zednotes";
-const NOTE_FILE_NAME: &str = "spike.md";
 const DEFAULT_MARKDOWN_SEARCH_FILTER: &str = "**/*.md, **/*.markdown";
 const DEFAULT_EXCLUDED_PATHS: &[&str] = &[".git", ".DS_Store", "node_modules", "target"];
 const DEFAULT_PREVIEW_MAX_WIDTH: u32 = 760;
@@ -60,6 +72,8 @@ const DEFAULT_EXPLORER_WIDTH: u32 = 240;
 const DEFAULT_EDITOR_FONT_FAMILY: &str = ".ZedMono";
 const DEFAULT_EDITOR_FONT_SIZE: f32 = 15.0;
 const DEFAULT_EDITOR_LINE_HEIGHT: f32 = 1.55;
+const RECENT_NOTES_KEY: &str = "notes_recent_usage";
+const MAX_RECENT_NOTES: usize = 512;
 const INITIAL_SETTINGS_CONTENT: &str = r#"{
   // system, light, or dark
   "theme": "system",
@@ -105,6 +119,9 @@ actions!(
     [
         /// Opens a directory as the notes workspace.
         OpenFolder,
+        /// Opens a recently used notes workspace.
+        #[action(name = "Open Recent")]
+        OpenRecentWorkspace,
         /// Searches Markdown notes in the workspace.
         Search,
     ]
@@ -133,6 +150,9 @@ actions!(
         Delete,
         /// Duplicates the selected note or directory.
         Duplicate,
+        /// Opens a recency-and-frequency-ranked list of recent notes.
+        #[action(name = "Open Recent")]
+        OpenRecentNote,
         /// Toggles a preview split for the active note.
         TogglePreview,
         /// Opens the active note as a preview-only tab.
@@ -260,6 +280,267 @@ struct CurrentNotesSettings(NotesSettings);
 
 impl Global for CurrentNotesSettings {}
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct RecentNotes {
+    entries: Vec<RecentNoteUsage>,
+}
+
+impl Global for RecentNotes {}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RecentNoteUsage {
+    path: PathBuf,
+    open_count: u64,
+    last_opened: u64,
+}
+
+impl RecentNotes {
+    fn record(&mut self, path: PathBuf, opened_at: u64) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.path == path) {
+            entry.open_count = entry.open_count.saturating_add(1);
+            entry.last_opened = opened_at;
+        } else {
+            self.entries.push(RecentNoteUsage {
+                path,
+                open_count: 1,
+                last_opened: opened_at,
+            });
+        }
+        self.entries.sort_by_key(|entry| Reverse(entry.last_opened));
+        self.entries.truncate(MAX_RECENT_NOTES);
+    }
+
+    fn score(&self, path: &Path) -> f64 {
+        let Some(entry) = self.entries.iter().find(|entry| entry.path == path) else {
+            return 0.0;
+        };
+        entry.last_opened as f64 + (entry.open_count as f64 + 1.0).ln() * 86_400.0
+    }
+}
+
+struct NotesEmptyState {
+    project: Entity<Project>,
+    _subscription: Subscription,
+}
+
+impl NotesEmptyState {
+    fn new(project: Entity<Project>, cx: &mut gpui::Context<Self>) -> Self {
+        let _subscription = cx.subscribe(&project, |_, _, event, cx| {
+            if matches!(
+                event,
+                project::Event::WorktreeAdded(_)
+                    | project::Event::WorktreeRemoved(_)
+                    | project::Event::WorktreeUpdatedEntries(_, _)
+            ) {
+                cx.notify();
+            }
+        });
+        Self {
+            project,
+            _subscription,
+        }
+    }
+
+    fn has_markdown_notes(&self, cx: &App) -> bool {
+        self.project.read(cx).visible_worktrees(cx).any(|worktree| {
+            worktree
+                .read(cx)
+                .snapshot()
+                .files(false, 0)
+                .any(|entry| is_markdown_path(entry.path.as_std_path()))
+        })
+    }
+}
+
+impl Render for NotesEmptyState {
+    fn render(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        let has_notes = self.has_markdown_notes(cx);
+        let title = if has_notes {
+            "Select a note"
+        } else {
+            "No notes yet"
+        };
+        let shortcuts = if has_notes {
+            "⌘P Open note    ⌘N New note    ⌘⇧F Search"
+        } else {
+            "⌘N New note    ⌘O Open folder    ⌘P Find note"
+        };
+        let colors = cx.theme().colors();
+
+        div()
+            .key_context("NotesEmptyState")
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .text_color(colors.text)
+            .child(div().text_size(px(18.)).child(title))
+            .child(div().text_color(colors.text_muted).child(shortcuts))
+    }
+}
+
+struct RecentWorkspacePickerDelegate {
+    workspace: WeakEntity<Workspace>,
+    workspaces: Vec<zed_workspace::RecentWorkspace>,
+    filtered_indices: Vec<usize>,
+    selected_index: usize,
+}
+
+impl RecentWorkspacePickerDelegate {
+    fn new(
+        workspace: WeakEntity<Workspace>,
+        workspaces: Vec<zed_workspace::RecentWorkspace>,
+    ) -> Self {
+        let filtered_indices = (0..workspaces.len()).collect();
+        Self {
+            workspace,
+            workspaces,
+            filtered_indices,
+            selected_index: 0,
+        }
+    }
+
+    fn workspace_label(workspace: &zed_workspace::RecentWorkspace) -> String {
+        workspace
+            .identity_paths
+            .ordered_paths()
+            .next()
+            .or_else(|| workspace.paths.ordered_paths().next())
+            .and_then(|path| path.file_name())
+            .map_or_else(
+                || "Notes Folder".to_owned(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+    }
+
+    fn workspace_path(workspace: &zed_workspace::RecentWorkspace) -> String {
+        workspace
+            .paths
+            .ordered_paths()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+}
+
+impl PickerDelegate for RecentWorkspacePickerDelegate {
+    type ListItem = AnyElement;
+
+    fn name() -> &'static str {
+        "notes recent workspaces"
+    }
+
+    fn match_count(&self) -> usize {
+        self.filtered_indices.len()
+    }
+
+    fn selected_index(&self) -> usize {
+        self.selected_index
+    }
+
+    fn set_selected_index(
+        &mut self,
+        index: usize,
+        _window: &mut Window,
+        cx: &mut gpui::Context<Picker<Self>>,
+    ) {
+        self.selected_index = index.min(self.filtered_indices.len().saturating_sub(1));
+        cx.notify();
+    }
+
+    fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
+        "Search recent notes folders…".into()
+    }
+
+    fn update_matches(
+        &mut self,
+        query: String,
+        _window: &mut Window,
+        cx: &mut gpui::Context<Picker<Self>>,
+    ) -> Task<()> {
+        let query = query.to_lowercase();
+        self.filtered_indices = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, workspace)| {
+                let label = Self::workspace_label(workspace).to_lowercase();
+                let path = Self::workspace_path(workspace).to_lowercase();
+                (query.is_empty() || label.contains(&query) || path.contains(&query))
+                    .then_some(index)
+            })
+            .collect();
+        self.selected_index = self
+            .selected_index
+            .min(self.filtered_indices.len().saturating_sub(1));
+        cx.notify();
+        Task::ready(())
+    }
+
+    fn confirm(
+        &mut self,
+        _secondary: bool,
+        window: &mut Window,
+        cx: &mut gpui::Context<Picker<Self>>,
+    ) {
+        let Some(workspace_index) = self.filtered_indices.get(self.selected_index).copied() else {
+            return;
+        };
+        let Some(recent_workspace) = self.workspaces.get(workspace_index) else {
+            return;
+        };
+        let paths = recent_workspace.paths.paths().to_vec();
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.open_workspace_for_paths(OpenMode::Activate, paths, window, cx)
+                })
+                .detach_and_log_err(cx);
+        }
+        cx.emit(DismissEvent);
+    }
+
+    fn dismissed(&mut self, _window: &mut Window, cx: &mut gpui::Context<Picker<Self>>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn render_match(
+        &self,
+        index: usize,
+        selected: bool,
+        _window: &mut Window,
+        cx: &mut gpui::Context<Picker<Self>>,
+    ) -> Option<Self::ListItem> {
+        let workspace_index = self.filtered_indices.get(index).copied()?;
+        let workspace = self.workspaces.get(workspace_index)?;
+        let colors = cx.theme().colors();
+        Some(
+            div()
+                .id(("recent-workspace", index))
+                .w_full()
+                .px_3()
+                .py_2()
+                .rounded_sm()
+                .when(selected, |element| element.bg(colors.element_selected))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(Self::workspace_label(workspace))
+                        .child(
+                            div()
+                                .text_color(colors.text_muted)
+                                .child(Self::workspace_path(workspace)),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct NotesSettingsContent {
     theme: Option<NotesTheme>,
@@ -371,12 +652,68 @@ fn config_dir_path() -> PathBuf {
     paths::home_dir().join(".config").join(APP_NAME)
 }
 
+pub fn application_support_dir() -> PathBuf {
+    paths::home_dir()
+        .join("Library")
+        .join("Application Support")
+        .join(APP_NAME)
+}
+
 fn notes_settings_path() -> PathBuf {
     config_dir_path().join("settings.json")
 }
 
 fn notes_keymap_path() -> PathBuf {
     config_dir_path().join("keymap.json")
+}
+
+fn load_recent_notes(cx: &mut App) {
+    let key_value_store = KeyValueStore::global(cx);
+    let recent_notes = match key_value_store.read_kvp(RECENT_NOTES_KEY) {
+        Ok(Some(content)) => serde_json::from_str(&content).unwrap_or_else(|error| {
+            log::error!("failed to load recent note usage: {error:#}");
+            RecentNotes::default()
+        }),
+        Ok(None) => RecentNotes::default(),
+        Err(error) => {
+            log::error!("failed to read recent note usage: {error:#}");
+            RecentNotes::default()
+        }
+    };
+    cx.set_global(recent_notes);
+}
+
+fn recent_note_score(path: &Path, cx: &App) -> f64 {
+    cx.try_global::<RecentNotes>()
+        .map_or(0.0, |recent_notes| recent_notes.score(path))
+}
+
+fn record_recent_note(path: PathBuf, cx: &mut App) {
+    if !is_markdown_path(&path) {
+        return;
+    }
+    if !cx.has_global::<RecentNotes>() {
+        cx.set_global(RecentNotes::default());
+    }
+    let opened_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let content = cx.update_global::<RecentNotes, _>(|recent_notes, _| {
+        recent_notes.record(path, opened_at);
+        serde_json::to_string(recent_notes)
+    });
+    let Ok(content) = content else {
+        log::error!("failed to serialize recent note usage");
+        return;
+    };
+    let key_value_store = KeyValueStore::global(cx);
+    cx.background_spawn(async move {
+        key_value_store
+            .write_kvp(RECENT_NOTES_KEY.to_owned(), content)
+            .await
+            .log_err();
+    })
+    .detach();
 }
 
 fn load_notes_settings() -> NotesSettings {
@@ -427,10 +764,6 @@ fn markdown_entry_filter(markdown_only: bool) -> EntryFilter {
     })
 }
 
-fn hard_coded_note_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(NOTE_FILE_NAME)
-}
-
 fn markdown_language(name: &str, grammar: tree_sitter::Language) -> Result<Arc<Language>> {
     let language = Language::new(grammars::load_config(name), Some(grammar))
         .with_queries(grammars::load_queries(name))
@@ -466,6 +799,10 @@ fn bind_default_editor_keymaps(cx: &mut App) -> Result<()> {
     cx.bind_keys([
         KeyBinding::new("cmd-,", OpenSettings, Some("Workspace")),
         KeyBinding::new("cmd-o", OpenFolder, None),
+        KeyBinding::new("cmd-e", OpenRecentNote, Some("Editor")),
+        KeyBinding::new("cmd-e", OpenRecentNote, Some("MarkdownPreview")),
+        KeyBinding::new("cmd-e", OpenRecentNote, Some("ProjectPanel")),
+        KeyBinding::new("cmd-e", OpenRecentNote, Some("Workspace")),
         KeyBinding::new("cmd-n", New, Some("Workspace")),
         KeyBinding::new("cmd-b", ToggleExplorer, Some("Workspace")),
         KeyBinding::new("cmd-shift-f", Search, Some("Pane")),
@@ -562,7 +899,12 @@ fn init_editor_subsystems(cx: &mut App) -> Result<()> {
     zed_actions::init();
     command_palette::init(cx);
     editor::init(cx);
-    file_finder::init_with_file_filter_and_file_creation(Arc::new(is_markdown_path), false, cx);
+    file_finder::init_with_file_filter_file_creation_and_history_ranker(
+        Arc::new(is_markdown_path),
+        false,
+        Arc::new(recent_note_score),
+        cx,
+    );
     markdown_preview::init(cx);
     project_panel::init(cx);
     search::init(cx);
@@ -589,10 +931,12 @@ fn init_editor_subsystems(cx: &mut App) -> Result<()> {
         ]),
         Menu::new("File").items([
             MenuItem::action("Open Folder…", OpenFolder),
+            MenuItem::action("Open Recent…", OpenRecentWorkspace),
             MenuItem::action("Search Workspace", Search),
         ]),
         Menu::new("Note").items([
             MenuItem::action("New Note…", New),
+            MenuItem::action("Open Recent…", OpenRecentNote),
             MenuItem::action("New Directory…", NewDirectory),
             MenuItem::action("Rename…", Rename),
             MenuItem::action("Move to Trash…", Delete),
@@ -605,6 +949,7 @@ fn init_editor_subsystems(cx: &mut App) -> Result<()> {
             MenuItem::action("Toggle Hidden Files", ToggleHiddenFiles),
         ]),
     ]);
+    #[cfg(not(target_os = "macos"))]
     cx.on_window_closed(|cx, _window_id| {
         if cx.windows().is_empty() {
             cx.quit();
@@ -774,6 +1119,17 @@ fn quit(_: &Quit, cx: &mut App) {
                     && !should_quit.await?
                 {
                     return anyhow::Ok(());
+                }
+
+                let flush_task = window
+                    .update(cx, |_, window, cx| {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.flush_serialization(window, cx)
+                        })
+                    })
+                    .log_err();
+                if let Some(flush_task) = flush_task {
+                    flush_task.await;
                 }
             }
         }
@@ -1065,6 +1421,36 @@ fn dispatch_project_panel_action(
     }
 }
 
+fn open_recent_workspace_picker(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    let database = zed_workspace::WorkspaceDb::global(cx);
+    let fs = workspace.app_state().fs.clone();
+    let workspace_handle = cx.entity().downgrade();
+    cx.spawn_in(window, async move |workspace, cx| {
+        let recent_workspaces = database
+            .recent_project_workspaces(fs.as_ref())
+            .await?
+            .into_iter()
+            .filter(|workspace| matches!(workspace.location, SerializedWorkspaceLocation::Local))
+            .collect::<Vec<_>>();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                Picker::uniform_list(
+                    RecentWorkspacePickerDelegate::new(workspace_handle, recent_workspaces),
+                    window,
+                    cx,
+                )
+                .show_scrollbar(true)
+            });
+        })?;
+        anyhow::Ok(())
+    })
+    .detach_and_log_err(cx);
+}
+
 fn open_settings_file(
     workspace: &mut Workspace,
     window: &mut Window,
@@ -1133,6 +1519,19 @@ fn init_workspace_composition(
                     cx,
                 );
             }
+        });
+        workspace.register_action(|workspace, _: &OpenRecentWorkspace, window, cx| {
+            open_recent_workspace_picker(workspace, window, cx);
+        });
+        workspace.register_action(|_, _: &OpenRecentNote, window, cx| {
+            window.dispatch_action(
+                zed_workspace::ToggleFileFinder {
+                    separate_history: true,
+                    include_ignored: Some(false),
+                }
+                .boxed_clone(),
+                cx,
+            );
         });
         workspace.register_action(|_: &mut Workspace, _: &ToggleHiddenFiles, _, cx| {
             let hide_hidden = ProjectPanelSettings::get_global(cx).hide_hidden;
@@ -1319,6 +1718,7 @@ pub fn init(session: Session, cx: &mut App) -> Result<Arc<AppState>> {
     let fs: Arc<dyn Fs> = Arc::new(RealFs::new(None, cx.background_executor().clone()));
     <dyn Fs>::set_global(fs.clone(), cx);
     cx.set_http_client(Arc::new(BlockedHttpClient::new()));
+    load_recent_notes(cx);
 
     let client = Client::production(cx);
     Client::set_global(client.clone(), cx);
@@ -1422,7 +1822,16 @@ fn configure_pane(
     cx: &mut gpui::Context<Workspace>,
 ) {
     let languages = workspace.project().read(cx).languages().clone();
+    let empty_state = cx.new(|cx| NotesEmptyState::new(workspace.project().clone(), cx));
     pane.update(cx, |pane, cx| {
+        pane.set_should_display_welcome_page(false);
+        pane.set_render_empty_state(
+            {
+                let empty_state = empty_state.clone();
+                move |_, _| empty_state.clone().into_any_element()
+            },
+            cx,
+        );
         pane.toolbar().update(cx, |toolbar, cx| {
             let buffer_search_bar = cx.new(|cx| BufferSearchBar::new(Some(languages), window, cx));
             toolbar.add_item(buffer_search_bar, window, cx);
@@ -1431,8 +1840,24 @@ fn configure_pane(
         });
     });
     cx.subscribe_in(pane, window, |workspace, _, event, window, cx| {
-        if autosave_enabled(cx) && matches!(event, PaneEvent::ActivateItem { .. }) {
-            autosave_workspace(workspace, window, cx);
+        if let PaneEvent::ActivateItem { local, .. } = event {
+            if autosave_enabled(cx) {
+                autosave_workspace(workspace, window, cx);
+            }
+            if *local {
+                let active_path = workspace
+                    .active_item(cx)
+                    .and_then(|item| item.project_path(cx))
+                    .and_then(|project_path| {
+                        workspace
+                            .project()
+                            .read(cx)
+                            .absolute_path(&project_path, cx)
+                    });
+                if let Some(active_path) = active_path {
+                    record_recent_note(active_path, cx);
+                }
+            }
         }
     })
     .detach();
@@ -1452,6 +1877,7 @@ fn notes_window_options(_display: Option<uuid::Uuid>, cx: &mut App) -> WindowOpt
     }
 }
 
+#[cfg(test)]
 fn open_notes_window_for_path(
     app_state: Arc<AppState>,
     project: gpui::Entity<Project>,
@@ -1493,30 +1919,154 @@ fn open_notes_window_for_path(
     Ok(window_handle)
 }
 
-pub fn open_notes_window(cx: &mut App) -> Result<WindowHandle<MultiWorkspace>> {
-    let app_state = AppState::global(cx);
-    let project = Project::local(
-        app_state.client.clone(),
-        app_state.node_runtime.clone(),
-        app_state.user_store.clone(),
-        app_state.languages.clone(),
-        app_state.fs.clone(),
-        None,
-        LocalProjectFlags {
-            init_worktree_trust: false,
-            watch_global_configs: false,
-        },
+async fn restore_session_workspaces(app_state: Arc<AppState>, cx: &mut AsyncApp) -> Result<usize> {
+    let (last_session_id, last_session_window_stack, database) = cx.update(|cx| {
+        let session = app_state.session.read(cx);
+        (
+            session.last_session_id().map(str::to_owned),
+            session.last_session_window_stack(),
+            zed_workspace::WorkspaceDb::global(cx),
+        )
+    });
+    let Some(last_session_id) = last_session_id else {
+        return Ok(0);
+    };
+    let Some(locations) = zed_workspace::last_session_workspace_locations(
+        &database,
+        &last_session_id,
+        last_session_window_stack,
+        app_state.fs.as_ref(),
+    )
+    .await
+    else {
+        return Ok(0);
+    };
+    restore_workspace_locations(locations, app_state, cx).await
+}
+
+async fn restore_last_workspace(app_state: Arc<AppState>, cx: &mut AsyncApp) -> Result<usize> {
+    let database = cx.update(|cx| zed_workspace::WorkspaceDb::global(cx));
+    let Some((workspace_id, location, paths)) =
+        zed_workspace::last_opened_workspace_location(&database, app_state.fs.as_ref()).await
+    else {
+        return Ok(0);
+    };
+    restore_workspace_locations(
+        vec![SessionWorkspace {
+            workspace_id,
+            location,
+            paths,
+            window_id: None,
+        }],
+        app_state,
         cx,
-    );
-    open_notes_window_for_path(app_state, project, hard_coded_note_path(), cx)
+    )
+    .await
+}
+
+async fn restore_workspace_locations(
+    locations: Vec<SessionWorkspace>,
+    app_state: Arc<AppState>,
+    cx: &mut AsyncApp,
+) -> Result<usize> {
+    let serialized_workspaces =
+        cx.update(|cx| zed_workspace::read_serialized_multi_workspaces(locations, cx));
+    let mut restored_count = 0;
+    for serialized_workspace in serialized_workspaces {
+        match zed_workspace::restore_multiworkspace(serialized_workspace, app_state.clone(), cx)
+            .await
+        {
+            Ok(_) => restored_count += 1,
+            Err(error) => log::error!("failed to restore notes workspace: {error:#}"),
+        }
+    }
+    Ok(restored_count)
+}
+
+async fn open_first_launch_folder_picker(
+    app_state: Arc<AppState>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let prompt_app_state = app_state.clone();
+    let open_task = cx.update(|cx| {
+        zed_workspace::open_new(
+            OpenOptions::default(),
+            app_state,
+            cx,
+            move |workspace, window, cx| {
+                zed_workspace::prompt_for_open_path_and_open(
+                    workspace,
+                    prompt_app_state,
+                    PathPromptOptions {
+                        files: false,
+                        directories: true,
+                        multiple: false,
+                        prompt: Some("Open Notes Folder".into()),
+                    },
+                    false,
+                    window,
+                    cx,
+                );
+            },
+        )
+    });
+    open_task.await
+}
+
+async fn restore_or_prompt(app_state: Arc<AppState>, cx: &mut AsyncApp) -> Result<()> {
+    let had_previous_session =
+        cx.update(|cx| app_state.session.read(cx).last_session_id().is_some());
+    let mut restored_count = restore_session_workspaces(app_state.clone(), cx).await?;
+    if restored_count == 0 && had_previous_session {
+        restored_count = restore_last_workspace(app_state.clone(), cx).await?;
+    }
+    if restored_count == 0 {
+        open_first_launch_folder_picker(app_state, cx).await?;
+    }
+    Ok(())
+}
+
+pub fn start(cx: &mut App) {
+    let app_state = AppState::global(cx);
+    cx.spawn(async move |cx| restore_or_prompt(app_state, cx).await)
+        .detach_and_log_err(cx);
+}
+
+async fn reopen_workspace(app_state: Arc<AppState>, cx: &mut AsyncApp) -> Result<()> {
+    let has_workspace_window = cx.update(|cx| {
+        cx.windows()
+            .iter()
+            .any(|window| window.downcast::<MultiWorkspace>().is_some())
+    });
+    if has_workspace_window {
+        zed_workspace::activate_any_workspace_window(cx);
+        return Ok(());
+    }
+    let mut restored_count = restore_last_workspace(app_state.clone(), cx).await?;
+    if restored_count == 0 {
+        restored_count = restore_session_workspaces(app_state.clone(), cx).await?;
+    }
+    if restored_count == 0 {
+        open_first_launch_folder_picker(app_state, cx).await?;
+    }
+    Ok(())
+}
+
+pub fn reopen(cx: &mut App) {
+    let Some(app_state) = AppState::try_global(cx) else {
+        return;
+    };
+    cx.spawn(async move |cx| reopen_workspace(app_state, cx).await)
+        .detach_and_log_err(cx);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use command_palette_hooks::GlobalCommandPaletteInterceptor;
+    use editor::{DisplayPoint, SelectionEffects, display_map::DisplayRow};
     use fs::FakeFs;
-    use gpui::{TestAppContext, VisualTestContext};
+    use gpui::{TestAppContext, VisualTestContext, point};
     use project::ProjectPath;
     use serde_json::{Value, json};
     use settings::SettingsStore;
@@ -1751,6 +2301,413 @@ mod tests {
         assert!(
             !titlebar.appears_transparent,
             "the traffic lights must be drawn by macOS, not by us"
+        );
+    }
+
+    #[test]
+    fn test_session_database_uses_zednotes_application_support() {
+        assert_eq!(
+            application_support_dir(),
+            paths::home_dir()
+                .join("Library")
+                .join("Application Support")
+                .join("zednotes")
+        );
+        assert!(!application_support_dir().starts_with(env!("CARGO_MANIFEST_DIR")));
+    }
+
+    #[test]
+    fn test_recent_note_score_combines_recency_and_frequency() {
+        let frequent = PathBuf::from("/notes/frequent.md");
+        let recent = PathBuf::from("/notes/recent.md");
+        let stale = PathBuf::from("/notes/stale.md");
+        let history = RecentNotes {
+            entries: vec![
+                RecentNoteUsage {
+                    path: frequent.clone(),
+                    open_count: 16,
+                    last_opened: 1_000_000,
+                },
+                RecentNoteUsage {
+                    path: recent.clone(),
+                    open_count: 1,
+                    last_opened: 1_086_400,
+                },
+                RecentNoteUsage {
+                    path: stale.clone(),
+                    open_count: 1,
+                    last_opened: 900_000,
+                },
+            ],
+        };
+
+        assert!(history.score(&recent) > history.score(&stale));
+        assert!(history.score(&frequent) > history.score(&recent));
+    }
+
+    #[gpui::test]
+    async fn test_empty_state_distinguishes_empty_and_unselected_vaults(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/empty", json!({ "readme.txt": "not a note" }))
+            .await;
+        fs.insert_tree("/with-notes", json!({ "one.md": "# One" }))
+            .await;
+        let empty_project = Project::test(fs.clone(), [Path::new("/empty")], cx).await;
+        let notes_project = Project::test(fs, [Path::new("/with-notes")], cx).await;
+        let empty_state = cx.new(|cx| NotesEmptyState::new(empty_project, cx));
+        let notes_state = cx.new(|cx| NotesEmptyState::new(notes_project, cx));
+
+        assert!(!empty_state.read_with(cx, NotesEmptyState::has_markdown_notes));
+        assert!(notes_state.read_with(cx, NotesEmptyState::has_markdown_notes));
+    }
+
+    #[gpui::test]
+    async fn test_recent_note_and_workspace_pickers_open(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+
+        test.cx.simulate_keystrokes("cmd-e");
+        test.cx.run_until_parked();
+        assert!(
+            workspace(&test, cx).read_with(cx, |workspace, cx| workspace
+                .active_modal::<file_finder::FileFinder>(cx)
+                .is_some()),
+            "Cmd+E should open the recent-note file finder"
+        );
+        test.cx.simulate_keystrokes("escape");
+        test.cx.run_until_parked();
+
+        test.cx.update(|window, cx| {
+            window.dispatch_action(OpenRecentWorkspace.boxed_clone(), cx);
+        });
+        test.cx.run_until_parked();
+        assert!(
+            workspace(&test, cx).read_with(cx, |workspace, cx| workspace
+                .active_modal::<Picker<RecentWorkspacePickerDelegate>>(cx)
+                .is_some()),
+            "Workspace: Open Recent should open the recent-workspace picker"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_first_launch_opens_only_the_notes_folder_picker(cx: &mut TestAppContext) {
+        let test = test_window(cx).await;
+        let app_state = cx.read(AppState::global);
+        test.window
+            .update(cx, |_, window, _| window.remove_window())
+            .expect("failed to remove the setup window");
+        test.fs
+            .insert_tree("/first-notes", json!({ "welcome.md": "# Welcome" }))
+            .await;
+        cx.run_until_parked();
+
+        let mut async_cx = cx.to_async();
+        open_first_launch_folder_picker(app_state, &mut async_cx)
+            .await
+            .expect("failed to open the first-launch folder picker");
+        cx.run_until_parked();
+
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|options| {
+            assert!(!options.files);
+            assert!(options.directories);
+            assert!(!options.multiple);
+            Some(vec![PathBuf::from("/first-notes")])
+        });
+        cx.run_until_parked();
+        let workspace_windows = cx.read(|cx| {
+            cx.windows()
+                .into_iter()
+                .filter_map(|window| window.downcast::<MultiWorkspace>())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(workspace_windows.len(), 1);
+        assert_eq!(
+            workspace_windows[0]
+                .read_with(cx, |multi_workspace, cx| multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .root_paths(cx))
+                .expect("failed to read the first-launch window"),
+            vec![Arc::<Path>::from(Path::new("/first-notes"))],
+            "first launch should enter the selected notes folder"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_restores_tabs_active_note_preview_layout_and_explorer_state(
+        cx: &mut TestAppContext,
+    ) {
+        use session::Session;
+
+        let test = test_window(cx).await;
+        let app_state = cx.read(AppState::global);
+        test.window
+            .update(cx, |_, window, _| window.remove_window())
+            .expect("failed to remove the setup window");
+        test.fs
+            .insert_tree(
+                "/session-notes",
+                json!({
+                    "one.md": "# One\n",
+                    "two.md": (0..40).map(|line| format!("line {line}\n")).collect::<String>(),
+                }),
+            )
+            .await;
+        cx.run_until_parked();
+
+        let session_id = cx.read(|cx| app_state.session.read(cx).id().to_owned());
+        let zed_workspace::OpenResult { window, .. } = cx
+            .update(|cx| {
+                Workspace::new_local(
+                    vec![PathBuf::from("/session-notes")],
+                    app_state.clone(),
+                    None,
+                    None,
+                    None,
+                    OpenMode::Activate,
+                    cx,
+                )
+            })
+            .await
+            .expect("failed to open the session workspace");
+        cx.run_until_parked();
+
+        for path in ["/session-notes/one.md", "/session-notes/two.md"] {
+            window
+                .update(cx, |multi_workspace, window, cx| {
+                    multi_workspace.workspace().update(cx, |workspace, cx| {
+                        workspace.open_abs_path(
+                            PathBuf::from(path),
+                            OpenOptions::default(),
+                            window,
+                            cx,
+                        )
+                    })
+                })
+                .expect("failed to schedule note open")
+                .await
+                .expect("failed to open note");
+        }
+        cx.run_until_parked();
+
+        window
+            .update(cx, |multi_workspace, window, cx| {
+                let editor = multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .active_item_as::<Editor>(cx)
+                    .expect("the second note should be active");
+                editor.update(cx, |editor, cx| {
+                    editor.change_selections(
+                        SelectionEffects::no_scroll(),
+                        window,
+                        cx,
+                        |selections| {
+                            selections
+                                .select_display_ranges([DisplayPoint::new(DisplayRow(20), 0)
+                                    ..DisplayPoint::new(DisplayRow(20), 0)]);
+                        },
+                    );
+                    editor.set_scroll_position(point(0., 4.5), window, cx);
+                });
+            })
+            .expect("failed to set persisted editor position");
+
+        window
+            .update(cx, |multi_workspace, window, cx| {
+                window.resize(size(px(1040.), px(740.)));
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    let editor = workspace
+                        .active_item_as::<Editor>(cx)
+                        .expect("the second note should be active");
+                    let pane = workspace.active_pane().clone();
+                    MarkdownPreviewView::open_preview_to_the_side_of_pane(
+                        workspace, editor, pane, window, cx,
+                    );
+                    assert!(workspace.set_panel_size_state::<ProjectPanel>(
+                        zed_workspace::dock::PanelSizeState {
+                            size: Some(px(333.)),
+                            flex: None,
+                        },
+                        window,
+                        cx,
+                    ));
+                    if workspace.left_dock().read(cx).is_open() {
+                        workspace.toggle_dock(DockPosition::Left, window, cx);
+                    }
+                });
+            })
+            .expect("failed to configure persisted workspace state");
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+
+        let flush_task = window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    workspace.flush_serialization(window, cx)
+                })
+            })
+            .expect("failed to flush workspace state");
+        flush_task.await;
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .expect("failed to remove the original session window");
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            app_state.session.update(cx, |app_session, _| {
+                app_session.replace_session_for_test(Session::test_with_old_session(session_id));
+            });
+        });
+        let mut async_cx = cx.to_async();
+        assert_eq!(
+            restore_session_workspaces(app_state.clone(), &mut async_cx)
+                .await
+                .expect("failed to restore notes session"),
+            1
+        );
+        cx.run_until_parked();
+
+        let restored_window = cx
+            .read(|cx| {
+                cx.windows()
+                    .into_iter()
+                    .find_map(|window| window.downcast::<MultiWorkspace>())
+            })
+            .expect("the restored notes window should exist");
+        restored_window
+            .read_with(cx, |multi_workspace, cx| {
+                let workspace = multi_workspace.workspace().read(cx);
+                let editor_paths = workspace
+                    .panes()
+                    .iter()
+                    .find_map(|pane| {
+                        let paths = pane
+                            .read(cx)
+                            .items()
+                            .filter_map(|item| item.downcast::<Editor>())
+                            .filter_map(|editor| {
+                                editor.read(cx).buffer().read(cx).as_singleton().and_then(
+                                    |buffer| {
+                                        buffer.read(cx).file().and_then(|file| {
+                                            file.as_local().map(|file| file.abs_path(cx))
+                                        })
+                                    },
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        (paths.len() == 2).then_some(paths)
+                    })
+                    .expect("the restored editor pane should contain both tabs");
+                assert_eq!(
+                    editor_paths,
+                    vec![
+                        PathBuf::from("/session-notes/one.md"),
+                        PathBuf::from("/session-notes/two.md"),
+                    ]
+                );
+                assert_eq!(
+                    workspace.active_item_as::<Editor>(cx).and_then(|editor| {
+                        editor
+                            .read(cx)
+                            .buffer()
+                            .read(cx)
+                            .as_singleton()
+                            .and_then(|buffer| {
+                                buffer
+                                    .read(cx)
+                                    .file()
+                                    .and_then(|file| file.as_local().map(|file| file.abs_path(cx)))
+                            })
+                    }),
+                    Some(PathBuf::from("/session-notes/two.md"))
+                );
+                assert_eq!(
+                    workspace.items_of_type::<MarkdownPreviewView>(cx).count(),
+                    1
+                );
+                assert!(workspace.panes().len() >= 2);
+                assert!(!workspace.left_dock().read(cx).is_open());
+                assert_eq!(
+                    workspace
+                        .panel_size_state::<ProjectPanel>(cx)
+                        .and_then(|state| state.size),
+                    Some(px(333.))
+                );
+            })
+            .expect("failed to inspect the restored notes window");
+        assert_eq!(
+            restored_window
+                .update(cx, |_, window, _| window.window_bounds().get_bounds().size)
+                .expect("failed to inspect restored window bounds"),
+            size(px(1040.), px(740.))
+        );
+        let (cursor, scroll_y) = restored_window
+            .update(cx, |multi_workspace, _, cx| {
+                let editor = multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .items_of_type::<Editor>(cx)
+                    .find(|editor| {
+                        editor
+                            .read(cx)
+                            .buffer()
+                            .read(cx)
+                            .as_singleton()
+                            .is_some_and(|buffer| {
+                                buffer.read(cx).file().is_some_and(|file| {
+                                    file.as_local().is_some_and(|file| {
+                                        file.abs_path(cx).as_path()
+                                            == Path::new("/session-notes/two.md")
+                                    })
+                                })
+                            })
+                    })
+                    .expect("the second editor should be restored");
+                editor.update(cx, |editor, cx| {
+                    let selections = editor
+                        .selections
+                        .display_ranges(&editor.display_snapshot(cx));
+                    (selections[0].start, editor.scroll_position(cx).y)
+                })
+            })
+            .expect("failed to inspect the restored editor position");
+        assert_eq!(cursor, DisplayPoint::new(DisplayRow(20), 0));
+        assert!(
+            (scroll_y - 4.5).abs() < 0.01,
+            "restored scroll was {scroll_y}"
+        );
+
+        restored_window
+            .update(cx, |_, window, _| window.remove_window())
+            .expect("failed to close the restored window");
+        cx.run_until_parked();
+        assert!(cx.read(|cx| cx.windows().is_empty()));
+        let mut async_cx = cx.to_async();
+        reopen_workspace(app_state, &mut async_cx)
+            .await
+            .expect("Dock reopen failed");
+        cx.run_until_parked();
+        let reopened_window = cx
+            .read(|cx| {
+                cx.windows()
+                    .into_iter()
+                    .find_map(|window| window.downcast::<MultiWorkspace>())
+            })
+            .expect("Dock reopen should restore the workspace window");
+        assert_eq!(
+            reopened_window
+                .read_with(cx, |multi_workspace, cx| multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .root_paths(cx))
+                .expect("failed to inspect the Dock-reopened window"),
+            vec![Arc::<Path>::from(Path::new("/session-notes"))]
         );
     }
 

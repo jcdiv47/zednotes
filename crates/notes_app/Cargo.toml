@@ -38,10 +38,12 @@ node_runtime.workspace = true
 paths.workspace = true
 project.workspace = true
 project_panel.workspace = true
+picker.workspace = true
 release_channel.workspace = true
 search.workspace = true
 semver.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 session.workspace = true
 settings.workspace = true
 theme.workspace = true
@@ -56,10 +58,10 @@ zed_actions.workspace = true
 
 [dev-dependencies]
 command_palette_hooks.workspace = true
+editor = { workspace = true, features = ["test-support"] }
 fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
 remote_connection = { workspace = true, features = ["test-support"] }
-serde_json.workspace = true
 settings = { workspace = true, features = ["test-support"] }
 workspace = { workspace = true, features = ["test-support"] }

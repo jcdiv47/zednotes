@@ -75,13 +75,16 @@ pub struct FileFinder {
 /// Restricts the paths shown by the file finder.
 pub type FileFilter = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
 
+/// Scores recent paths before they are shown in the file finder.
+pub type HistoryRanker = Arc<dyn Fn(&Path, &App) -> f64 + Send + Sync>;
+
 pub fn init(cx: &mut App) {
-    init_with_options(None, true, cx);
+    init_with_options(None, true, None, cx);
 }
 
 /// Initializes the file finder with an application-wide path filter.
 pub fn init_with_file_filter(file_filter: FileFilter, cx: &mut App) {
-    init_with_options(Some(file_filter), true, cx);
+    init_with_options(Some(file_filter), true, None, cx);
 }
 
 /// Initializes the file finder with an application-wide path filter and controls
@@ -91,16 +94,37 @@ pub fn init_with_file_filter_and_file_creation(
     allow_file_creation: bool,
     cx: &mut App,
 ) {
-    init_with_options(Some(file_filter), allow_file_creation, cx);
+    init_with_options(Some(file_filter), allow_file_creation, None, cx);
 }
 
-fn init_with_options(file_filter: Option<FileFilter>, allow_file_creation: bool, cx: &mut App) {
+/// Initializes the file finder with an application-defined ordering for recent files.
+pub fn init_with_file_filter_file_creation_and_history_ranker(
+    file_filter: FileFilter,
+    allow_file_creation: bool,
+    history_ranker: HistoryRanker,
+    cx: &mut App,
+) {
+    init_with_options(
+        Some(file_filter),
+        allow_file_creation,
+        Some(history_ranker),
+        cx,
+    );
+}
+
+fn init_with_options(
+    file_filter: Option<FileFilter>,
+    allow_file_creation: bool,
+    history_ranker: Option<HistoryRanker>,
+    cx: &mut App,
+) {
     cx.observe_new(move |workspace, window, cx| {
         FileFinder::register(
             workspace,
             window,
             file_filter.clone(),
             allow_file_creation,
+            history_ranker.clone(),
             cx,
         )
     })
@@ -115,6 +139,7 @@ impl FileFinder {
         _window: Option<&mut Window>,
         file_filter: Option<FileFilter>,
         allow_file_creation: bool,
+        history_ranker: Option<HistoryRanker>,
         _: &mut Context<Workspace>,
     ) {
         workspace.register_action({
@@ -127,6 +152,7 @@ impl FileFinder {
                         action.include_ignored,
                         file_filter.clone(),
                         allow_file_creation,
+                        history_ranker.clone(),
                         window,
                         cx,
                     )
@@ -150,6 +176,7 @@ impl FileFinder {
         include_ignored: Option<bool>,
         file_filter: Option<FileFilter>,
         allow_file_creation: bool,
+        history_ranker: Option<HistoryRanker>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Task<()> {
@@ -188,10 +215,20 @@ impl FileFinder {
             })
             .collect::<Vec<_>>();
         cx.spawn_in(window, async move |workspace, cx| {
-            let history_items = join_all(history_items).await.into_iter().flatten();
+            let mut history_items = join_all(history_items)
+                .await
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
 
             workspace
                 .update_in(cx, |workspace, window, cx| {
+                    if let Some(history_ranker) = history_ranker.as_ref() {
+                        history_items.sort_by(|left, right| {
+                            history_ranker(&right.absolute, cx)
+                                .total_cmp(&history_ranker(&left.absolute, cx))
+                        });
+                    }
                     let project = workspace.project().clone();
                     let weak_workspace = cx.entity().downgrade();
                     workspace.toggle_modal(window, cx, |window, cx| {
@@ -200,7 +237,7 @@ impl FileFinder {
                             weak_workspace,
                             project,
                             currently_opened_path,
-                            history_items.collect(),
+                            history_items,
                             separate_history,
                             include_ignored,
                             file_filter,

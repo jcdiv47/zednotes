@@ -434,12 +434,33 @@ pub trait SerializableItem: Item {
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>>;
 
+    /// Serializes all state needed to restore this item before an application
+    /// shutdown. Implementations with separately throttled metadata can
+    /// override this to include those writes in the returned task.
+    fn serialize_for_flush(
+        &mut self,
+        workspace: &mut Workspace,
+        item_id: ItemId,
+        closing: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<()>>> {
+        self.serialize(workspace, item_id, closing, window, cx)
+    }
+
     fn should_serialize(&self, event: &Self::Event) -> bool;
 }
 
 pub trait SerializableItemHandle: ItemHandle {
     fn serialized_item_kind(&self) -> &'static str;
     fn serialize(
+        &self,
+        workspace: &mut Workspace,
+        closing: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Task<Result<()>>>;
+    fn serialize_for_flush(
         &self,
         workspace: &mut Workspace,
         closing: bool,
@@ -466,6 +487,18 @@ where
     ) -> Option<Task<Result<()>>> {
         self.update(cx, |this, cx| {
             this.serialize(workspace, cx.entity_id().as_u64(), closing, window, cx)
+        })
+    }
+
+    fn serialize_for_flush(
+        &self,
+        workspace: &mut Workspace,
+        closing: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Task<Result<()>>> {
+        self.update(cx, |this, cx| {
+            this.serialize_for_flush(workspace, cx.entity_id().as_u64(), closing, window, cx)
         })
     }
 

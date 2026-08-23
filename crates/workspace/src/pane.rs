@@ -420,6 +420,7 @@ pub struct Pane {
     can_toggle_zoom: bool,
     should_display_tab_bar: Rc<dyn Fn(&Window, &mut Context<Pane>) -> bool>,
     should_display_welcome_page: bool,
+    render_empty_state: Option<Rc<dyn Fn(&mut Window, &mut Context<Pane>) -> AnyElement>>,
     render_tab_bar_buttons: Rc<
         dyn Fn(
             &mut Pane,
@@ -605,6 +606,7 @@ impl Pane {
             can_toggle_zoom: true,
             should_display_tab_bar: Rc::new(|_, cx| TabBarSettings::get_global(cx).show),
             should_display_welcome_page: false,
+            render_empty_state: None,
             render_tab_bar_buttons: Rc::new(default_render_tab_bar_buttons),
             render_tab_bar: Rc::new(Self::render_tab_bar),
             show_tab_bar_buttons: TabBarSettings::get_global(cx).show_tab_bar_buttons,
@@ -836,6 +838,14 @@ impl Pane {
 
     pub fn set_should_display_welcome_page(&mut self, should_display_welcome_page: bool) {
         self.should_display_welcome_page = should_display_welcome_page;
+    }
+
+    pub fn set_render_empty_state<F>(&mut self, render: F, cx: &mut Context<Self>)
+    where
+        F: 'static + Fn(&mut Window, &mut Context<Pane>) -> AnyElement,
+    {
+        self.render_empty_state = Some(Rc::new(render));
+        cx.notify();
     }
 
     pub fn set_can_split(
@@ -4570,7 +4580,9 @@ impl Render for Pane {
                                         }
                                     },
                                 ));
-                            if has_worktrees || !self.should_display_welcome_page {
+                            if let Some(render_empty_state) = self.render_empty_state.clone() {
+                                placeholder.child(render_empty_state(window, cx))
+                            } else if has_worktrees || !self.should_display_welcome_page {
                                 placeholder
                             } else {
                                 if self.welcome_page.is_none() {

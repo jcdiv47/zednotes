@@ -10,7 +10,10 @@ fn main() {
         return;
     }
 
+    let data_dir = notes_app::application_support_dir();
+    paths::set_custom_data_dir(data_dir.to_string_lossy().as_ref());
     let application = application().with_assets(Assets);
+    application.on_reopen(notes_app::reopen);
     let database = AppDatabase::new();
     let session = application.background_executor().spawn(Session::new(
         Uuid::new_v4().to_string(),
@@ -25,7 +28,6 @@ fn main() {
             .expect("failed to load zednotes' bundled fonts");
         let session = cx.foreground_executor().block_on(session);
         notes_app::init(session, cx).expect("failed to initialize the editor and Vim subsystems");
-        notes_app::open_notes_window(cx)
-            .expect("failed to open the notes window; there is nothing to fall back to");
+        notes_app::start(cx);
     });
 }

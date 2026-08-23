@@ -24,7 +24,7 @@ use language::{
     proto::serialize_anchor as serialize_text_anchor,
 };
 use lsp::DiagnosticSeverity;
-use multi_buffer::{BufferOffset, MultiBufferOffset, MultiBufferRow, PathKey};
+use multi_buffer::{BufferOffset, MultiBufferOffset, MultiBufferRow, PathKey, ToOffset as _};
 use project::{
     File, Project, ProjectItem as _, ProjectPath, git_store::GitStore, lsp_store::FormatTrigger,
     project_settings::ProjectSettings, search::SearchQuery,
@@ -1517,6 +1517,61 @@ impl SerializableItem for Editor {
             })
             .await
             .context("failed to save contents of buffer")?;
+
+            Ok(())
+        }))
+    }
+
+    fn serialize_for_flush(
+        &mut self,
+        workspace: &mut Workspace,
+        item_id: ItemId,
+        closing: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<()>>> {
+        let serialize_task = self.serialize(workspace, item_id, closing, window, cx)?;
+        let snapshot = self.buffer().read(cx).snapshot(cx);
+        let selections = self
+            .selections
+            .disjoint_anchors_arc()
+            .iter()
+            .map(|selection| {
+                (
+                    selection.start.to_offset(&snapshot).0,
+                    selection.end.to_offset(&snapshot).0,
+                )
+            })
+            .collect();
+        let display_snapshot = self.display_snapshot(cx);
+        let scroll_anchor = self.scroll_manager.native_anchor(&display_snapshot, cx);
+        let scroll_top_row = scroll_anchor.top_row(&snapshot);
+        let scroll_offset = scroll_anchor.offset;
+        let workspace_id = workspace.database_id()?;
+        let db = EditorDb::global(cx);
+
+        Some(cx.spawn_in(window, async move |_this, cx| {
+            serialize_task.await?;
+            cx.background_spawn(async move {
+                db.save_editor_selections(item_id, workspace_id, selections)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "persisting editor selections for editor {item_id}, workspace {workspace_id:?}"
+                        )
+                    })?;
+                db.save_scroll_position(
+                    item_id,
+                    workspace_id,
+                    scroll_top_row,
+                    scroll_offset.x,
+                    scroll_offset.y,
+                )
+                .await
+                .context("failed to save editor scroll position")
+            })
+            .await
+            .context("failed to save editor restoration metadata")?;
 
             Ok(())
         }))

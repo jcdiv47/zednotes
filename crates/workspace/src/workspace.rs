@@ -7125,9 +7125,26 @@ impl Workspace {
         self._serialize_workspace_task.take();
         self.bounds_save_task_queued.take();
 
+        let serializable_items = self
+            .panes
+            .iter()
+            .flat_map(|pane| {
+                pane.read(cx)
+                    .items()
+                    .filter_map(|item| item.to_serializable_item_handle(cx))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let item_tasks = serializable_items
+            .into_iter()
+            .filter_map(|item| item.serialize_for_flush(self, false, window, cx))
+            .collect::<Vec<_>>();
         let bounds_task = self.save_window_bounds(window, cx);
         let serialize_task = self.serialize_workspace_internal(window, cx);
         cx.spawn(async move |_| {
+            for task in item_tasks {
+                task.await.log_err();
+            }
             bounds_task.await;
             serialize_task.await;
         })

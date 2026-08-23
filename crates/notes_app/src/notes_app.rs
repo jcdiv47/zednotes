@@ -20,7 +20,10 @@ use language::{Language, LanguageRegistry};
 use markdown_preview::markdown_preview_view::MarkdownPreviewView;
 use node_runtime::NodeRuntime;
 use project::{LocalProjectFlags, Project};
-use project_panel::{EntryFilter, ProjectPanel, project_panel_settings::ProjectPanelSettings};
+use project_panel::{
+    EntryFilter, Event as ProjectPanelEvent, ProjectPanel, ProjectPanelOptions,
+    project_panel_settings::ProjectPanelSettings,
+};
 use search::BufferSearchBar;
 use semver::Version;
 use serde::Deserialize;
@@ -30,7 +33,8 @@ use theme::{ActiveTheme as _, LoadThemes};
 use vim::ModeIndicator;
 use workspace as zed_workspace;
 use zed_workspace::{
-    AppState, MultiWorkspace, SaveIntent, Workspace, WorkspaceStore, dock::DockPosition,
+    AppState, MultiWorkspace, SaveIntent, Toast, Workspace, WorkspaceStore, dock::DockPosition,
+    notifications::NotificationId,
 };
 
 const APP_NAME: &str = "zednotes";
@@ -68,6 +72,16 @@ actions!(
 actions!(
     note,
     [
+        /// Creates a new Markdown note.
+        New,
+        /// Creates a new directory in the notes workspace.
+        NewDirectory,
+        /// Renames the selected note or directory.
+        Rename,
+        /// Moves the selected note or directory to the system Trash.
+        Delete,
+        /// Duplicates the selected note or directory.
+        Duplicate,
         /// Toggles a preview split for the active note.
         TogglePreview,
         /// Opens the active note as a preview-only tab.
@@ -212,6 +226,14 @@ fn is_markdown_path(path: &Path) -> bool {
         })
 }
 
+fn markdown_note_filename(filename: &str) -> String {
+    if is_markdown_path(Path::new(filename)) {
+        filename.to_owned()
+    } else {
+        format!("{filename}.md")
+    }
+}
+
 fn markdown_entry_filter(markdown_only: bool) -> EntryFilter {
     Arc::new(move |path: &Path, is_directory| {
         is_directory || !markdown_only || is_markdown_path(path)
@@ -256,7 +278,12 @@ fn load_editor_keymaps(cx: &mut App) -> Result<()> {
     }
     cx.bind_keys([
         KeyBinding::new("cmd-o", OpenFolder, None),
+        KeyBinding::new("cmd-n", New, None),
         KeyBinding::new("cmd-b", ToggleExplorer, None),
+        KeyBinding::new("a", New, Some("ProjectPanel && not_editing")),
+        KeyBinding::new("shift-a", NewDirectory, Some("ProjectPanel && not_editing")),
+        KeyBinding::new("r", Rename, Some("ProjectPanel && not_editing")),
+        KeyBinding::new("d", Delete, Some("ProjectPanel && not_editing")),
         KeyBinding::new(
             "enter",
             project_panel::OpenPermanent,
@@ -312,6 +339,11 @@ fn init_editor_subsystems(cx: &mut App) -> Result<()> {
         Menu::new(APP_NAME).items([MenuItem::action("Quit", Quit)]),
         Menu::new("File").items([MenuItem::action("Open Folder…", OpenFolder)]),
         Menu::new("Note").items([
+            MenuItem::action("New Note…", New),
+            MenuItem::action("New Directory…", NewDirectory),
+            MenuItem::action("Rename…", Rename),
+            MenuItem::action("Move to Trash…", Delete),
+            MenuItem::action("Duplicate", Duplicate),
             MenuItem::action("Toggle Preview", TogglePreview),
             MenuItem::action("Open Preview", OpenPreview),
         ]),
@@ -425,6 +457,23 @@ fn open_preview(workspace: &mut Workspace, window: &mut Window, cx: &mut gpui::C
     MarkdownPreviewView::open_preview_in_pane(workspace, editor, pane, window, cx);
 }
 
+fn dispatch_project_panel_action(
+    workspace: &mut Workspace,
+    action_name: &str,
+    window: &mut Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    workspace.open_panel::<ProjectPanel>(window, cx);
+    let Some(panel) = workspace.panel::<ProjectPanel>(cx) else {
+        return;
+    };
+    panel.focus_handle(cx).focus(window, cx);
+    match cx.build_action(action_name, None) {
+        Ok(action) => window.dispatch_action(action, cx),
+        Err(error) => log::error!("failed to build {action_name}: {error:#}"),
+    }
+}
+
 fn init_workspace_composition(
     app_state: Arc<AppState>,
     explorer_settings: ExplorerSettings,
@@ -476,17 +525,70 @@ fn init_workspace_composition(
         workspace.register_action(|workspace, _: &OpenPreview, window, cx| {
             open_preview(workspace, window, cx);
         });
+        workspace.register_action(|workspace, _: &New, window, cx| {
+            dispatch_project_panel_action(workspace, "project_panel::NewFile", window, cx);
+        });
+        workspace.register_action(|workspace, _: &NewDirectory, window, cx| {
+            dispatch_project_panel_action(workspace, "project_panel::NewDirectory", window, cx);
+        });
+        workspace.register_action(|workspace, _: &Rename, window, cx| {
+            dispatch_project_panel_action(workspace, "project_panel::Rename", window, cx);
+        });
+        workspace.register_action(|workspace, _: &Delete, window, cx| {
+            dispatch_project_panel_action(workspace, "project_panel::Trash", window, cx);
+        });
+        workspace.register_action(|workspace, _: &Duplicate, window, cx| {
+            dispatch_project_panel_action(workspace, "project_panel::Duplicate", window, cx);
+        });
 
         let panel_task = cx.spawn_in(window, {
             let entry_filter = entry_filter.clone();
             async move |workspace, cx| {
-                let panel = ProjectPanel::load_with_entry_filter(
+                let panel = ProjectPanel::load_with_options(
                     workspace.clone(),
-                    entry_filter,
+                    ProjectPanelOptions {
+                        entry_filter: Some(entry_filter),
+                        new_file_name_transformer: Some(Arc::new(markdown_note_filename)),
+                        post_create_action: Some(Box::new(vim::SwitchToInsertMode)),
+                    },
                     cx.clone(),
                 )
                 .await?;
                 workspace.update_in(cx, |workspace, window, cx| {
+                    cx.subscribe_in(&panel, window, |workspace, _, event, _, cx| {
+                        let message = match event {
+                            ProjectPanelEvent::EntryCreated {
+                                project_path,
+                                is_directory,
+                            } => Some(format!(
+                                "Created {} {}",
+                                if *is_directory { "folder" } else { "note" },
+                                project_path.path.as_unix_str()
+                            )),
+                            ProjectPanelEvent::EntryRenamed {
+                                old_project_path,
+                                new_project_path,
+                                is_directory,
+                            } => Some(format!(
+                                "Renamed {} {} to {}",
+                                if *is_directory { "folder" } else { "note" },
+                                old_project_path.path.as_unix_str(),
+                                new_project_path.path.as_unix_str()
+                            )),
+                            _ => None,
+                        };
+                        if let Some(message) = message {
+                            workspace.show_toast(
+                                Toast::new(
+                                    NotificationId::Named("notes-entry-operation".into()),
+                                    message,
+                                )
+                                .autohide(),
+                                cx,
+                            );
+                        }
+                    })
+                    .detach();
                     workspace.add_panel(panel, window, cx);
                     workspace.finish_dock_restoration(cx);
                 })?;
@@ -764,25 +866,29 @@ mod tests {
     }
 
     fn active_editor_path(test: &TestWindow, cx: &TestAppContext) -> PathBuf {
+        active_editor(test, cx).read_with(cx, |editor, cx| {
+            editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .and_then(|buffer| {
+                    buffer
+                        .read(cx)
+                        .file()
+                        .and_then(|file| file.as_local().map(|file| file.abs_path(cx)))
+                })
+                .expect("active editor should be file-backed")
+        })
+    }
+
+    fn active_editor(test: &TestWindow, cx: &TestAppContext) -> gpui::Entity<Editor> {
         test.window
             .read_with(cx, |multi_workspace, cx| {
-                let editor = multi_workspace
+                multi_workspace
                     .workspace()
                     .read(cx)
                     .active_item_as::<Editor>(cx)
-                    .expect("an editor should be active");
-                editor
-                    .read(cx)
-                    .buffer()
-                    .read(cx)
-                    .as_singleton()
-                    .and_then(|buffer| {
-                        buffer
-                            .read(cx)
-                            .file()
-                            .and_then(|file| file.as_local().map(|file| file.abs_path(cx)))
-                    })
-                    .expect("active editor should be file-backed")
+                    .expect("an editor should be active")
             })
             .expect("failed to read the notes window")
     }
@@ -858,6 +964,197 @@ mod tests {
         assert_eq!(
             test.fs.load(Path::new(TEST_NOTE_PATH)).await.unwrap(),
             format!("x{TEST_NOTE}")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cmd_n_creates_nested_markdown_note_and_enters_insert_mode(
+        cx: &mut TestAppContext,
+    ) {
+        let mut test = test_window(cx).await;
+
+        test.cx.simulate_keystrokes("cmd-n");
+        test.cx.simulate_input("projects/new-idea");
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+
+        let note_path = Path::new("/notes/projects/new-idea.md");
+        assert_eq!(test.fs.load(note_path).await.unwrap(), "");
+        assert_eq!(active_editor_path(&test, cx), note_path);
+
+        test.cx.simulate_keystrokes("x");
+        assert_eq!(
+            active_editor(&test, cx).read_with(cx, |editor, cx| editor.text(cx)),
+            "x"
+        );
+    }
+
+    #[test]
+    fn test_markdown_note_filename_appends_only_when_missing() {
+        assert_eq!(markdown_note_filename("note"), "note.md");
+        assert_eq!(markdown_note_filename("nested/note.md"), "nested/note.md");
+        assert_eq!(
+            markdown_note_filename("nested/note.markdown"),
+            "nested/note.markdown"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_explorer_note_and_directory_lifecycle_actions(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+
+        focus_project_path(&mut test, "", cx);
+        test.cx.simulate_keystrokes("a");
+        test.cx.simulate_input("inbox");
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+        assert_eq!(
+            test.fs.load(Path::new("/notes/inbox.md")).await.unwrap(),
+            ""
+        );
+
+        focus_project_path(&mut test, "", cx);
+        test.cx.simulate_keystrokes("shift-a");
+        test.cx.simulate_input("archive");
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+        assert!(test.fs.is_dir(Path::new("/notes/archive")).await);
+
+        focus_project_path(&mut test, "archive", cx);
+        test.cx.simulate_keystrokes("r");
+        test.cx.simulate_input("old-archive");
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+        assert!(!test.fs.is_dir(Path::new("/notes/archive")).await);
+        assert!(test.fs.is_dir(Path::new("/notes/old-archive")).await);
+
+        focus_project_path(&mut test, "inbox.md", cx);
+        test.cx.dispatch_action(Duplicate);
+        test.cx.run_until_parked();
+        test.cx.simulate_keystrokes("escape");
+        assert_eq!(
+            test.fs
+                .load(Path::new("/notes/inbox copy.md"))
+                .await
+                .unwrap(),
+            ""
+        );
+
+        focus_project_path(&mut test, "old-archive", cx);
+        test.cx.simulate_keystrokes("d");
+        cx.simulate_prompt_answer("Trash");
+        test.cx.run_until_parked();
+        assert!(!test.fs.is_dir(Path::new("/notes/old-archive")).await);
+        assert!(
+            test.fs
+                .trashed_paths()
+                .contains(&PathBuf::from("/notes/old-archive"))
+        );
+    }
+
+    #[gpui::test]
+    async fn test_rename_preserves_open_editor_buffer_undo_and_recent_path(
+        cx: &mut TestAppContext,
+    ) {
+        let mut test = test_window(cx).await;
+        let editor = test.editor.clone();
+        test.cx.simulate_keystrokes("i a b c escape");
+
+        focus_project_path(&mut test, "spike.md", cx);
+        test.cx.simulate_keystrokes("r");
+        test.cx.simulate_input("renamed");
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/renamed.md")
+        );
+        assert_eq!(active_editor(&test, cx), editor);
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor.text(cx)),
+            format!("abc{TEST_NOTE}")
+        );
+        assert!(!test.fs.is_file(Path::new(TEST_NOTE_PATH)).await);
+        assert!(test.fs.is_file(Path::new("/notes/renamed.md")).await);
+
+        let workspace = workspace(&test, cx);
+        assert!(workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .recent_navigation_history_iter(cx)
+                .any(|(_, abs_path)| abs_path == Some(PathBuf::from("/notes/renamed.md")))
+        }));
+
+        test.cx.update(|window, cx| {
+            editor.focus_handle(cx).focus(window, cx);
+        });
+        test.cx.simulate_keystrokes("u");
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor.text(cx)),
+            TEST_NOTE
+        );
+    }
+
+    #[gpui::test]
+    async fn test_delete_trashes_open_note_and_closes_its_tab(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+
+        focus_project_path(&mut test, "spike.md", cx);
+        test.cx.simulate_keystrokes("d");
+        cx.simulate_prompt_answer("Trash");
+        test.cx.run_until_parked();
+
+        assert!(!test.fs.is_file(Path::new(TEST_NOTE_PATH)).await);
+        assert!(
+            test.fs
+                .trashed_paths()
+                .contains(&PathBuf::from(TEST_NOTE_PATH))
+        );
+        assert_eq!(
+            workspace(&test, cx).read_with(cx, |workspace, cx| workspace
+                .active_pane()
+                .read(cx)
+                .items_len()),
+            0
+        );
+    }
+
+    #[gpui::test]
+    async fn test_note_lifecycle_actions_are_registered_for_the_palette(cx: &mut TestAppContext) {
+        let _test = test_window(cx).await;
+        for action_name in [
+            "note::New",
+            "note::NewDirectory",
+            "note::Rename",
+            "note::Delete",
+            "note::Duplicate",
+        ] {
+            assert!(
+                cx.update(|cx| cx.all_action_names().contains(&action_name)),
+                "{action_name} should be registered"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_palette_executes_note_new(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+
+        execute_palette_command(&mut test, "note: new", cx);
+        test.cx.simulate_input("from-palette");
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            test.fs
+                .load(Path::new("/notes/from-palette.md"))
+                .await
+                .unwrap(),
+            ""
+        );
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/from-palette.md")
         );
     }
 

@@ -98,6 +98,16 @@ const NEW_ENTRY_ID: ProjectEntryId = ProjectEntryId::MAX;
 /// an empty directory should remain navigable.
 pub type EntryFilter = Arc<dyn Fn(&Path, bool) -> bool + Send + Sync>;
 
+/// Transforms the name entered when creating a file before it is written.
+pub type NewFileNameTransformer = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
+#[derive(Default)]
+pub struct ProjectPanelOptions {
+    pub entry_filter: Option<EntryFilter>,
+    pub new_file_name_transformer: Option<NewFileNameTransformer>,
+    pub post_create_action: Option<Box<dyn Action>>,
+}
+
 struct VisibleEntriesForWorktree {
     worktree_id: WorktreeId,
     entries: Vec<GitEntry>,
@@ -143,6 +153,8 @@ impl State {
 pub struct ProjectPanel {
     project: Entity<Project>,
     entry_filter: Option<EntryFilter>,
+    new_file_name_transformer: Option<NewFileNameTransformer>,
+    post_create_action: Option<Box<dyn Action>>,
     fs: Arc<dyn Fs>,
     focus_handle: FocusHandle,
     scroll_handle: UniformListScrollHandle,
@@ -590,6 +602,16 @@ pub enum Event {
         entry_id: ProjectEntryId,
         focus_opened_item: bool,
         allow_preview: bool,
+        post_open_action: Option<Box<dyn Action>>,
+    },
+    EntryCreated {
+        project_path: ProjectPath,
+        is_directory: bool,
+    },
+    EntryRenamed {
+        old_project_path: ProjectPath,
+        new_project_path: ProjectPath,
+        is_directory: bool,
     },
     SplitEntry {
         entry_id: ProjectEntryId,
@@ -673,15 +695,20 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
-        Self::new_with_entry_filter(workspace, None, window, cx)
+        Self::new_with_options(workspace, ProjectPanelOptions::default(), window, cx)
     }
 
-    fn new_with_entry_filter(
+    fn new_with_options(
         workspace: &mut Workspace,
-        entry_filter: Option<EntryFilter>,
+        options: ProjectPanelOptions,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
+        let ProjectPanelOptions {
+            entry_filter,
+            new_file_name_transformer,
+            post_create_action,
+        } = options;
         let project = workspace.project().clone();
         let git_store = project.read(cx).git_store().clone();
         let path_style = project.read(cx).path_style(cx);
@@ -858,6 +885,8 @@ impl ProjectPanel {
             let mut this = Self {
                 project: project.clone(),
                 entry_filter,
+                new_file_name_transformer,
+                post_create_action,
                 hover_scroll_task: None,
                 fs: workspace.app_state().fs.clone(),
                 focus_handle,
@@ -906,31 +935,41 @@ impl ProjectPanel {
         cx.subscribe_in(&project_panel, window, {
             let project_panel = project_panel.downgrade();
             move |workspace, _, event, window, cx| match event {
-                &Event::OpenedEntry {
+                Event::OpenedEntry {
                     entry_id,
                     focus_opened_item,
                     allow_preview,
+                    post_open_action,
                 } => {
-                    if let Some(worktree) = project.read(cx).worktree_for_entry(entry_id, cx)
-                        && let Some(entry) = worktree.read(cx).entry_for_id(entry_id) {
+                    if let Some(worktree) = project.read(cx).worktree_for_entry(*entry_id, cx)
+                        && let Some(entry) = worktree.read(cx).entry_for_id(*entry_id) {
                             let file_path = entry.path.clone();
                             let worktree_id = worktree.read(cx).id();
                             let entry_id = entry.id;
                             let is_via_ssh = project.read(cx).is_via_remote_server();
 
-                            workspace
-                                .open_path_preview(
+                            let open_task = workspace.open_path_preview(
                                     ProjectPath {
                                         worktree_id,
                                         path: file_path.clone(),
                                     },
                                     None,
-                                    focus_opened_item,
-                                    allow_preview,
+                                    *focus_opened_item,
+                                    *allow_preview,
                                     true,
                                     window, cx,
-                                )
-                                .detach_and_prompt_err("Failed to open file", window, cx, move |e, _, _| {
+                                );
+                            let post_open_action = post_open_action
+                                .as_ref()
+                                .map(|action| action.boxed_clone());
+                            cx.spawn_in(window, async move |_, cx| {
+                                open_task.await?;
+                                if let Some(action) = post_open_action {
+                                    cx.update(|window, cx| window.dispatch_action(action, cx))?;
+                                }
+                                anyhow::Ok(())
+                            })
+                            .detach_and_prompt_err("Failed to open file", window, cx, move |e, _, _| {
                                     match e.error_code() {
                                         ErrorCode::Disconnected => if is_via_ssh {
                                             Some("Disconnected from SSH host".to_string())
@@ -956,7 +995,7 @@ impl ProjectPanel {
                                     project_panel.marked_entries.push(entry);
                                     project_panel.selection = Some(entry);
                                 });
-                                if !focus_opened_item {
+                                if !*focus_opened_item {
                                     let focus_handle = project_panel.read(cx).focus_handle.clone();
                                     window.focus(&focus_handle, cx);
                                 }
@@ -1004,10 +1043,26 @@ impl ProjectPanel {
     pub async fn load_with_entry_filter(
         workspace: WeakEntity<Workspace>,
         entry_filter: EntryFilter,
+        cx: AsyncWindowContext,
+    ) -> Result<Entity<Self>> {
+        Self::load_with_options(
+            workspace,
+            ProjectPanelOptions {
+                entry_filter: Some(entry_filter),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await
+    }
+
+    pub async fn load_with_options(
+        workspace: WeakEntity<Workspace>,
+        options: ProjectPanelOptions,
         mut cx: AsyncWindowContext,
     ) -> Result<Entity<Self>> {
         workspace.update_in(&mut cx, |workspace, window, cx| {
-            ProjectPanel::new_with_entry_filter(workspace, Some(entry_filter), window, cx)
+            ProjectPanel::new_with_options(workspace, options, window, cx)
         })
     }
 
@@ -1874,6 +1929,18 @@ impl ProjectPanel {
                 return;
             }
             let trimmed_filename = trimmed_filename.trim_start_matches('/');
+            let transformed_filename = if edit_state.is_new_entry()
+                && !edit_state.is_dir
+                && !trimmed_filename.ends_with('/')
+                && !trimmed_filename.ends_with('\\')
+            {
+                self.new_file_name_transformer
+                    .as_ref()
+                    .map(|transformer| transformer(trimmed_filename))
+            } else {
+                None
+            };
+            let trimmed_filename = transformed_filename.as_deref().unwrap_or(trimmed_filename);
 
             let Ok(filename) = RelPath::from_unix_str(trimmed_filename) else {
                 edit_state.validation_state = ValidationState::Warning(
@@ -1949,6 +2016,13 @@ impl ProjectPanel {
         } else {
             filename.ends_with('/')
         };
+        if is_new_entry
+            && !edit_state.is_dir
+            && !filename_indicates_dir
+            && let Some(transformer) = &self.new_file_name_transformer
+        {
+            filename = transformer(&filename);
+        }
         let filename = if path_style.is_windows() {
             filename.trim_start_matches(&['/', '\\'])
         } else {
@@ -1965,6 +2039,7 @@ impl ProjectPanel {
         let edit_task;
         let edited_entry_id;
         let new_project_path: ProjectPath;
+        let old_project_path: Option<ProjectPath>;
         let changes: Vec<Change>;
 
         if is_new_entry {
@@ -1982,7 +2057,8 @@ impl ProjectPanel {
             edit_task = self.project.update(cx, |project, cx| {
                 project.create_entry(new_project_path.clone(), is_dir, cx)
             });
-            changes = vec![Change::Created(new_project_path)];
+            changes = vec![Change::Created(new_project_path.clone())];
+            old_project_path = None;
         } else {
             let new_path = if let Some(parent) = entry.path.parent() {
                 parent.join(&filename).into()
@@ -1997,6 +2073,8 @@ impl ProjectPanel {
             }
             edited_entry_id = entry.id;
             new_project_path = (worktree_id, new_path).into();
+            let renamed_from: ProjectPath = (worktree_id, entry.path).into();
+            old_project_path = Some(renamed_from.clone());
 
             // Before renaming, keep track of which directories will need to be
             // created, so we can remove these when undoing.
@@ -2017,8 +2095,8 @@ impl ProjectPanel {
                 .rev()
                 .map(Change::DirCreated)
                 .chain(std::iter::once(Change::Renamed(
-                    (worktree_id, entry.path).into(),
-                    new_project_path,
+                    renamed_from,
+                    new_project_path.clone(),
                 )))
                 .collect();
         };
@@ -2067,10 +2145,22 @@ impl ProjectPanel {
                             project_panel.expand_to_selection(cx);
                         }
                         project_panel.update_visible_entries(None, false, false, window, cx);
+                        if let Some(old_project_path) = old_project_path {
+                            cx.emit(Event::EntryRenamed {
+                                old_project_path,
+                                new_project_path: new_project_path.clone(),
+                                is_directory: is_dir,
+                            });
+                        } else {
+                            cx.emit(Event::EntryCreated {
+                                project_path: new_project_path.clone(),
+                                is_directory: is_dir,
+                            });
+                        }
                         if is_new_entry && !is_dir {
                             let settings = ProjectPanelSettings::get_global(cx);
                             if settings.auto_open.should_open_on_create() {
-                                project_panel.open_entry(new_entry.id, true, false, cx);
+                                project_panel.open_created_entry(new_entry.id, true, false, cx);
                             }
                         }
                         cx.notify();
@@ -2205,6 +2295,25 @@ impl ProjectPanel {
             entry_id,
             focus_opened_item,
             allow_preview,
+            post_open_action: None,
+        });
+    }
+
+    fn open_created_entry(
+        &mut self,
+        entry_id: ProjectEntryId,
+        focus_opened_item: bool,
+        allow_preview: bool,
+        cx: &mut Context<Self>,
+    ) {
+        cx.emit(Event::OpenedEntry {
+            entry_id,
+            focus_opened_item,
+            allow_preview,
+            post_open_action: self
+                .post_create_action
+                .as_ref()
+                .map(|action| action.boxed_clone()),
         });
     }
 

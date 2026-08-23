@@ -1,5 +1,11 @@
 use super::*;
 
+enum DirectHoverLink {
+    Url(String),
+    File(ResolvedFileTarget),
+    MissingFile(String),
+}
+
 impl Editor {
     pub fn move_left(&mut self, _: &MoveLeft, window: &mut Window, cx: &mut Context<Self>) {
         self.change_selections(Default::default(), window, cx, |s| {
@@ -1718,11 +1724,15 @@ impl Editor {
                     Some(cx.background_spawn(computation))
                 }
                 HoverLink::Url(url) => {
-                    first_url_or_file = Some(Either::Left(url));
+                    first_url_or_file = Some(DirectHoverLink::Url(url));
                     None
                 }
                 HoverLink::File(file_target) => {
-                    first_url_or_file = Some(Either::Right(file_target));
+                    first_url_or_file = Some(DirectHoverLink::File(file_target));
+                    None
+                }
+                HoverLink::MissingFile(path) => {
+                    first_url_or_file = Some(DirectHoverLink::MissingFile(path));
                     None
                 }
             })
@@ -1845,7 +1855,7 @@ impl Editor {
             } else if num_locations == 0 {
                 // If there is one url or file, open it directly
                 match first_url_or_file {
-                    Some(Either::Left(url)) => {
+                    Some(DirectHoverLink::Url(url)) => {
                         cx.update(|window, cx| {
                             if parse_zed_link(&url, cx).is_some() {
                                 window.dispatch_action(
@@ -1858,7 +1868,7 @@ impl Editor {
                         })?;
                         Ok(Navigated::Yes)
                     }
-                    Some(Either::Right(file_target)) => {
+                    Some(DirectHoverLink::File(file_target)) => {
                         // TODO(andrew): respect preview tab settings
                         //               `enable_keep_preview_on_code_navigation` and
                         //               `enable_preview_file_from_code_navigation`
@@ -1877,6 +1887,22 @@ impl Editor {
 
                         file_target.navigate_item_to_position(item, cx);
 
+                        Ok(Navigated::Yes)
+                    }
+                    Some(DirectHoverLink::MissingFile(path)) => {
+                        let Some(workspace) = workspace else {
+                            return Ok(Navigated::No);
+                        };
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.show_toast(
+                                Toast::new(
+                                    NotificationId::Named("missing-file-link".into()),
+                                    format!("Linked file not found: {path}"),
+                                )
+                                .autohide(),
+                                cx,
+                            );
+                        });
                         Ok(Navigated::Yes)
                     }
                     None => Ok(Navigated::No),
@@ -2319,6 +2345,8 @@ impl Editor {
         let display_snapshot = self.display_map.update(cx, |map, cx| map.snapshot(cx));
         let buffer = self.buffer.read(cx).read(cx);
         let cursor_position = cursor_anchor.to_point(&buffer);
+        let selections = (self.selections.newest_anchor().head() == cursor_anchor)
+            .then(|| self.selections.disjoint_anchors_arc());
         let scroll_anchor = self.scroll_manager.native_anchor(&display_snapshot, cx);
         let scroll_top_row = scroll_anchor.top_row(&buffer);
         drop(buffer);
@@ -2326,6 +2354,7 @@ impl Editor {
         NavigationData {
             cursor_anchor,
             cursor_position,
+            selections,
             scroll_anchor,
             scroll_top_row,
         }

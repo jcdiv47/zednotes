@@ -1225,6 +1225,7 @@ async fn test_navigation_history(cx: &mut TestAppContext) {
                 Arc::new(NavigationData {
                     cursor_anchor: invalid_anchor,
                     cursor_position: invalid_point,
+                    selections: None,
                     scroll_anchor: ScrollAnchor {
                         anchor: invalid_anchor,
                         offset: Default::default(),

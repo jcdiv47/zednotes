@@ -170,7 +170,7 @@ use gpui::{
     UniformListScrollHandle, WeakEntity, WeakFocusHandle, Window, div, point, prelude::*,
     pulsating_between, px, relative, size,
 };
-use hover_links::{HoverLink, HoveredLinkState, find_file};
+use hover_links::{HoverLink, HoveredLinkState, ResolvedFileTarget, find_file};
 use hover_popover::{HoverState, hide_hover};
 use indent_guides::ActiveIndentGuidesState;
 use inlays::{InlaySplice, inlay_hints::InlayHintRefreshReason};
@@ -1580,10 +1580,11 @@ enum SelectSyntaxNodeScrollBehavior {
     CursorBottom,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct NavigationData {
     cursor_anchor: Anchor,
     cursor_position: Point,
+    selections: Option<Arc<[Selection<Anchor>]>>,
     scroll_anchor: ScrollAnchor,
     scroll_top_row: u32,
 }
@@ -2966,6 +2967,10 @@ impl Editor {
 
     pub fn buffer(&self) -> &Entity<MultiBuffer> {
         &self.buffer
+    }
+
+    pub fn newest_selection(&self, cx: &mut App) -> Selection<Point> {
+        self.selections.newest(&self.display_snapshot(cx))
     }
 
     pub fn project(&self) -> Option<&Entity<Project>> {

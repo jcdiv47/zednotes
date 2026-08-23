@@ -649,13 +649,22 @@ impl Item for Editor {
         cx: &mut Context<Self>,
     ) -> bool {
         if let Some(data) = data.downcast_ref::<NavigationData>() {
-            let newest_selection = self.selections.newest::<Point>(&self.display_snapshot(cx));
+            let display_snapshot = self.display_snapshot(cx);
+            let newest_selection = self.selections.newest::<Point>(&display_snapshot);
+            let current_selections = self.selections.disjoint_anchors_arc();
+            let current_scroll_anchor = self.scroll_manager.native_anchor(&display_snapshot, cx);
             let buffer = self.buffer.read(cx).read(cx);
             let offset = if buffer.can_resolve(&data.cursor_anchor) {
                 data.cursor_anchor.to_point(&buffer)
             } else {
                 buffer.clip_point(data.cursor_position, Bias::Left)
             };
+
+            let selections = data.selections.as_deref().filter(|selections| {
+                selections.iter().all(|selection| {
+                    buffer.can_resolve(&selection.start) && buffer.can_resolve(&selection.end)
+                })
+            });
 
             let mut scroll_anchor = data.scroll_anchor;
             if !buffer.can_resolve(&scroll_anchor.anchor) {
@@ -666,16 +675,33 @@ impl Item for Editor {
 
             drop(buffer);
 
-            if newest_selection.head() == offset {
+            let selection_changed = selections.map_or_else(
+                || {
+                    current_selections.len() != 1
+                        || !newest_selection.is_empty()
+                        || newest_selection.head() != offset
+                },
+                |selections| current_selections.as_ref() != selections,
+            );
+            let scroll_changed = current_scroll_anchor != scroll_anchor;
+            if !selection_changed && !scroll_changed {
                 false
             } else {
                 self.set_scroll_anchor(scroll_anchor, window, cx);
-                self.change_selections(
-                    SelectionEffects::default().nav_history(false),
-                    window,
-                    cx,
-                    |s| s.select_ranges([offset..offset]),
-                );
+                if selection_changed {
+                    self.change_selections(
+                        SelectionEffects::default().nav_history(false),
+                        window,
+                        cx,
+                        |selection_collection| {
+                            if let Some(selections) = selections {
+                                selection_collection.select_anchors(selections.to_vec());
+                            } else {
+                                selection_collection.select_ranges([offset..offset]);
+                            }
+                        },
+                    );
+                }
                 true
             }
         } else {

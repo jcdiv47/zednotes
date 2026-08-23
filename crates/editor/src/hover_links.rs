@@ -13,7 +13,7 @@ use lsp::LanguageServerId;
 use project::{InlayId, LocationLink, Project, ResolvedPath};
 use regex::Regex;
 use settings::Settings;
-use std::{ops::Range, str::FromStr as _, sync::LazyLock};
+use std::{ops::Range, path::Path, str::FromStr as _, sync::LazyLock};
 use text::OffsetRangeExt;
 use theme::ActiveTheme as _;
 use util::{
@@ -76,6 +76,7 @@ impl RangeInEditor {
 pub enum HoverLink {
     Url(String),
     File(ResolvedFileTarget),
+    MissingFile(String),
     Text(LocationLink),
     /// Navigate to an LSP-given location whose buffer may not be loaded yet.
     /// Used by inlay-hint hover, code-lens references, and document-link
@@ -378,10 +379,12 @@ pub fn show_link_definition(
         return;
     };
     let same_kind = hovered_link_state.preferred_kind == preferred_kind
-        || hovered_link_state
-            .links
-            .first()
-            .is_some_and(|d| matches!(d, HoverLink::Url(_) | HoverLink::LspLocation(_, _)));
+        || hovered_link_state.links.first().is_some_and(|d| {
+            matches!(
+                d,
+                HoverLink::Url(_) | HoverLink::MissingFile(_) | HoverLink::LspLocation(_, _)
+            )
+        });
 
     if same_kind {
         if is_cached && (hovered_link_state.last_trigger_point == trigger_point)
@@ -469,6 +472,17 @@ pub fn show_link_definition(
                             symbol_range = Some(RangeInEditor::Text(range));
                         }
                         links.push(HoverLink::File(file_target));
+                    } else if let Some((filename_range, missing_path)) =
+                        find_missing_markdown_file(&buffer, anchor, cx)
+                    {
+                        let snapshot =
+                            this.read_with(cx, |editor, cx| editor.buffer.read(cx).snapshot(cx))?;
+                        if let Some(range) =
+                            snapshot.buffer_anchor_range_to_anchor_range(filename_range)
+                        {
+                            symbol_range = Some(RangeInEditor::Text(range));
+                        }
+                        links.push(HoverLink::MissingFile(missing_path));
                     }
 
                     // Always also collect LSP definitions so that cmd-click
@@ -906,9 +920,6 @@ pub(crate) async fn find_file(
 // partial wrappers where punctuation only appears on one side (e.g. path) or path`).
 // Returns candidates ordered from most-specific (most trimmed) to least-specific (raw).
 fn link_pattern_file_candidates(candidate: &str) -> Vec<(String, Range<usize>)> {
-    static MD_LINK_REGEX: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"]\(([^)]*)\)").expect("Failed to create REGEX"));
-
     // Punctuation that commonly wraps file paths in prose/markdown
     const LEADING_PUNCTUATION: &[char] = &['`', '(', '[', '{', '<', '"', '\''];
     const TRAILING_PUNCTUATION: &[char] = &[
@@ -947,21 +958,51 @@ fn link_pattern_file_candidates(candidate: &str) -> Vec<(String, Range<usize>)> 
 
     // Extract markdown link destination: [title](path) or ](path) -> path
     // This also handles bare (path) wrapping.
-    if let Some(captures) = MD_LINK_REGEX.captures(candidate) {
-        if let Some(link) = captures.get(1) {
-            let link_str = link.as_str().to_string();
-            let link_range = link.range();
-            // Avoid duplicate if punctuation trimming already found this
-            if !candidates.iter().any(|(s, _)| s == &link_str) {
-                candidates.push((link_str, link_range));
-            }
-        }
+    if let Some((link, link_range)) = markdown_link_destination_candidate(candidate)
+        && !candidates.iter().any(|(existing, _)| existing == &link)
+    {
+        candidates.push((link, link_range));
     }
 
     // Always include the raw candidate as fallback (lowest priority)
     candidates.push((candidate.to_string(), 0..candidate_len));
 
     candidates
+}
+
+fn markdown_link_destination_candidate(candidate: &str) -> Option<(String, Range<usize>)> {
+    static MARKDOWN_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"]\(([^)]*)\)").expect("failed to compile Markdown link regex")
+    });
+
+    let link = MARKDOWN_LINK_REGEX.captures(candidate)?.get(1)?;
+    Some((link.as_str().to_owned(), link.range()))
+}
+
+fn find_missing_markdown_file(
+    buffer: &Entity<language::Buffer>,
+    position: text::Anchor,
+    cx: &AsyncWindowContext,
+) -> Option<(Range<text::Anchor>, String)> {
+    let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+    let (range, candidate) = surrounding_filename(&snapshot, position)?;
+    let (target, target_range) = markdown_link_destination_candidate(&candidate)?;
+    if target.is_empty()
+        || target.starts_with(['~', '#'])
+        || target.starts_with("//")
+        || url::Url::parse(&target).is_ok()
+        || Path::new(&target).is_absolute()
+    {
+        return None;
+    }
+
+    let candidate_range = range.to_offset(&snapshot);
+    let start = candidate_range.start + target_range.start;
+    let end = candidate_range.end - (candidate.len() - target_range.end);
+    Some((
+        snapshot.anchor_before(start)..snapshot.anchor_after(end),
+        target,
+    ))
 }
 
 fn surrounding_filename(

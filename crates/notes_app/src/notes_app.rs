@@ -18,16 +18,16 @@ use anyhow::{Context as _, Result};
 use assets::Assets;
 use client::{Client, UserStore};
 use db::kvp::KeyValueStore;
-use editor::Editor;
+use editor::{Editor, EditorEvent};
 use fs::{Fs, PathEventKind, RealFs};
 use futures::StreamExt as _;
 #[cfg(test)]
 use gpui::WindowHandle;
 use gpui::{
     Action as _, AnyElement, App, AppContext as _, AsyncApp, BorrowAppContext as _, Bounds,
-    DismissEvent, Entity, Focusable as _, Global, KeyBinding, Keystroke, Menu, MenuItem,
-    PathPromptOptions, Render, Subscription, Task, TaskExt as _, TitlebarOptions, WeakEntity,
-    Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
+    DismissEvent, Entity, Focusable as _, Global, KeyBinding, Keystroke, Menu, MenuItem, OsAction,
+    PathPromptOptions, Render, Subscription, SystemMenuType, Task, TaskExt as _, TitlebarOptions,
+    WeakEntity, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
 };
 use http_client::BlockedHttpClient;
 use language::{Buffer, BufferEvent, Capability, DiskState, Language, LanguageRegistry};
@@ -45,9 +45,10 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use session::{AppSession, Session};
 use settings::{
-    AutosaveSetting, BufferLineHeight, CommandAliasTarget, DockSide, FontFamilyName, KeybindSource,
-    KeymapFile, KeymapFileLoadResult, Settings as _, SettingsStore, SoftWrap, ThemeAppearanceMode,
-    ThemeName, ThemeSelection,
+    AutosaveSetting, BufferLineHeight, CodeLens, CommandAliasTarget, DockSide, FontFamilyName,
+    KeybindSource, KeymapFile, KeymapFileLoadResult, ScrollbarDiagnostics, Settings as _,
+    SettingsStore, ShowDiagnostics, ShowMinimap, SoftWrap, ThemeAppearanceMode, ThemeName,
+    ThemeSelection, WordsCompletionMode,
 };
 use theme::{ActiveTheme as _, GlobalTheme, LoadThemes};
 use util::ResultExt as _;
@@ -56,8 +57,9 @@ use workspace as zed_workspace;
 use zed_workspace::{
     AppState, CloseIntent, Event as WorkspaceEvent, ItemHandle as _, MultiWorkspace, OpenMode,
     OpenOptions, OpenVisible, Pane, SaveIntent, SerializedWorkspaceLocation, SessionWorkspace,
-    SplitDirection, Toast, Workspace, WorkspaceStore,
-    dock::DockPosition,
+    SplitDirection, StatusBarSettings, StatusItemView, TabBarSettings, Toast, Workspace,
+    WorkspaceStore,
+    dock::{DockPosition, PanelButtons},
     item::SaveOptions,
     notifications::{DetachAndPromptErr as _, NotificationId},
     pane::Event as PaneEvent,
@@ -73,6 +75,10 @@ const DEFAULT_EXPLORER_WIDTH: u32 = 240;
 const DEFAULT_EDITOR_FONT_FAMILY: &str = ".ZedMono";
 const DEFAULT_EDITOR_FONT_SIZE: f32 = 15.0;
 const DEFAULT_EDITOR_LINE_HEIGHT: f32 = 1.55;
+const DEFAULT_UI_FONT_FAMILY: &str = ".SystemUIFont";
+const DEFAULT_UI_FONT_SIZE: f32 = 14.0;
+const DEFAULT_PREVIEW_FONT_FAMILY: &str = ".SystemUIFont";
+const DEFAULT_PREVIEW_FONT_SIZE: f32 = 16.0;
 const DEFAULT_VIM_LEADER: &str = "space";
 const RECENT_NOTES_KEY: &str = "notes_recent_usage";
 const MAX_RECENT_NOTES: usize = 512;
@@ -83,6 +89,11 @@ const INITIAL_SETTINGS_CONTENT: &str = r#"{
 
   "vim": {
     "leader": "space",
+  },
+
+  "ui": {
+    "font_family": ".SystemUIFont",
+    "font_size": 14,
   },
 
   "editor": {
@@ -105,6 +116,8 @@ const INITIAL_SETTINGS_CONTENT: &str = r#"{
   },
 
   "preview": {
+    "font_family": ".SystemUIFont",
+    "font_size": 16,
     "max_width": 760,
   },
 }
@@ -117,6 +130,16 @@ actions!(
         OpenSettings,
         /// Quits zednotes.
         Quit,
+        /// Hides zednotes.
+        Hide,
+        /// Hides all applications except zednotes.
+        HideOthers,
+        /// Shows all applications.
+        ShowAll,
+        /// Minimizes the active notes window.
+        Minimize,
+        /// Zooms the active notes window.
+        Zoom,
     ]
 );
 
@@ -165,6 +188,8 @@ actions!(
         OpenPreview,
         /// Opens the relative Markdown link under the cursor.
         FollowLink,
+        /// Reports word and character counts for the active note.
+        Statistics,
     ]
 );
 
@@ -173,6 +198,14 @@ actions!(
     [
         /// Toggles the notes explorer.
         ToggleExplorer,
+        /// Hides surrounding UI and centers the active editor.
+        ToggleFocusMode,
+        /// Follows the macOS appearance.
+        UseSystemTheme,
+        /// Uses the light notes theme.
+        UseLightTheme,
+        /// Uses the dark notes theme.
+        UseDarkTheme,
     ]
 );
 
@@ -183,6 +216,21 @@ enum NotesTheme {
     System,
     Light,
     Dark,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct NotesUiSettings {
+    font_family: String,
+    font_size: f32,
+}
+
+impl Default for NotesUiSettings {
+    fn default() -> Self {
+        Self {
+            font_family: DEFAULT_UI_FONT_FAMILY.to_owned(),
+            font_size: DEFAULT_UI_FONT_SIZE,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -214,8 +262,10 @@ struct ExplorerSettings {
     excluded_paths: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct PreviewSettings {
+    font_family: String,
+    font_size: f32,
     max_width: u32,
     allow_remote_images: bool,
     max_file_size_bytes: Option<u64>,
@@ -252,6 +302,8 @@ impl Default for NotesVimSettings {
 impl Default for PreviewSettings {
     fn default() -> Self {
         Self {
+            font_family: DEFAULT_PREVIEW_FONT_FAMILY.to_owned(),
+            font_size: DEFAULT_PREVIEW_FONT_SIZE,
             max_width: DEFAULT_PREVIEW_MAX_WIDTH,
             allow_remote_images: false,
             max_file_size_bytes: Some(DEFAULT_PREVIEW_MAX_FILE_SIZE_BYTES),
@@ -278,6 +330,7 @@ struct NotesSettings {
     theme: NotesTheme,
     vim_mode: bool,
     vim: NotesVimSettings,
+    ui: NotesUiSettings,
     editor: NotesEditorSettings,
     autosave: AutosaveSettings,
     explorer: ExplorerSettings,
@@ -290,6 +343,7 @@ impl Default for NotesSettings {
             theme: NotesTheme::System,
             vim_mode: true,
             vim: NotesVimSettings::default(),
+            ui: NotesUiSettings::default(),
             editor: NotesEditorSettings::default(),
             autosave: AutosaveSettings::default(),
             explorer: ExplorerSettings::default(),
@@ -343,6 +397,238 @@ impl RecentNotes {
             return 0.0;
         };
         entry.last_opened as f64 + (entry.open_count as f64 + 1.0).ln() * 86_400.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct NoteStatistics {
+    words: usize,
+    characters: usize,
+}
+
+fn note_statistics(text: &str) -> NoteStatistics {
+    NoteStatistics {
+        words: text
+            .split_whitespace()
+            .filter(|token| token.chars().any(char::is_alphanumeric))
+            .count(),
+        characters: text.chars().count(),
+    }
+}
+
+fn note_statistics_message(text: &str) -> String {
+    let statistics = note_statistics(text);
+    format!(
+        "{} words · {} characters",
+        statistics.words, statistics.characters
+    )
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum NoteSaveState {
+    #[default]
+    Saved,
+    Modified,
+}
+
+impl NoteSaveState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Saved => "Saved",
+            Self::Modified => "Modified",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct NotesStatusSnapshot {
+    language: String,
+    statistics: NoteStatistics,
+    line: usize,
+    column: usize,
+    save_state: NoteSaveState,
+}
+
+fn status_editor(
+    active_pane_item: Option<&dyn zed_workspace::ItemHandle>,
+    cx: &App,
+) -> Option<Entity<Editor>> {
+    let active_pane_item = active_pane_item?;
+    active_pane_item.act_as::<Editor>(cx).or_else(|| {
+        active_pane_item
+            .downcast::<MarkdownPreviewView>()
+            .and_then(|preview| preview.read(cx).source_editor())
+    })
+}
+
+fn notes_status_snapshot(editor: &mut Editor, cx: &mut App) -> NotesStatusSnapshot {
+    let cursor = editor.newest_selection(cx).head();
+    let text = editor.text(cx);
+    let cursor_offset = editor
+        .buffer()
+        .read(cx)
+        .as_singleton()
+        .map(|buffer| buffer.read(cx).snapshot().point_to_offset(cursor))
+        .unwrap_or_default()
+        .min(text.len());
+    let column = text
+        .get(..cursor_offset)
+        .and_then(|text| text.rsplit_once('\n').map(|(_, line)| line).or(Some(text)))
+        .map_or(1, |line| line.chars().count().saturating_add(1));
+    let language = editor
+        .active_buffer(cx)
+        .and_then(|buffer| buffer.read(cx).language().map(|language| language.name()))
+        .map_or_else(|| "Markdown".to_owned(), |language| language.to_string());
+
+    NotesStatusSnapshot {
+        language,
+        statistics: note_statistics(&text),
+        line: cursor.row as usize + 1,
+        column,
+        save_state: if editor.buffer().read(cx).is_dirty(cx) {
+            NoteSaveState::Modified
+        } else {
+            NoteSaveState::Saved
+        },
+    }
+}
+
+struct NotesStatusDetails {
+    snapshot: Option<NotesStatusSnapshot>,
+    update_task: Task<()>,
+    _active_editor_subscription: Option<Subscription>,
+}
+
+impl NotesStatusDetails {
+    fn new() -> Self {
+        Self {
+            snapshot: None,
+            update_task: Task::ready(()),
+            _active_editor_subscription: None,
+        }
+    }
+
+    fn update_snapshot(
+        &mut self,
+        editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let editor = editor.downgrade();
+        self.update_task = cx.spawn_in(window, async move |this, cx| {
+            let Ok(snapshot) = editor.update(cx, |editor, cx| notes_status_snapshot(editor, cx))
+            else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.snapshot = Some(snapshot);
+                cx.notify();
+            })
+            .ok();
+        });
+    }
+}
+
+impl Render for NotesStatusDetails {
+    fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        let text = self.snapshot.as_ref().map(|snapshot| {
+            format!(
+                "{}   {} words · {} chars   {}",
+                snapshot.save_state.label(),
+                snapshot.statistics.words,
+                snapshot.statistics.characters,
+                snapshot.language,
+            )
+        });
+        div()
+            .whitespace_nowrap()
+            .text_size(px(11.))
+            .text_color(cx.theme().colors().text_muted)
+            .child(text.unwrap_or_default())
+    }
+}
+
+impl StatusItemView for NotesStatusDetails {
+    fn set_active_pane_item(
+        &mut self,
+        active_pane_item: Option<&dyn zed_workspace::ItemHandle>,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(editor) = status_editor(active_pane_item, cx) else {
+            self.snapshot = None;
+            self._active_editor_subscription = None;
+            cx.notify();
+            return;
+        };
+        self._active_editor_subscription =
+            Some(
+                cx.subscribe_in(&editor, window, |this, editor, event, window, cx| {
+                    if matches!(
+                        event,
+                        EditorEvent::BufferEdited
+                            | EditorEvent::Edited { .. }
+                            | EditorEvent::SelectionsChanged { .. }
+                            | EditorEvent::DirtyChanged
+                            | EditorEvent::Saved
+                            | EditorEvent::FileHandleChanged
+                            | EditorEvent::Reparsed(_)
+                    ) {
+                        this.update_snapshot(editor, window, cx);
+                    }
+                }),
+            );
+        self.update_snapshot(&editor, window, cx);
+    }
+
+    fn hide_setting(&self, _: &App) -> Option<zed_workspace::HideStatusItem> {
+        None
+    }
+}
+
+struct NotesCursorStatus {
+    details: Entity<NotesStatusDetails>,
+    _details_subscription: Subscription,
+}
+
+impl NotesCursorStatus {
+    fn new(details: Entity<NotesStatusDetails>, cx: &mut gpui::Context<Self>) -> Self {
+        let _details_subscription = cx.observe(&details, |_, _, cx| cx.notify());
+        Self {
+            details,
+            _details_subscription,
+        }
+    }
+}
+
+impl Render for NotesCursorStatus {
+    fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        let text = self
+            .details
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .map(|snapshot| format!("Ln {}, Col {}", snapshot.line, snapshot.column));
+        div()
+            .whitespace_nowrap()
+            .pr_1()
+            .text_size(px(11.))
+            .text_color(cx.theme().colors().text_muted)
+            .child(text.unwrap_or_default())
+    }
+}
+
+impl StatusItemView for NotesCursorStatus {
+    fn set_active_pane_item(
+        &mut self,
+        _: Option<&dyn zed_workspace::ItemHandle>,
+        _: &mut Window,
+        _: &mut gpui::Context<Self>,
+    ) {
+    }
+
+    fn hide_setting(&self, _: &App) -> Option<zed_workspace::HideStatusItem> {
+        None
     }
 }
 
@@ -574,6 +860,7 @@ struct NotesSettingsContent {
     theme: Option<NotesTheme>,
     vim_mode: Option<bool>,
     vim: Option<NotesVimSettingsContent>,
+    ui: Option<NotesUiSettingsContent>,
     editor: Option<NotesEditorSettingsContent>,
     autosave: Option<AutosaveSettingsContent>,
     explorer: Option<ExplorerSettingsContent>,
@@ -584,6 +871,12 @@ struct NotesSettingsContent {
 #[derive(Debug, Default, Deserialize)]
 struct NotesVimSettingsContent {
     leader: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct NotesUiSettingsContent {
+    font_family: Option<String>,
+    font_size: Option<f32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -615,6 +908,8 @@ struct FileSettingsContent {
 
 #[derive(Debug, Default, Deserialize)]
 struct PreviewSettingsContent {
+    font_family: Option<String>,
+    font_size: Option<f32>,
     max_width: Option<u32>,
     allow_remote_images: Option<bool>,
     max_file_size_bytes: Option<u64>,
@@ -628,6 +923,10 @@ fn parse_notes_settings(content: &str) -> Result<NotesSettings> {
     settings.vim_mode = content.vim_mode.unwrap_or(settings.vim_mode);
     if let Some(vim) = content.vim {
         settings.vim.leader = vim.leader.unwrap_or(settings.vim.leader);
+    }
+    if let Some(ui) = content.ui {
+        settings.ui.font_family = ui.font_family.unwrap_or(settings.ui.font_family);
+        settings.ui.font_size = ui.font_size.unwrap_or(settings.ui.font_size);
     }
     if let Some(editor) = content.editor {
         settings.editor.font_family = editor.font_family.unwrap_or(settings.editor.font_family);
@@ -653,6 +952,8 @@ fn parse_notes_settings(content: &str) -> Result<NotesSettings> {
         settings.explorer.excluded_paths = excluded_paths;
     }
     if let Some(preview) = content.preview {
+        settings.preview.font_family = preview.font_family.unwrap_or(settings.preview.font_family);
+        settings.preview.font_size = preview.font_size.unwrap_or(settings.preview.font_size);
         settings.preview.max_width = preview.max_width.unwrap_or(settings.preview.max_width);
         settings.preview.allow_remote_images = preview
             .allow_remote_images
@@ -662,6 +963,14 @@ fn parse_notes_settings(content: &str) -> Result<NotesSettings> {
             .or(settings.preview.max_file_size_bytes);
     }
 
+    anyhow::ensure!(
+        !settings.ui.font_family.trim().is_empty(),
+        "ui.font_family cannot be empty"
+    );
+    anyhow::ensure!(
+        settings.ui.font_size > 0.0,
+        "ui.font_size must be greater than zero"
+    );
     anyhow::ensure!(
         !settings.editor.font_family.trim().is_empty(),
         "editor.font_family cannot be empty"
@@ -683,6 +992,14 @@ fn parse_notes_settings(content: &str) -> Result<NotesSettings> {
     anyhow::ensure!(
         settings.explorer.width > 0,
         "explorer.width must be positive"
+    );
+    anyhow::ensure!(
+        !settings.preview.font_family.trim().is_empty(),
+        "preview.font_family cannot be empty"
+    );
+    anyhow::ensure!(
+        settings.preview.font_size > 0.0,
+        "preview.font_size must be greater than zero"
     );
     anyhow::ensure!(
         settings.preview.max_width > 0,
@@ -1069,6 +1386,7 @@ fn bind_default_editor_keymaps(cx: &mut App) -> Result<()> {
         KeyBinding::new("cmd-e", OpenRecentNote, Some("Workspace")),
         KeyBinding::new("cmd-n", New, Some("Workspace")),
         KeyBinding::new("cmd-b", ToggleExplorer, Some("Workspace")),
+        KeyBinding::new("cmd-shift-enter", ToggleFocusMode, Some("Workspace")),
         KeyBinding::new("cmd-shift-f", Search, Some("Pane")),
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new(
@@ -1178,6 +1496,83 @@ fn load_user_keymap(cx: &mut App) -> Result<()> {
     }
 }
 
+fn notes_menus() -> Vec<Menu> {
+    let mut application_items = vec![
+        MenuItem::action("Settings…", OpenSettings),
+        MenuItem::separator(),
+    ];
+    #[cfg(target_os = "macos")]
+    application_items.push(MenuItem::os_submenu("Services", SystemMenuType::Services));
+    #[cfg(target_os = "macos")]
+    application_items.push(MenuItem::separator());
+    application_items.extend([
+        MenuItem::action("Hide zednotes", Hide),
+        MenuItem::action("Hide Others", HideOthers),
+        MenuItem::action("Show All", ShowAll),
+        MenuItem::separator(),
+        MenuItem::action("Quit zednotes", Quit),
+    ]);
+
+    vec![
+        Menu::new(APP_NAME).items(application_items),
+        Menu::new("File").items([
+            MenuItem::action("New Note…", New),
+            MenuItem::action("Open Folder…", OpenFolder),
+            MenuItem::action("Open Recent Folder…", OpenRecentWorkspace),
+            MenuItem::separator(),
+            MenuItem::action("Save", zed_workspace::Save { save_intent: None }),
+            MenuItem::action("Save All", zed_workspace::SaveAll { save_intent: None }),
+            MenuItem::separator(),
+            MenuItem::action("Statistics", Statistics),
+            MenuItem::separator(),
+            MenuItem::action("Close Note", zed_workspace::CloseActiveItem::default()),
+            MenuItem::action("Close Window", zed_workspace::CloseWindow),
+        ]),
+        Menu::new("Edit").items([
+            MenuItem::os_action("Undo", editor::actions::Undo, OsAction::Undo),
+            MenuItem::os_action("Redo", editor::actions::Redo, OsAction::Redo),
+            MenuItem::separator(),
+            MenuItem::os_action("Cut", editor::actions::Cut, OsAction::Cut),
+            MenuItem::os_action("Copy", editor::actions::Copy, OsAction::Copy),
+            MenuItem::os_action("Paste", editor::actions::Paste, OsAction::Paste),
+            MenuItem::os_action(
+                "Select All",
+                editor::actions::SelectAll,
+                OsAction::SelectAll,
+            ),
+            MenuItem::separator(),
+            MenuItem::action("Find in Note…", zed_actions::buffer_search::Deploy::find()),
+            MenuItem::action("Find in Workspace…", Search),
+        ]),
+        Menu::new("View").items([
+            MenuItem::action("Toggle Explorer", ToggleExplorer),
+            MenuItem::action("Toggle Preview", TogglePreview),
+            MenuItem::action("Toggle Focus Mode", ToggleFocusMode),
+            MenuItem::separator(),
+            MenuItem::submenu(Menu::new("Theme").items([
+                MenuItem::action("System", UseSystemTheme),
+                MenuItem::action("Light", UseLightTheme),
+                MenuItem::action("Dark", UseDarkTheme),
+            ])),
+        ]),
+        Menu::new("Go").items([
+            MenuItem::action("Quick Open…", zed_workspace::ToggleFileFinder::default()),
+            MenuItem::action("Open Recent Note…", OpenRecentNote),
+            MenuItem::separator(),
+            MenuItem::action("Back", zed_workspace::GoBack),
+            MenuItem::action("Forward", zed_workspace::GoForward),
+            MenuItem::separator(),
+            MenuItem::action("Command Palette…", zed_actions::command_palette::Toggle),
+        ]),
+        Menu::new("Window").items([
+            MenuItem::action("Minimize", Minimize),
+            MenuItem::action("Zoom", Zoom),
+            MenuItem::separator(),
+            MenuItem::action("Close Window", zed_workspace::CloseWindow),
+        ]),
+    ]
+}
+
 fn init_editor_subsystems(cx: &mut App) -> Result<()> {
     zed_actions::init();
     command_palette::init(cx);
@@ -1206,32 +1601,11 @@ fn init_editor_subsystems(cx: &mut App) -> Result<()> {
     load_user_keymap(cx)?;
 
     cx.on_action(quit);
+    cx.on_action(hide);
+    cx.on_action(hide_others);
+    cx.on_action(show_all);
     observe_external_file_changes(cx);
-    cx.set_menus([
-        Menu::new(APP_NAME).items([
-            MenuItem::action("Settings…", OpenSettings),
-            MenuItem::action("Quit", Quit),
-        ]),
-        Menu::new("File").items([
-            MenuItem::action("Open Folder…", OpenFolder),
-            MenuItem::action("Open Recent…", OpenRecentWorkspace),
-            MenuItem::action("Search Workspace", Search),
-        ]),
-        Menu::new("Note").items([
-            MenuItem::action("New Note…", New),
-            MenuItem::action("Open Recent…", OpenRecentNote),
-            MenuItem::action("New Directory…", NewDirectory),
-            MenuItem::action("Rename…", Rename),
-            MenuItem::action("Move to Trash…", Delete),
-            MenuItem::action("Duplicate", Duplicate),
-            MenuItem::action("Toggle Preview", TogglePreview),
-            MenuItem::action("Open Preview", OpenPreview),
-        ]),
-        Menu::new("View").items([
-            MenuItem::action("Toggle Explorer", ToggleExplorer),
-            MenuItem::action("Toggle Hidden Files", ToggleHiddenFiles),
-        ]),
-    ]);
+    cx.set_menus(notes_menus());
     #[cfg(not(target_os = "macos"))]
     cx.on_window_closed(|cx, _window_id| {
         if cx.windows().is_empty() {
@@ -1279,15 +1653,91 @@ fn apply_editor_settings(settings: &NotesEditorSettings, cx: &mut App) {
         store.update_default_settings(cx, |content| {
             content.theme.buffer_font_family =
                 Some(FontFamilyName::from(settings.font_family.clone()));
+            content.theme.markdown_preview_code_font_family =
+                Some(FontFamilyName::from(settings.font_family.clone()));
             content.theme.buffer_font_size = Some(settings.font_size.into());
             content.theme.buffer_line_height = Some(BufferLineHeight::Custom(settings.line_height));
             content.editor.gutter.get_or_insert_default().line_numbers =
                 Some(settings.line_numbers);
+            let gutter = content.editor.gutter.get_or_insert_default();
+            gutter.runnables = Some(false);
+            gutter.breakpoints = Some(false);
+            gutter.bookmarks = Some(false);
+            gutter.folds = Some(false);
+            let minimap = content.editor.minimap.get_or_insert_default();
+            minimap.show = Some(ShowMinimap::Never);
+            let scrollbar = content.editor.scrollbar.get_or_insert_default();
+            scrollbar.git_diff = Some(false);
+            scrollbar.diagnostics = Some(ScrollbarDiagnostics::None);
+            let toolbar = content.editor.toolbar.get_or_insert_default();
+            toolbar.breadcrumbs = Some(false);
+            toolbar.quick_actions = Some(false);
+            toolbar.selections_menu = Some(false);
+            toolbar.agent_review = Some(false);
+            toolbar.code_actions = Some(false);
+            content.editor.hover_popover_enabled = Some(false);
+            content.editor.auto_signature_help = Some(false);
+            content.editor.show_signature_help_after_edits = Some(false);
+            content.editor.inline_code_actions = Some(false);
+            content.editor.code_lens = Some(CodeLens::Off);
+            content.editor.lsp_document_links = Some(false);
             content.project.all_languages.defaults.soft_wrap = Some(if settings.soft_wrap {
                 SoftWrap::EditorWidth
             } else {
                 SoftWrap::None
             });
+            content
+                .project
+                .all_languages
+                .defaults
+                .enable_language_server = Some(false);
+            content
+                .project
+                .all_languages
+                .defaults
+                .show_completions_on_input = Some(false);
+            content.project.all_languages.defaults.show_edit_predictions = Some(false);
+            let completions = content
+                .project
+                .all_languages
+                .defaults
+                .completions
+                .get_or_insert_default();
+            completions.words = Some(WordsCompletionMode::Disabled);
+            completions.lsp = Some(false);
+            content
+                .project
+                .all_languages
+                .defaults
+                .inlay_hints
+                .get_or_insert_default()
+                .enabled = Some(false);
+            let tabs = content.tabs.get_or_insert_default();
+            tabs.git_status = Some(false);
+            tabs.show_diagnostics = Some(ShowDiagnostics::Off);
+            let project_panel = content.project_panel.get_or_insert_default();
+            project_panel.git_status = Some(false);
+            project_panel.show_diagnostics = Some(ShowDiagnostics::Off);
+            let status_bar = content.status_bar.get_or_insert_default();
+            status_bar.show_active_file = Some(false);
+            status_bar.active_language_button = Some(false);
+            status_bar.cursor_position_button = Some(false);
+            status_bar.line_endings_button = Some(false);
+            content
+                .git
+                .get_or_insert_default()
+                .enabled
+                .get_or_insert_default()
+                .disable_git = Some(true);
+        });
+    });
+}
+
+fn apply_ui_settings(settings: &NotesUiSettings, cx: &mut App) {
+    cx.update_global::<SettingsStore, _>(|store, cx| {
+        store.update_default_settings(cx, |content| {
+            content.theme.ui_font_family = Some(FontFamilyName::from(settings.font_family.clone()));
+            content.theme.ui_font_size = Some(settings.font_size.into());
         });
     });
 }
@@ -1300,11 +1750,13 @@ fn apply_theme_setting(theme: NotesTheme, cx: &mut App) {
     };
     cx.update_global::<SettingsStore, _>(|store, cx| {
         store.update_default_settings(cx, |content| {
-            content.theme.theme = Some(ThemeSelection::Dynamic {
+            let selection = ThemeSelection::Dynamic {
                 mode,
                 light: ThemeName(settings::DEFAULT_LIGHT_THEME.into()),
                 dark: ThemeName(settings::DEFAULT_DARK_THEME.into()),
-            });
+            };
+            content.theme.theme = Some(selection.clone());
+            content.theme.markdown_preview_theme = Some(selection);
         });
     });
 }
@@ -1312,6 +1764,9 @@ fn apply_theme_setting(theme: NotesTheme, cx: &mut App) {
 fn apply_preview_settings(settings: &PreviewSettings, cx: &mut App) {
     cx.update_global::<SettingsStore, _>(|store, cx| {
         store.update_default_settings(cx, |content| {
+            content.theme.markdown_preview_font_family =
+                Some(FontFamilyName::from(settings.font_family.clone()));
+            content.theme.markdown_preview_font_size = Some(settings.font_size.into());
             let preview = content.markdown_preview.get_or_insert_default();
             preview.limit_content_width = Some(true);
             preview.max_width = Some((settings.max_width as f32).into());
@@ -1341,6 +1796,7 @@ fn apply_notes_settings(settings: NotesSettings, cx: &mut App) {
         .try_global::<CurrentNotesSettings>()
         .is_some_and(|current| current.0.vim.leader != settings.vim.leader);
     apply_theme_setting(settings.theme, cx);
+    apply_ui_settings(&settings.ui, cx);
     apply_editor_settings(&settings.editor, cx);
     apply_explorer_settings(&settings.explorer, cx);
     apply_preview_settings(&settings.preview, cx);
@@ -1381,6 +1837,18 @@ fn apply_notes_settings(settings: NotesSettings, cx: &mut App) {
 
 fn autosave_enabled(cx: &App) -> bool {
     cx.global::<CurrentNotesSettings>().0.autosave.enabled
+}
+
+fn hide(_: &Hide, cx: &mut App) {
+    cx.hide();
+}
+
+fn hide_others(_: &HideOthers, cx: &mut App) {
+    cx.hide_other_apps();
+}
+
+fn show_all(_: &ShowAll, cx: &mut App) {
+    cx.unhide_other_apps();
 }
 
 fn quit(_: &Quit, cx: &mut App) {
@@ -1701,6 +2169,119 @@ fn toggle_preview(
     }
 }
 
+fn active_note_editor(workspace: &Workspace, cx: &App) -> Option<Entity<Editor>> {
+    workspace.active_item_as::<Editor>(cx).or_else(|| {
+        workspace
+            .active_item_as::<MarkdownPreviewView>(cx)
+            .and_then(|preview| preview.read(cx).source_editor())
+    })
+}
+
+fn show_note_statistics(workspace: &mut Workspace, cx: &mut gpui::Context<Workspace>) {
+    let Some(editor) = active_note_editor(workspace, cx) else {
+        workspace.show_toast(
+            Toast::new(
+                NotificationId::Named("notes-statistics".into()),
+                "No active note",
+            )
+            .autohide(),
+            cx,
+        );
+        return;
+    };
+    let message = editor.read_with(cx, |editor, cx| note_statistics_message(&editor.text(cx)));
+    workspace.show_toast(
+        Toast::new(NotificationId::Named("notes-statistics".into()), message).autohide(),
+        cx,
+    );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FocusModeLayout {
+    open_docks: [bool; 3],
+    centered_layout: bool,
+    pane_maximized: bool,
+    tab_bar_visible: bool,
+    status_bar_visible: bool,
+}
+
+fn set_notes_chrome_visibility(tab_bar_visible: bool, status_bar_visible: bool, cx: &mut App) {
+    cx.update_global::<SettingsStore, _>(|store, cx| {
+        store.update_default_settings(cx, |content| {
+            content.tab_bar.get_or_insert_default().show = Some(tab_bar_visible);
+            content.status_bar.get_or_insert_default().show = Some(status_bar_visible);
+        });
+    });
+}
+
+fn set_dock_open(
+    workspace: &Workspace,
+    position: DockPosition,
+    open: bool,
+    window: &mut Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    workspace
+        .dock_at_position(position)
+        .update(cx, |dock, cx| dock.set_open(open, window, cx));
+}
+
+fn toggle_focus_mode(
+    workspace: &mut Workspace,
+    state: &Cell<Option<FocusModeLayout>>,
+    window: &mut Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    const DOCKS: [DockPosition; 3] = [
+        DockPosition::Left,
+        DockPosition::Bottom,
+        DockPosition::Right,
+    ];
+
+    if let Some(layout) = state.take() {
+        if workspace.is_pane_maximized() != layout.pane_maximized {
+            workspace.toggle_editor_zoom(&zed_workspace::ToggleEditorZoom, window, cx);
+        }
+        workspace.centered_layout = layout.centered_layout;
+        for (position, open) in DOCKS.into_iter().zip(layout.open_docks) {
+            set_dock_open(workspace, position, open, window, cx);
+        }
+        set_notes_chrome_visibility(layout.tab_bar_visible, layout.status_bar_visible, cx);
+        workspace.focus_center_pane(window, cx);
+        cx.notify();
+        return;
+    }
+
+    let layout = FocusModeLayout {
+        open_docks: DOCKS.map(|position| workspace.dock_at_position(position).read(cx).is_open()),
+        centered_layout: workspace.centered_layout,
+        pane_maximized: workspace.is_pane_maximized(),
+        tab_bar_visible: TabBarSettings::get_global(cx).show,
+        status_bar_visible: StatusBarSettings::get_global(cx).show,
+    };
+    let Some(editor) = active_note_editor(workspace, cx) else {
+        return;
+    };
+    workspace.activate_item(&editor, true, true, window, cx);
+    for position in DOCKS {
+        set_dock_open(workspace, position, false, window, cx);
+    }
+    if !workspace.is_pane_maximized() {
+        workspace.toggle_editor_zoom(&zed_workspace::ToggleEditorZoom, window, cx);
+    }
+    workspace.centered_layout = true;
+    set_notes_chrome_visibility(false, false, cx);
+    editor.focus_handle(cx).focus(window, cx);
+    state.set(Some(layout));
+    cx.notify();
+}
+
+fn use_theme(theme: NotesTheme, cx: &mut App) {
+    let mut settings = cx.global::<CurrentNotesSettings>().0.clone();
+    settings.theme = theme;
+    apply_notes_settings(settings, cx);
+}
+
 fn open_preview(workspace: &mut Workspace, window: &mut Window, cx: &mut gpui::Context<Workspace>) {
     let Some(editor) = MarkdownPreviewView::resolve_active_item_as_markdown_editor(workspace, cx)
     else {
@@ -1863,6 +2444,7 @@ fn init_workspace_composition(
         };
 
         configure_workspace(workspace, window, cx);
+        let focus_mode_state = Rc::new(Cell::new(None));
 
         workspace.register_action({
             let app_state = app_state.clone();
@@ -1912,6 +2494,24 @@ fn init_workspace_composition(
         workspace.register_action(|workspace, _: &ToggleExplorer, window, cx| {
             workspace.toggle_dock(DockPosition::Left, window, cx);
         });
+        workspace.register_action(move |workspace, _: &ToggleFocusMode, window, cx| {
+            toggle_focus_mode(workspace, &focus_mode_state, window, cx);
+        });
+        workspace.register_action(|_, _: &UseSystemTheme, _, cx| {
+            use_theme(NotesTheme::System, cx);
+        });
+        workspace.register_action(|_, _: &UseLightTheme, _, cx| {
+            use_theme(NotesTheme::Light, cx);
+        });
+        workspace.register_action(|_, _: &UseDarkTheme, _, cx| {
+            use_theme(NotesTheme::Dark, cx);
+        });
+        workspace.register_action(|_, _: &Minimize, window, _| {
+            window.minimize_window();
+        });
+        workspace.register_action(|_, _: &Zoom, window, _| {
+            window.zoom_window();
+        });
         workspace.register_action(|workspace, _: &Search, window, cx| {
             ProjectSearchView::deploy_search(
                 workspace,
@@ -1931,6 +2531,9 @@ fn init_workspace_composition(
         });
         workspace.register_action(|workspace, _: &FollowLink, window, cx| {
             follow_link(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &Statistics, _, cx| {
+            show_note_statistics(workspace, cx);
         });
         workspace.register_action(|workspace, _: &New, window, cx| {
             dispatch_project_panel_action(workspace, "project_panel::NewFile", window, cx);
@@ -2143,8 +2746,15 @@ fn configure_workspace(
     })
     .detach();
     workspace.status_bar().update(cx, |status_bar, cx| {
+        while let Some(position) = status_bar.position_of_item::<PanelButtons>() {
+            status_bar.remove_item_at(position, cx);
+        }
+        let details = cx.new(|_| NotesStatusDetails::new());
+        let cursor = cx.new(|cx| NotesCursorStatus::new(details.clone(), cx));
         let mode_indicator = cx.new(|cx| ModeIndicator::new(window, cx));
+        status_bar.add_right_item(cursor, window, cx);
         status_bar.add_right_item(mode_indicator, window, cx);
+        status_bar.add_right_item(details, window, cx);
     });
 }
 
@@ -2670,6 +3280,33 @@ mod tests {
         test.cx.run_until_parked();
     }
 
+    #[test]
+    fn test_note_statistics_count_words_and_unicode_characters() {
+        let text = "# Hello, **world**\n\n你好 world\n";
+        assert_eq!(
+            note_statistics(text),
+            NoteStatistics {
+                words: 4,
+                characters: text.chars().count(),
+            }
+        );
+        assert_eq!(
+            note_statistics_message(text),
+            format!("4 words · {} characters", text.chars().count())
+        );
+    }
+
+    #[test]
+    fn test_notes_menu_bar_has_only_the_minimal_sections() {
+        assert_eq!(
+            notes_menus()
+                .into_iter()
+                .map(|menu| menu.name.to_string())
+                .collect::<Vec<_>>(),
+            [APP_NAME, "File", "Edit", "View", "Go", "Window"]
+        );
+    }
+
     #[gpui::test]
     fn test_notes_windows_keep_the_native_macos_titlebar(cx: &mut TestAppContext) {
         let titlebar = cx
@@ -3187,6 +3824,53 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_notes_status_bar_tracks_counts_cursor_and_save_state(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+        test.cx.run_until_parked();
+        let status_bar =
+            workspace(&test, cx).read_with(cx, |workspace, _| workspace.status_bar().clone());
+        let details = status_bar.read_with(cx, |status_bar, _| {
+            assert_eq!(status_bar.position_of_item::<NotesCursorStatus>(), Some(0));
+            assert_eq!(status_bar.position_of_item::<ModeIndicator>(), Some(1));
+            assert_eq!(status_bar.position_of_item::<NotesStatusDetails>(), Some(2));
+            assert!(status_bar.item_of_type::<PanelButtons>().is_none());
+            status_bar
+                .item_of_type::<NotesStatusDetails>()
+                .expect("notes details should be on the right")
+        });
+        assert_eq!(
+            details.read_with(cx, |details, _| details.snapshot.clone()),
+            Some(NotesStatusSnapshot {
+                language: "Markdown".to_owned(),
+                statistics: note_statistics(TEST_NOTE),
+                line: 1,
+                column: 1,
+                save_state: NoteSaveState::Saved,
+            })
+        );
+
+        test.cx.simulate_keystrokes("i");
+        test.cx.simulate_input("two words ");
+        test.cx.simulate_keystrokes("escape");
+        test.cx.run_until_parked();
+
+        let snapshot = details
+            .read_with(cx, |details, _| details.snapshot.clone())
+            .expect("status should remain attached to the editor");
+        assert_eq!(
+            snapshot.statistics.words,
+            note_statistics(TEST_NOTE).words + 2
+        );
+        assert_eq!(
+            snapshot.statistics.characters,
+            note_statistics(TEST_NOTE).characters + "two words ".chars().count()
+        );
+        assert_eq!(snapshot.line, 1);
+        assert!(snapshot.column > 1);
+        assert_eq!(snapshot.save_state, NoteSaveState::Modified);
+    }
+
+    #[gpui::test]
     async fn test_cmd_s_saves_the_editor_buffer(cx: &mut TestAppContext) {
         let mut test = test_window(cx).await;
 
@@ -3243,6 +3927,10 @@ mod tests {
                 "vim": {
                     "leader": "ctrl-space",
                 },
+                "ui": {
+                    "font_family": "Test Sans",
+                    "font_size": 13.5,
+                },
                 "editor": {
                     "font_family": "Test Mono",
                     "font_size": 18.5,
@@ -3253,6 +3941,10 @@ mod tests {
                 "explorer": {
                     "width": 320,
                 },
+                "preview": {
+                    "font_family": "Test Serif",
+                    "font_size": 17,
+                },
             }
             "#,
         )
@@ -3261,20 +3953,25 @@ mod tests {
         assert_eq!(settings.theme, NotesTheme::Dark);
         assert!(!settings.vim_mode);
         assert_eq!(settings.vim.leader, "ctrl-space");
+        assert_eq!(settings.ui.font_family, "Test Sans");
+        assert_eq!(settings.ui.font_size, 13.5);
         assert_eq!(settings.editor.font_family, "Test Mono");
         assert_eq!(settings.editor.font_size, 18.5);
         assert_eq!(settings.editor.line_height, 1.4);
         assert!(settings.editor.line_numbers);
         assert!(!settings.editor.soft_wrap);
         assert_eq!(settings.explorer.width, 320);
+        assert_eq!(settings.preview.font_family, "Test Serif");
+        assert_eq!(settings.preview.font_size, 17.0);
         assert_eq!(settings.autosave, AutosaveSettings::default());
-        assert_eq!(settings.preview, PreviewSettings::default());
     }
 
     #[test]
     fn test_invalid_settings_are_rejected_for_the_loader_to_fall_back() {
         assert!(parse_notes_settings("{ invalid").is_err());
+        assert!(parse_notes_settings(r#"{ "ui": { "font_size": 0 } }"#).is_err());
         assert!(parse_notes_settings(r#"{ "editor": { "line_height": 0.5 } }"#).is_err());
+        assert!(parse_notes_settings(r#"{ "preview": { "font_family": "" } }"#).is_err());
         assert!(parse_notes_settings(r#"{ "vim": { "leader": "" } }"#).is_err());
         assert!(parse_notes_settings(r#"{ "vim": { "leader": "g g" } }"#).is_err());
         assert!(parse_notes_settings(r#"{ "vim": { "leader": "ctrl-alt-x-y" } }"#).is_err());
@@ -3286,6 +3983,10 @@ mod tests {
         let settings = NotesSettings {
             theme: NotesTheme::Dark,
             vim_mode: false,
+            ui: NotesUiSettings {
+                font_family: "Test Sans".to_owned(),
+                font_size: 13.0,
+            },
             editor: NotesEditorSettings {
                 font_family: "Test Mono".to_owned(),
                 font_size: 18.0,
@@ -3296,6 +3997,11 @@ mod tests {
             explorer: ExplorerSettings {
                 width: 320,
                 ..ExplorerSettings::default()
+            },
+            preview: PreviewSettings {
+                font_family: "Test Serif".to_owned(),
+                font_size: 17.0,
+                ..PreviewSettings::default()
             },
             ..NotesSettings::default()
         };
@@ -3311,6 +4017,17 @@ mod tests {
             line_numbers,
             soft_wrap,
             explorer_width,
+            ui_font_family,
+            ui_font_size,
+            preview_font_family,
+            preview_font_size,
+            minimap,
+            automatic_completions,
+            word_completions,
+            lsp_completions,
+            language_server,
+            git_status,
+            git_diff,
         ) = cx.update(|cx| {
             let theme = theme_settings::ThemeSettings::get_global(cx);
             (
@@ -3323,6 +4040,33 @@ mod tests {
                     .defaults
                     .soft_wrap,
                 ProjectPanelSettings::get_global(cx).default_width,
+                theme.ui_font.family.to_string(),
+                theme.ui_font_size(cx),
+                theme.markdown_preview_font_family().to_string(),
+                theme.markdown_preview_font_size(cx),
+                editor::EditorSettings::get_global(cx).minimap.show,
+                language::language_settings::AllLanguageSettings::get_global(cx)
+                    .defaults
+                    .show_completions_on_input,
+                language::language_settings::AllLanguageSettings::get_global(cx)
+                    .defaults
+                    .completions
+                    .words,
+                language::language_settings::AllLanguageSettings::get_global(cx)
+                    .defaults
+                    .completions
+                    .lsp,
+                language::language_settings::AllLanguageSettings::get_global(cx)
+                    .defaults
+                    .enable_language_server,
+                project::project_settings::ProjectSettings::get_global(cx)
+                    .git
+                    .enabled
+                    .status,
+                project::project_settings::ProjectSettings::get_global(cx)
+                    .git
+                    .enabled
+                    .diff,
             )
         });
         assert_eq!(font_family, "Test Mono");
@@ -3332,6 +4076,17 @@ mod tests {
         assert!(line_numbers);
         assert_eq!(soft_wrap, SoftWrap::None);
         assert_eq!(explorer_width, px(320.0));
+        assert_eq!(ui_font_family, "Test Sans");
+        assert_eq!(ui_font_size, px(13.0));
+        assert_eq!(preview_font_family, "Test Serif");
+        assert_eq!(preview_font_size, px(17.0));
+        assert_eq!(minimap, ShowMinimap::Never);
+        assert!(!automatic_completions);
+        assert_eq!(word_completions, WordsCompletionMode::Disabled);
+        assert!(!lsp_completions);
+        assert!(!language_server);
+        assert!(!git_status);
+        assert!(!git_diff);
 
         test.cx.simulate_keystrokes("x");
         assert_eq!(
@@ -3919,6 +4674,11 @@ mod tests {
             "note::Rename",
             "note::Delete",
             "note::Duplicate",
+            "note::Statistics",
+            "view::ToggleFocusMode",
+            "view::UseSystemTheme",
+            "view::UseLightTheme",
+            "view::UseDarkTheme",
         ] {
             assert!(
                 cx.update(|cx| cx.all_action_names().contains(&action_name)),
@@ -4326,6 +5086,8 @@ mod tests {
         assert_eq!(
             settings,
             PreviewSettings {
+                font_family: DEFAULT_PREVIEW_FONT_FAMILY.to_owned(),
+                font_size: DEFAULT_PREVIEW_FONT_SIZE,
                 max_width: 680,
                 allow_remote_images: true,
                 max_file_size_bytes: Some(2048),
@@ -4395,6 +5157,107 @@ mod tests {
                 .count()),
             0
         );
+    }
+
+    #[gpui::test]
+    async fn test_focus_mode_restores_explorer_preview_and_chrome_layout(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+        test.cx.simulate_keystrokes("cmd-shift-v");
+        test.cx.run_until_parked();
+        let workspace = workspace(&test, cx);
+        let before = workspace.read_with(cx, |workspace, cx| FocusModeLayout {
+            open_docks: [
+                workspace.left_dock().read(cx).is_open(),
+                workspace.bottom_dock().read(cx).is_open(),
+                workspace.right_dock().read(cx).is_open(),
+            ],
+            centered_layout: workspace.centered_layout,
+            pane_maximized: workspace.is_pane_maximized(),
+            tab_bar_visible: TabBarSettings::get_global(cx).show,
+            status_bar_visible: StatusBarSettings::get_global(cx).show,
+        });
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .items_of_type::<MarkdownPreviewView>(cx)
+                .count()),
+            1
+        );
+
+        test.cx.dispatch_action(ToggleFocusMode);
+        test.cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(workspace.centered_layout);
+            assert!(workspace.is_pane_maximized());
+            assert!(!workspace.left_dock().read(cx).is_open());
+            assert!(!workspace.bottom_dock().read(cx).is_open());
+            assert!(!workspace.right_dock().read(cx).is_open());
+            assert_eq!(
+                workspace.panes().len(),
+                2,
+                "the preview layout is preserved"
+            );
+            assert_eq!(
+                workspace.items_of_type::<MarkdownPreviewView>(cx).count(),
+                1
+            );
+            assert!(!TabBarSettings::get_global(cx).show);
+            assert!(!StatusBarSettings::get_global(cx).show);
+        });
+
+        test.cx.dispatch_action(ToggleFocusMode);
+        test.cx.run_until_parked();
+        let after = workspace.read_with(cx, |workspace, cx| FocusModeLayout {
+            open_docks: [
+                workspace.left_dock().read(cx).is_open(),
+                workspace.bottom_dock().read(cx).is_open(),
+                workspace.right_dock().read(cx).is_open(),
+            ],
+            centered_layout: workspace.centered_layout,
+            pane_maximized: workspace.is_pane_maximized(),
+            tab_bar_visible: TabBarSettings::get_global(cx).show,
+            status_bar_visible: StatusBarSettings::get_global(cx).show,
+        });
+        assert_eq!(after, before);
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .items_of_type::<MarkdownPreviewView>(cx)
+                .count()),
+            1
+        );
+    }
+
+    #[gpui::test]
+    async fn test_theme_actions_keep_ui_preview_and_syntax_theme_modes_coordinated(
+        cx: &mut TestAppContext,
+    ) {
+        let mut test = test_window(cx).await;
+        for (action, expected) in [
+            (UseDarkTheme.boxed_clone(), NotesTheme::Dark),
+            (UseLightTheme.boxed_clone(), NotesTheme::Light),
+            (UseSystemTheme.boxed_clone(), NotesTheme::System),
+        ] {
+            test.cx
+                .update(|window, cx| window.dispatch_action(action, cx));
+            test.cx.run_until_parked();
+            cx.update(|cx| {
+                let settings = cx.global::<CurrentNotesSettings>();
+                let theme = theme_settings::ThemeSettings::get_global(cx);
+                let expected_mode = match expected {
+                    NotesTheme::System => ThemeAppearanceMode::System,
+                    NotesTheme::Light => ThemeAppearanceMode::Light,
+                    NotesTheme::Dark => ThemeAppearanceMode::Dark,
+                };
+                assert_eq!(settings.0.theme, expected);
+                assert_eq!(theme.theme.mode(), Some(expected_mode));
+                assert_eq!(
+                    theme
+                        .markdown_preview_theme
+                        .as_ref()
+                        .and_then(|theme| theme.mode()),
+                    Some(expected_mode)
+                );
+            });
+        }
     }
 
     #[gpui::test]

@@ -9104,7 +9104,7 @@ impl Render for Workspace {
         }
 
         let centered_layout = self.centered_layout
-            && self.center.panes().len() == 1
+            && (self.center.panes().len() == 1 || self.maximized_pane.is_some())
             && self.active_item(cx).is_some();
         let render_padding = |size| {
             (size > 0.0).then(|| {

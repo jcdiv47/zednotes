@@ -11,9 +11,10 @@ use anyhow::{Context as _, Result};
 use assets::Assets;
 use client::{Client, UserStore};
 use editor::Editor;
-use fs::{Fs, RealFs};
+use fs::{Fs, PathEventKind, RealFs};
+use futures::StreamExt as _;
 use gpui::{
-    App, AppContext as _, BorrowAppContext as _, Bounds, Focusable as _, KeyBinding, Menu,
+    App, AppContext as _, BorrowAppContext as _, Bounds, Focusable as _, Global, KeyBinding, Menu,
     MenuItem, PathPromptOptions, TaskExt as _, TitlebarOptions, Window, WindowBounds, WindowHandle,
     WindowOptions, actions, px, size,
 };
@@ -31,15 +32,17 @@ use semver::Version;
 use serde::Deserialize;
 use session::{AppSession, Session};
 use settings::{
-    AutosaveSetting, DockSide, KeybindSource, KeymapFile, Settings as _, SettingsStore,
+    AutosaveSetting, BufferLineHeight, DockSide, FontFamilyName, KeybindSource, KeymapFile,
+    KeymapFileLoadResult, Settings as _, SettingsStore, SoftWrap, ThemeAppearanceMode, ThemeName,
+    ThemeSelection,
 };
-use theme::{ActiveTheme as _, LoadThemes};
+use theme::{ActiveTheme as _, GlobalTheme, LoadThemes};
 use util::ResultExt as _;
 use vim::ModeIndicator;
 use workspace as zed_workspace;
 use zed_workspace::{
-    AppState, CloseIntent, Event as WorkspaceEvent, ItemHandle as _, MultiWorkspace, Pane,
-    SaveIntent, SplitDirection, Toast, Workspace, WorkspaceStore,
+    AppState, CloseIntent, Event as WorkspaceEvent, ItemHandle as _, MultiWorkspace, OpenOptions,
+    OpenVisible, Pane, SaveIntent, SplitDirection, Toast, Workspace, WorkspaceStore,
     dock::DockPosition,
     item::SaveOptions,
     notifications::{DetachAndPromptErr as _, NotificationId},
@@ -53,10 +56,45 @@ const DEFAULT_EXCLUDED_PATHS: &[&str] = &[".git", ".DS_Store", "node_modules", "
 const DEFAULT_PREVIEW_MAX_WIDTH: u32 = 760;
 const DEFAULT_PREVIEW_MAX_FILE_SIZE_BYTES: u64 = 5 * 1024 * 1024;
 const DEFAULT_AUTOSAVE_DELAY_MS: u64 = 750;
+const DEFAULT_EXPLORER_WIDTH: u32 = 240;
+const DEFAULT_EDITOR_FONT_FAMILY: &str = ".ZedMono";
+const DEFAULT_EDITOR_FONT_SIZE: f32 = 15.0;
+const DEFAULT_EDITOR_LINE_HEIGHT: f32 = 1.55;
+const INITIAL_SETTINGS_CONTENT: &str = r#"{
+  // system, light, or dark
+  "theme": "system",
+  "vim_mode": true,
+
+  "editor": {
+    "font_family": ".ZedMono",
+    "font_size": 15,
+    "line_height": 1.55,
+    "line_numbers": false,
+    "soft_wrap": true,
+  },
+
+  "autosave": {
+    "enabled": true,
+    "delay_ms": 750,
+  },
+
+  "explorer": {
+    "width": 240,
+    "markdown_only": true,
+    "show_hidden": false,
+  },
+
+  "preview": {
+    "max_width": 760,
+  },
+}
+"#;
 
 actions!(
     notes,
     [
+        /// Opens the user-owned zednotes settings file.
+        OpenSettings,
         /// Quits zednotes.
         Quit,
     ]
@@ -110,8 +148,39 @@ actions!(
     ]
 );
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum NotesTheme {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct NotesEditorSettings {
+    font_family: String,
+    font_size: f32,
+    line_height: f32,
+    line_numbers: bool,
+    soft_wrap: bool,
+}
+
+impl Default for NotesEditorSettings {
+    fn default() -> Self {
+        Self {
+            font_family: DEFAULT_EDITOR_FONT_FAMILY.to_owned(),
+            font_size: DEFAULT_EDITOR_FONT_SIZE,
+            line_height: DEFAULT_EDITOR_LINE_HEIGHT,
+            line_numbers: false,
+            soft_wrap: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ExplorerSettings {
+    width: u32,
     markdown_only: bool,
     show_hidden: bool,
     excluded_paths: Vec<String>,
@@ -152,6 +221,7 @@ impl Default for PreviewSettings {
 impl Default for ExplorerSettings {
     fn default() -> Self {
         Self {
+            width: DEFAULT_EXPLORER_WIDTH,
             markdown_only: true,
             show_hidden: false,
             excluded_paths: DEFAULT_EXCLUDED_PATHS
@@ -162,12 +232,52 @@ impl Default for ExplorerSettings {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct NotesSettings {
+    theme: NotesTheme,
+    vim_mode: bool,
+    editor: NotesEditorSettings,
+    autosave: AutosaveSettings,
+    explorer: ExplorerSettings,
+    preview: PreviewSettings,
+}
+
+impl Default for NotesSettings {
+    fn default() -> Self {
+        Self {
+            theme: NotesTheme::System,
+            vim_mode: true,
+            editor: NotesEditorSettings::default(),
+            autosave: AutosaveSettings::default(),
+            explorer: ExplorerSettings::default(),
+            preview: PreviewSettings::default(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CurrentNotesSettings(NotesSettings);
+
+impl Global for CurrentNotesSettings {}
+
 #[derive(Debug, Default, Deserialize)]
 struct NotesSettingsContent {
+    theme: Option<NotesTheme>,
+    vim_mode: Option<bool>,
+    editor: Option<NotesEditorSettingsContent>,
     autosave: Option<AutosaveSettingsContent>,
     explorer: Option<ExplorerSettingsContent>,
     files: Option<FileSettingsContent>,
     preview: Option<PreviewSettingsContent>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct NotesEditorSettingsContent {
+    font_family: Option<String>,
+    font_size: Option<f32>,
+    line_height: Option<f32>,
+    line_numbers: Option<bool>,
+    soft_wrap: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -178,6 +288,7 @@ struct AutosaveSettingsContent {
 
 #[derive(Debug, Default, Deserialize)]
 struct ExplorerSettingsContent {
+    width: Option<u32>,
     markdown_only: Option<bool>,
     show_hidden: Option<bool>,
 }
@@ -194,73 +305,95 @@ struct PreviewSettingsContent {
     max_file_size_bytes: Option<u64>,
 }
 
-fn parse_explorer_settings(content: &str) -> Result<ExplorerSettings> {
+fn parse_notes_settings(content: &str) -> Result<NotesSettings> {
     let content = settings::parse_json_with_comments::<NotesSettingsContent>(content)
         .context("failed to parse zednotes settings")?;
-    let mut settings = ExplorerSettings::default();
+    let mut settings = NotesSettings::default();
+    settings.theme = content.theme.unwrap_or(settings.theme);
+    settings.vim_mode = content.vim_mode.unwrap_or(settings.vim_mode);
+    if let Some(editor) = content.editor {
+        settings.editor.font_family = editor.font_family.unwrap_or(settings.editor.font_family);
+        settings.editor.font_size = editor.font_size.unwrap_or(settings.editor.font_size);
+        settings.editor.line_height = editor.line_height.unwrap_or(settings.editor.line_height);
+        settings.editor.line_numbers = editor.line_numbers.unwrap_or(settings.editor.line_numbers);
+        settings.editor.soft_wrap = editor.soft_wrap.unwrap_or(settings.editor.soft_wrap);
+    }
+    if let Some(autosave) = content.autosave {
+        settings.autosave.enabled = autosave.enabled.unwrap_or(settings.autosave.enabled);
+        settings.autosave.delay_ms = autosave.delay_ms.unwrap_or(settings.autosave.delay_ms);
+    }
     if let Some(explorer) = content.explorer {
-        settings.markdown_only = explorer.markdown_only.unwrap_or(settings.markdown_only);
-        settings.show_hidden = explorer.show_hidden.unwrap_or(settings.show_hidden);
+        settings.explorer.width = explorer.width.unwrap_or(settings.explorer.width);
+        settings.explorer.markdown_only = explorer
+            .markdown_only
+            .unwrap_or(settings.explorer.markdown_only);
+        settings.explorer.show_hidden = explorer
+            .show_hidden
+            .unwrap_or(settings.explorer.show_hidden);
     }
     if let Some(excluded_paths) = content.files.and_then(|files| files.exclude) {
-        settings.excluded_paths = excluded_paths;
+        settings.explorer.excluded_paths = excluded_paths;
     }
-    Ok(settings)
-}
-
-fn parse_preview_settings(content: &str) -> Result<PreviewSettings> {
-    let content = settings::parse_json_with_comments::<NotesSettingsContent>(content)
-        .context("failed to parse zednotes settings")?;
-    let mut settings = PreviewSettings::default();
     if let Some(preview) = content.preview {
-        settings.max_width = preview.max_width.unwrap_or(settings.max_width);
-        settings.allow_remote_images = preview
+        settings.preview.max_width = preview.max_width.unwrap_or(settings.preview.max_width);
+        settings.preview.allow_remote_images = preview
             .allow_remote_images
-            .unwrap_or(settings.allow_remote_images);
-        settings.max_file_size_bytes = preview.max_file_size_bytes.or(settings.max_file_size_bytes);
+            .unwrap_or(settings.preview.allow_remote_images);
+        settings.preview.max_file_size_bytes = preview
+            .max_file_size_bytes
+            .or(settings.preview.max_file_size_bytes);
     }
+
+    anyhow::ensure!(
+        !settings.editor.font_family.trim().is_empty(),
+        "editor.font_family cannot be empty"
+    );
+    anyhow::ensure!(
+        settings.editor.font_size > 0.0,
+        "editor.font_size must be greater than zero"
+    );
+    anyhow::ensure!(
+        settings.editor.line_height >= 1.0,
+        "editor.line_height must be at least 1.0"
+    );
+    anyhow::ensure!(
+        settings.explorer.width > 0,
+        "explorer.width must be positive"
+    );
+    anyhow::ensure!(
+        settings.preview.max_width > 0,
+        "preview.max_width must be positive"
+    );
     Ok(settings)
 }
 
-fn parse_autosave_settings(content: &str) -> Result<AutosaveSettings> {
-    let content = settings::parse_json_with_comments::<NotesSettingsContent>(content)
-        .context("failed to parse zednotes settings")?;
-    let mut settings = AutosaveSettings::default();
-    if let Some(autosave) = content.autosave {
-        settings.enabled = autosave.enabled.unwrap_or(settings.enabled);
-        settings.delay_ms = autosave.delay_ms.unwrap_or(settings.delay_ms);
-    }
-    Ok(settings)
+fn config_dir_path() -> PathBuf {
+    paths::home_dir().join(".config").join(APP_NAME)
 }
 
-fn explorer_settings_path() -> PathBuf {
-    paths::home_dir()
-        .join(".config")
-        .join(APP_NAME)
-        .join("settings.json")
+fn notes_settings_path() -> PathBuf {
+    config_dir_path().join("settings.json")
 }
 
-fn load_explorer_settings() -> Result<ExplorerSettings> {
-    match std::fs::read_to_string(explorer_settings_path()) {
-        Ok(content) => parse_explorer_settings(&content),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(ExplorerSettings::default()),
-        Err(error) => Err(error).context("failed to read zednotes settings"),
-    }
+fn notes_keymap_path() -> PathBuf {
+    config_dir_path().join("keymap.json")
 }
 
-fn load_preview_settings() -> Result<PreviewSettings> {
-    match std::fs::read_to_string(explorer_settings_path()) {
-        Ok(content) => parse_preview_settings(&content),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(PreviewSettings::default()),
-        Err(error) => Err(error).context("failed to read zednotes settings"),
-    }
-}
-
-fn load_autosave_settings() -> Result<AutosaveSettings> {
-    match std::fs::read_to_string(explorer_settings_path()) {
-        Ok(content) => parse_autosave_settings(&content),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(AutosaveSettings::default()),
-        Err(error) => Err(error).context("failed to read zednotes settings"),
+fn load_notes_settings() -> NotesSettings {
+    let path = notes_settings_path();
+    match std::fs::read_to_string(&path) {
+        Ok(content) => parse_notes_settings(&content).unwrap_or_else(|error| {
+            log::error!(
+                "failed to load {}: {error:#}; using defaults",
+                path.display()
+            );
+            NotesSettings::default()
+        }),
+        Err(error) if error.kind() == ErrorKind::NotFound => NotesSettings::default(),
+        Err(error) => {
+            log::error!("failed to read {}: {error}; using defaults", path.display());
+            NotesSettings::default()
+        }
     }
 }
 
@@ -319,7 +452,7 @@ fn markdown_languages(cx: &App) -> Result<Arc<LanguageRegistry>> {
     Ok(languages)
 }
 
-fn load_editor_keymaps(cx: &mut App) -> Result<()> {
+fn bind_default_editor_keymaps(cx: &mut App) -> Result<()> {
     for (path, source) in [
         (settings::DEFAULT_KEYMAP_PATH, KeybindSource::Default),
         (settings::VIM_KEYMAP_PATH, KeybindSource::Vim),
@@ -331,10 +464,23 @@ fn load_editor_keymaps(cx: &mut App) -> Result<()> {
         cx.bind_keys(key_bindings);
     }
     cx.bind_keys([
+        KeyBinding::new("cmd-,", OpenSettings, Some("Workspace")),
         KeyBinding::new("cmd-o", OpenFolder, None),
-        KeyBinding::new("cmd-n", New, None),
-        KeyBinding::new("cmd-b", ToggleExplorer, None),
-        KeyBinding::new("cmd-shift-f", Search, None),
+        KeyBinding::new("cmd-n", New, Some("Workspace")),
+        KeyBinding::new("cmd-b", ToggleExplorer, Some("Workspace")),
+        KeyBinding::new("cmd-shift-f", Search, Some("Pane")),
+        KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new(
+            "cmd-shift-v",
+            TogglePreview,
+            Some("Editor && extension == md"),
+        ),
+        KeyBinding::new("cmd-shift-v", TogglePreview, Some("MarkdownPreview")),
+        KeyBinding::new(
+            "cmd-s",
+            zed_workspace::Save { save_intent: None },
+            Some("Editor"),
+        ),
         KeyBinding::new(
             "enter",
             editor::actions::OpenExcerpts,
@@ -364,7 +510,55 @@ fn load_editor_keymaps(cx: &mut App) -> Result<()> {
     Ok(())
 }
 
-fn init_editor_subsystems(autosave_settings: AutosaveSettings, cx: &mut App) -> Result<()> {
+fn reload_editor_keymaps(mut user_key_bindings: Vec<KeyBinding>, cx: &mut App) -> Result<()> {
+    cx.clear_key_bindings();
+    bind_default_editor_keymaps(cx)?;
+    for key_binding in &mut user_key_bindings {
+        key_binding.set_meta(KeybindSource::User.meta());
+    }
+    cx.bind_keys(user_key_bindings);
+    Ok(())
+}
+
+fn reload_editor_keymap_content(content: &str, cx: &mut App) -> Result<()> {
+    match KeymapFile::load(content, cx) {
+        KeymapFileLoadResult::Success { key_bindings } => reload_editor_keymaps(key_bindings, cx),
+        KeymapFileLoadResult::SomeFailedToLoad {
+            key_bindings,
+            error_message,
+        } => {
+            log::error!(
+                "failed to load part of {}: {error_message}",
+                notes_keymap_path().display()
+            );
+            reload_editor_keymaps(key_bindings, cx)
+        }
+        KeymapFileLoadResult::JsonParseFailure { error } => {
+            log::error!(
+                "failed to parse {}: {error:#}; using default keymap",
+                notes_keymap_path().display()
+            );
+            reload_editor_keymaps(Vec::new(), cx)
+        }
+    }
+}
+
+fn load_user_keymap(cx: &mut App) -> Result<()> {
+    let path = notes_keymap_path();
+    match std::fs::read_to_string(&path) {
+        Ok(content) => reload_editor_keymap_content(&content, cx),
+        Err(error) if error.kind() == ErrorKind::NotFound => reload_editor_keymaps(Vec::new(), cx),
+        Err(error) => {
+            log::error!(
+                "failed to read {}: {error}; using default keymap",
+                path.display()
+            );
+            reload_editor_keymaps(Vec::new(), cx)
+        }
+    }
+}
+
+fn init_editor_subsystems(cx: &mut App) -> Result<()> {
     zed_actions::init();
     command_palette::init(cx);
     editor::init(cx);
@@ -374,30 +568,25 @@ fn init_editor_subsystems(autosave_settings: AutosaveSettings, cx: &mut App) -> 
     search::init(cx);
     vim::init(cx);
     // Vim activates its settings observer at the end of this effect cycle, so
-    // apply our app default after that observer is live.
+    // reapply the configured mode after that observer is live.
     cx.defer(|cx| {
+        let vim_mode = cx.global::<CurrentNotesSettings>().0.vim_mode;
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_default_settings(cx, |settings| {
-                settings.vim_mode = Some(true);
+                settings.vim_mode = Some(vim_mode);
                 settings.helix_mode = Some(false);
             });
         });
     });
-    load_editor_keymaps(cx)?;
+    load_user_keymap(cx)?;
 
-    cx.on_action(move |action: &Quit, cx| quit(action, autosave_settings, cx));
+    cx.on_action(quit);
     observe_external_file_changes(cx);
-    cx.bind_keys([
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-shift-v", TogglePreview, None),
-        KeyBinding::new(
-            "cmd-s",
-            zed_workspace::Save { save_intent: None },
-            Some("Editor"),
-        ),
-    ]);
     cx.set_menus([
-        Menu::new(APP_NAME).items([MenuItem::action("Quit", Quit)]),
+        Menu::new(APP_NAME).items([
+            MenuItem::action("Settings…", OpenSettings),
+            MenuItem::action("Quit", Quit),
+        ]),
         Menu::new("File").items([
             MenuItem::action("Open Folder…", OpenFolder),
             MenuItem::action("Search Workspace", Search),
@@ -438,6 +627,7 @@ fn apply_explorer_settings(settings: &ExplorerSettings, cx: &mut App) {
             let project_panel = content.project_panel.get_or_insert_default();
             project_panel.dock = Some(DockSide::Left);
             project_panel.starts_open = Some(true);
+            project_panel.default_width = Some((settings.width as f32).into());
             project_panel.hide_gitignore = Some(true);
             project_panel.hide_hidden = Some(hide_hidden);
             project_panel.auto_fold_dirs = Some(false);
@@ -452,6 +642,41 @@ fn apply_explorer_settings(settings: &ExplorerSettings, cx: &mut App) {
                     exclusions.0.push(excluded_path);
                 }
             }
+        });
+    });
+}
+
+fn apply_editor_settings(settings: &NotesEditorSettings, cx: &mut App) {
+    cx.update_global::<SettingsStore, _>(|store, cx| {
+        store.update_default_settings(cx, |content| {
+            content.theme.buffer_font_family =
+                Some(FontFamilyName::from(settings.font_family.clone()));
+            content.theme.buffer_font_size = Some(settings.font_size.into());
+            content.theme.buffer_line_height = Some(BufferLineHeight::Custom(settings.line_height));
+            content.editor.gutter.get_or_insert_default().line_numbers =
+                Some(settings.line_numbers);
+            content.project.all_languages.defaults.soft_wrap = Some(if settings.soft_wrap {
+                SoftWrap::EditorWidth
+            } else {
+                SoftWrap::None
+            });
+        });
+    });
+}
+
+fn apply_theme_setting(theme: NotesTheme, cx: &mut App) {
+    let mode = match theme {
+        NotesTheme::System => ThemeAppearanceMode::System,
+        NotesTheme::Light => ThemeAppearanceMode::Light,
+        NotesTheme::Dark => ThemeAppearanceMode::Dark,
+    };
+    cx.update_global::<SettingsStore, _>(|store, cx| {
+        store.update_default_settings(cx, |content| {
+            content.theme.theme = Some(ThemeSelection::Dynamic {
+                mode,
+                light: ThemeName(settings::DEFAULT_LIGHT_THEME.into()),
+                dark: ThemeName(settings::DEFAULT_DARK_THEME.into()),
+            });
         });
     });
 }
@@ -483,7 +708,32 @@ fn apply_autosave_settings(settings: AutosaveSettings, cx: &mut App) {
     });
 }
 
-fn quit(_: &Quit, autosave_settings: AutosaveSettings, cx: &mut App) {
+fn apply_notes_settings(settings: NotesSettings, cx: &mut App) {
+    apply_theme_setting(settings.theme, cx);
+    apply_editor_settings(&settings.editor, cx);
+    apply_explorer_settings(&settings.explorer, cx);
+    apply_preview_settings(&settings.preview, cx);
+    apply_autosave_settings(settings.autosave, cx);
+    cx.update_global::<SettingsStore, _>(|store, cx| {
+        store.update_default_settings(cx, |content| {
+            content.vim_mode = Some(settings.vim_mode);
+            content.helix_mode = Some(false);
+        });
+    });
+    if cx.has_global::<CurrentNotesSettings>() {
+        cx.update_global::<CurrentNotesSettings, _>(|current, _| current.0 = settings);
+    } else {
+        cx.set_global(CurrentNotesSettings(settings));
+    }
+    cx.refresh_windows();
+}
+
+fn autosave_enabled(cx: &App) -> bool {
+    cx.global::<CurrentNotesSettings>().0.autosave.enabled
+}
+
+fn quit(_: &Quit, cx: &mut App) {
+    let autosave_enabled = autosave_enabled(cx);
     let windows = cx
         .windows()
         .into_iter()
@@ -500,7 +750,7 @@ fn quit(_: &Quit, autosave_settings: AutosaveSettings, cx: &mut App) {
                 .unwrap_or_default();
 
             for workspace in workspaces {
-                if autosave_settings.enabled {
+                if autosave_enabled {
                     let save_tasks = window
                         .update(cx, |_, window, cx| {
                             workspace
@@ -815,10 +1065,47 @@ fn dispatch_project_panel_action(
     }
 }
 
+fn open_settings_file(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    let path = notes_settings_path();
+    let config_dir = config_dir_path();
+    let fs = workspace.app_state().fs.clone();
+    let project = workspace.project().clone();
+    cx.spawn_in(window, async move |workspace, cx| {
+        if !fs.is_file(&path).await {
+            fs.save(&path, &INITIAL_SETTINGS_CONTENT.into(), Default::default())
+                .await
+                .with_context(|| format!("failed to create {}", path.display()))?;
+        }
+        project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(config_dir, false, cx)
+            })
+            .await?;
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    path,
+                    OpenOptions {
+                        visible: Some(OpenVisible::None),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })?
+            .await?;
+        anyhow::Ok(())
+    })
+    .detach_and_log_err(cx);
+}
+
 fn init_workspace_composition(
     app_state: Arc<AppState>,
     explorer_settings: ExplorerSettings,
-    autosave_settings: AutosaveSettings,
     cx: &mut App,
 ) {
     let entry_filter = markdown_entry_filter(explorer_settings.markdown_only);
@@ -827,7 +1114,7 @@ fn init_workspace_composition(
             return;
         };
 
-        configure_workspace(workspace, autosave_settings, window, cx);
+        configure_workspace(workspace, window, cx);
 
         workspace.register_action({
             let app_state = app_state.clone();
@@ -854,6 +1141,9 @@ fn init_workspace_composition(
                     content.project_panel.get_or_insert_default().hide_hidden = Some(!hide_hidden);
                 });
             });
+        });
+        workspace.register_action(|workspace, _: &OpenSettings, window, cx| {
+            open_settings_file(workspace, window, cx);
         });
         workspace.register_action(|workspace, _: &FocusEditor, window, cx| {
             workspace.focus_center_pane(window, cx);
@@ -953,18 +1243,78 @@ fn init_workspace_composition(
     .detach();
 }
 
+fn watch_configuration_files(fs: Arc<dyn Fs>, cx: &mut App) {
+    let config_dir = config_dir_path();
+    let settings_path = notes_settings_path();
+    let keymap_path = notes_keymap_path();
+    cx.spawn(async move |cx| {
+        let (mut events, _watcher) = fs.watch(&config_dir, Duration::from_millis(100)).await;
+        while let Some(events) = events.next().await {
+            let mut settings_changed = false;
+            let mut keymap_changed = false;
+            for event in events {
+                let config_rescanned =
+                    event.kind == Some(PathEventKind::Rescan) && event.path == config_dir;
+                settings_changed |= event.path == settings_path || config_rescanned;
+                keymap_changed |= event.path == keymap_path || config_rescanned;
+            }
+
+            if settings_changed {
+                let settings = match fs.load(&settings_path).await {
+                    Ok(content) => parse_notes_settings(&content).unwrap_or_else(|error| {
+                        log::error!(
+                            "failed to load {}: {error:#}; using defaults",
+                            settings_path.display()
+                        );
+                        NotesSettings::default()
+                    }),
+                    Err(error) => {
+                        if fs.is_file(&settings_path).await {
+                            log::error!(
+                                "failed to read {}: {error:#}; using defaults",
+                                settings_path.display()
+                            );
+                        }
+                        NotesSettings::default()
+                    }
+                };
+                cx.update(|cx| apply_notes_settings(settings, cx));
+            }
+
+            if keymap_changed {
+                let content = match fs.load(&keymap_path).await {
+                    Ok(content) => content,
+                    Err(error) => {
+                        if fs.is_file(&keymap_path).await {
+                            log::error!(
+                                "failed to read {}: {error:#}; using default keymap",
+                                keymap_path.display()
+                            );
+                        }
+                        "[]".to_owned()
+                    }
+                };
+                cx.update(|cx| {
+                    reload_editor_keymap_content(&content, cx).log_err();
+                });
+            }
+        }
+    })
+    .detach();
+}
+
 /// Initializes the local-only services needed by the file-backed editor.
 pub fn init(session: Session, cx: &mut App) -> Result<Arc<AppState>> {
     release_channel::init(Version::new(0, 1, 0), cx);
     gpui_tokio::init(cx);
     settings::init(cx);
     theme_settings::init(LoadThemes::All(Box::new(Assets)), cx);
-    let explorer_settings = load_explorer_settings()?;
-    let preview_settings = load_preview_settings()?;
-    let autosave_settings = load_autosave_settings()?;
-    apply_explorer_settings(&explorer_settings, cx);
-    apply_preview_settings(&preview_settings, cx);
-    apply_autosave_settings(autosave_settings, cx);
+    let notes_settings = load_notes_settings();
+    apply_notes_settings(notes_settings.clone(), cx);
+
+    if let Err(error) = std::fs::create_dir_all(config_dir_path()) {
+        log::error!("failed to create zednotes config directory: {error}");
+    }
 
     let fs: Arc<dyn Fs> = Arc::new(RealFs::new(None, cx.background_executor().clone()));
     <dyn Fs>::set_global(fs.clone(), cx);
@@ -989,35 +1339,40 @@ pub fn init(session: Session, cx: &mut App) -> Result<Arc<AppState>> {
         node_runtime: NodeRuntime::unavailable(),
         session,
     });
+    cx.observe_global::<GlobalTheme>({
+        let languages = app_state.languages.clone();
+        move |cx| languages.set_theme(cx.theme().clone())
+    })
+    .detach();
 
     AppState::set_global(app_state.clone(), cx);
     zed_workspace::init(app_state.clone(), cx);
-    init_editor_subsystems(autosave_settings, cx)?;
-    init_workspace_composition(app_state.clone(), explorer_settings, autosave_settings, cx);
+    init_editor_subsystems(cx)?;
+    init_workspace_composition(app_state.clone(), notes_settings.explorer, cx);
+    watch_configuration_files(app_state.fs.clone(), cx);
     Ok(app_state)
 }
 
 fn configure_workspace(
     workspace: &mut Workspace,
-    autosave_settings: AutosaveSettings,
     window: &mut Window,
     cx: &mut gpui::Context<Workspace>,
 ) {
     let active_pane = workspace.active_pane().clone();
-    configure_pane(workspace, &active_pane, autosave_settings, window, cx);
+    configure_pane(workspace, &active_pane, window, cx);
     let workspace_entity = cx.entity();
     cx.subscribe_in(
         &workspace_entity,
         window,
         move |workspace, _, event, window, cx| {
             if let WorkspaceEvent::PaneAdded(pane) = event {
-                configure_pane(workspace, pane, autosave_settings, window, cx);
+                configure_pane(workspace, pane, window, cx);
             }
         },
     )
     .detach();
     cx.observe_window_activation(window, move |workspace, window, cx| {
-        if autosave_settings.enabled && !window.is_window_active() {
+        if autosave_enabled(cx) && !window.is_window_active() {
             autosave_workspace(workspace, window, cx);
         }
     })
@@ -1063,7 +1418,6 @@ fn autosave_tasks(
 fn configure_pane(
     workspace: &Workspace,
     pane: &gpui::Entity<Pane>,
-    autosave_settings: AutosaveSettings,
     window: &mut Window,
     cx: &mut gpui::Context<Workspace>,
 ) {
@@ -1076,14 +1430,12 @@ fn configure_pane(
             toolbar.add_item(project_search_bar, window, cx);
         });
     });
-    if autosave_settings.enabled {
-        cx.subscribe_in(pane, window, |workspace, _, event, window, cx| {
-            if matches!(event, PaneEvent::ActivateItem { .. }) {
-                autosave_workspace(workspace, window, cx);
-            }
-        })
-        .detach();
-    }
+    cx.subscribe_in(pane, window, |workspace, _, event, window, cx| {
+        if autosave_enabled(cx) && matches!(event, PaneEvent::ActivateItem { .. }) {
+            autosave_workspace(workspace, window, cx);
+        }
+    })
+    .detach();
 }
 
 fn notes_window_options(_display: Option<uuid::Uuid>, cx: &mut App) -> WindowOptions {
@@ -1195,12 +1547,14 @@ mod tests {
             let app_state = AppState::test(cx);
             AppState::set_global(app_state.clone(), cx);
             zed_workspace::init(app_state.clone(), cx);
-            apply_explorer_settings(&explorer_settings, cx);
-            apply_preview_settings(&PreviewSettings::default(), cx);
-            apply_autosave_settings(autosave_settings, cx);
-            init_editor_subsystems(autosave_settings, cx)
-                .expect("failed to initialize editor test subsystems");
-            init_workspace_composition(app_state.clone(), explorer_settings, autosave_settings, cx);
+            let notes_settings = NotesSettings {
+                explorer: explorer_settings.clone(),
+                autosave: autosave_settings,
+                ..NotesSettings::default()
+            };
+            apply_notes_settings(notes_settings, cx);
+            init_editor_subsystems(cx).expect("failed to initialize editor test subsystems");
+            init_workspace_composition(app_state.clone(), explorer_settings, cx);
             app_state
         });
 
@@ -1444,14 +1798,16 @@ mod tests {
     #[test]
     fn test_parses_autosave_settings_from_jsonc() {
         assert_eq!(
-            parse_autosave_settings("{}").expect("default settings should parse"),
+            parse_notes_settings("{}")
+                .expect("default settings should parse")
+                .autosave,
             AutosaveSettings {
                 enabled: true,
                 delay_ms: 750,
             }
         );
 
-        let settings = parse_autosave_settings(
+        let settings = parse_notes_settings(
             r#"
             {
                 "autosave": {
@@ -1461,7 +1817,8 @@ mod tests {
             }
             "#,
         )
-        .expect("settings should parse");
+        .expect("settings should parse")
+        .autosave;
 
         assert_eq!(
             settings,
@@ -1469,6 +1826,216 @@ mod tests {
                 enabled: false,
                 delay_ms: 1250,
             }
+        );
+    }
+
+    #[test]
+    fn test_parses_editor_theme_vim_and_explorer_width_settings() {
+        let settings = parse_notes_settings(
+            r#"
+            {
+                "theme": "dark",
+                "vim_mode": false,
+                "editor": {
+                    "font_family": "Test Mono",
+                    "font_size": 18.5,
+                    "line_height": 1.4,
+                    "line_numbers": true,
+                    "soft_wrap": false,
+                },
+                "explorer": {
+                    "width": 320,
+                },
+            }
+            "#,
+        )
+        .expect("settings should parse");
+
+        assert_eq!(settings.theme, NotesTheme::Dark);
+        assert!(!settings.vim_mode);
+        assert_eq!(settings.editor.font_family, "Test Mono");
+        assert_eq!(settings.editor.font_size, 18.5);
+        assert_eq!(settings.editor.line_height, 1.4);
+        assert!(settings.editor.line_numbers);
+        assert!(!settings.editor.soft_wrap);
+        assert_eq!(settings.explorer.width, 320);
+        assert_eq!(settings.autosave, AutosaveSettings::default());
+        assert_eq!(settings.preview, PreviewSettings::default());
+    }
+
+    #[test]
+    fn test_invalid_settings_are_rejected_for_the_loader_to_fall_back() {
+        assert!(parse_notes_settings("{ invalid").is_err());
+        assert!(parse_notes_settings(r#"{ "editor": { "line_height": 0.5 } }"#).is_err());
+    }
+
+    #[gpui::test]
+    async fn test_applying_settings_updates_editor_theme_vim_and_explorer(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+        let settings = NotesSettings {
+            theme: NotesTheme::Dark,
+            vim_mode: false,
+            editor: NotesEditorSettings {
+                font_family: "Test Mono".to_owned(),
+                font_size: 18.0,
+                line_height: 1.4,
+                line_numbers: true,
+                soft_wrap: false,
+            },
+            explorer: ExplorerSettings {
+                width: 320,
+                ..ExplorerSettings::default()
+            },
+            ..NotesSettings::default()
+        };
+
+        cx.update(|cx| apply_notes_settings(settings, cx));
+        test.cx.run_until_parked();
+
+        let (
+            font_family,
+            font_size,
+            line_height,
+            theme_mode,
+            line_numbers,
+            soft_wrap,
+            explorer_width,
+        ) = cx.update(|cx| {
+            let theme = theme_settings::ThemeSettings::get_global(cx);
+            (
+                theme.buffer_font.family.to_string(),
+                theme.buffer_font_size(cx),
+                theme.buffer_line_height.value(),
+                theme.theme.mode(),
+                editor::EditorSettings::get_global(cx).gutter.line_numbers,
+                language::language_settings::AllLanguageSettings::get_global(cx)
+                    .defaults
+                    .soft_wrap,
+                ProjectPanelSettings::get_global(cx).default_width,
+            )
+        });
+        assert_eq!(font_family, "Test Mono");
+        assert_eq!(font_size, px(18.0));
+        assert_eq!(line_height, 1.4);
+        assert_eq!(theme_mode, Some(ThemeAppearanceMode::Dark));
+        assert!(line_numbers);
+        assert_eq!(soft_wrap, SoftWrap::None);
+        assert_eq!(explorer_width, px(320.0));
+
+        test.cx.simulate_keystrokes("x");
+        assert_eq!(
+            test.editor.read_with(cx, |editor, cx| editor.text(cx)),
+            format!("x{TEST_NOTE}"),
+            "disabling Vim should make normal text input insert immediately"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_user_keymap_rebinds_in_workspace_context(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+        cx.update(|cx| {
+            reload_editor_keymap_content(
+                r#"
+                [
+                    {
+                        "context": "Workspace",
+                        "bindings": {
+                            "cmd-b": "note::TogglePreview",
+                        },
+                    },
+                ]
+                "#,
+                cx,
+            )
+            .expect("user keymap should load");
+        });
+        let workspace = workspace(&test, cx);
+        assert!(workspace.read_with(cx, |workspace, cx| workspace.left_dock().read(cx).is_open()));
+
+        test.cx.simulate_keystrokes("cmd-b");
+        test.cx.run_until_parked();
+
+        assert!(
+            workspace.read_with(cx, |workspace, cx| workspace.left_dock().read(cx).is_open()),
+            "the default Cmd+B action must not fire after it is rebound"
+        );
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.panes().len()),
+            2,
+            "the rebound preview action should fire"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_settings_and_keymap_edits_reload_without_restart(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+        let config_dir = config_dir_path();
+        test.fs
+            .insert_tree(
+                &config_dir,
+                json!({
+                    "settings.json": "{}",
+                    "keymap.json": "[]",
+                }),
+            )
+            .await;
+        cx.update(|cx| watch_configuration_files(test.fs.clone(), cx));
+        test.cx.run_until_parked();
+
+        test.fs
+            .save(
+                &notes_settings_path(),
+                &r#"{ "editor": { "line_numbers": true } }"#.into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        test.cx.run_until_parked();
+        assert!(cx.update(|cx| editor::EditorSettings::get_global(cx).gutter.line_numbers));
+
+        test.fs
+            .save(
+                &notes_keymap_path(),
+                &r#"
+                [
+                    {
+                        "context": "Workspace",
+                        "bindings": {
+                            "cmd-b": "note::TogglePreview",
+                        },
+                    },
+                ]
+                "#
+                .into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        test.cx.run_until_parked();
+
+        let workspace = workspace(&test, cx);
+        test.cx.simulate_keystrokes("cmd-b");
+        test.cx.run_until_parked();
+        assert!(workspace.read_with(cx, |workspace, cx| workspace.left_dock().read(cx).is_open()));
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.panes().len()),
+            2
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cmd_comma_creates_and_opens_settings_as_an_editor(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+        let settings_path = notes_settings_path();
+        assert!(!test.fs.is_file(&settings_path).await);
+
+        test.cx.simulate_keystrokes("cmd-,");
+        test.cx.run_until_parked();
+
+        assert_eq!(active_editor_path(&test, cx), settings_path);
+        assert_eq!(
+            test.fs.load(&notes_settings_path()).await.unwrap(),
+            INITIAL_SETTINGS_CONTENT
         );
     }
 
@@ -2009,7 +2576,7 @@ mod tests {
 
     #[test]
     fn test_parses_explorer_settings_from_jsonc() {
-        let settings = parse_explorer_settings(
+        let settings = parse_notes_settings(
             r#"
             {
                 // Non-Markdown files are useful in mixed vaults.
@@ -2023,11 +2590,13 @@ mod tests {
             }
             "#,
         )
-        .expect("settings should parse");
+        .expect("settings should parse")
+        .explorer;
 
         assert_eq!(
             settings,
             ExplorerSettings {
+                width: DEFAULT_EXPLORER_WIDTH,
                 markdown_only: false,
                 show_hidden: true,
                 excluded_paths: vec!["drafts".to_owned(), "**/*.tmp".to_owned()],
@@ -2037,7 +2606,7 @@ mod tests {
 
     #[test]
     fn test_parses_preview_settings_from_jsonc() {
-        let settings = parse_preview_settings(
+        let settings = parse_notes_settings(
             r#"
             {
                 "preview": {
@@ -2048,7 +2617,8 @@ mod tests {
             }
             "#,
         )
-        .expect("settings should parse");
+        .expect("settings should parse")
+        .preview;
 
         assert_eq!(
             settings,

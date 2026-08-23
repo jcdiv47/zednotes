@@ -33,6 +33,7 @@ use http_client::BlockedHttpClient;
 use language::{Buffer, BufferEvent, Capability, DiskState, Language, LanguageRegistry};
 use markdown_preview::markdown_preview_view::MarkdownPreviewView;
 use node_runtime::NodeRuntime;
+use percent_encoding::percent_decode_str;
 use picker::{Picker, PickerDelegate};
 use project::Project;
 use project_panel::{
@@ -157,6 +158,8 @@ actions!(
         TogglePreview,
         /// Opens the active note as a preview-only tab.
         OpenPreview,
+        /// Opens the relative Markdown link under the cursor.
+        FollowLink,
     ]
 );
 
@@ -758,6 +761,166 @@ fn markdown_note_filename(filename: &str) -> String {
     }
 }
 
+fn markdown_link_target_at(text: &str, cursor_offset: usize) -> Option<String> {
+    const SCAN_LIMIT: usize = 4096;
+
+    if cursor_offset > text.len() || !text.is_char_boundary(cursor_offset) {
+        return None;
+    }
+    let mut scan_start = cursor_offset.saturating_sub(SCAN_LIMIT);
+    while !text.is_char_boundary(scan_start) {
+        scan_start += 1;
+    }
+    let mut scan_end = cursor_offset.saturating_add(SCAN_LIMIT).min(text.len());
+    while !text.is_char_boundary(scan_end) {
+        scan_end -= 1;
+    }
+    let text = &text[scan_start..scan_end];
+    let cursor_offset = cursor_offset - scan_start;
+    let bytes = text.as_bytes();
+    let mut link_start = 0;
+
+    while link_start < bytes.len() {
+        if bytes[link_start] != b'['
+            || is_escaped(bytes, link_start)
+            || (link_start > 0 && bytes[link_start - 1] == b'!')
+        {
+            link_start += 1;
+            continue;
+        }
+
+        let Some(link_text_end) = find_balanced_delimiter(bytes, link_start, b'[', b']') else {
+            link_start += 1;
+            continue;
+        };
+        let destination_start = link_text_end + 1;
+        if bytes.get(destination_start) != Some(&b'(') {
+            link_start += 1;
+            continue;
+        }
+        let Some(link_end) = find_balanced_delimiter(bytes, destination_start, b'(', b')') else {
+            link_start += 1;
+            continue;
+        };
+
+        if (link_start..=link_end).contains(&cursor_offset) {
+            return parse_markdown_link_destination(&text[destination_start + 1..link_end]);
+        }
+        link_start = link_end + 1;
+    }
+
+    None
+}
+
+fn find_balanced_delimiter(bytes: &[u8], start: usize, opening: u8, closing: u8) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, byte) in bytes.iter().copied().enumerate().skip(start) {
+        if is_escaped(bytes, index) {
+            continue;
+        }
+        if byte == opening {
+            depth = depth.saturating_add(1);
+        } else if byte == closing {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn parse_markdown_link_destination(contents: &str) -> Option<String> {
+    let contents = contents.trim_start();
+    if let Some(contents) = contents.strip_prefix('<') {
+        let end = contents
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .find_map(|(index, byte)| {
+                (*byte == b'>' && !is_escaped(contents.as_bytes(), index)).then_some(index)
+            })?;
+        return unescape_markdown_destination(&contents[..end]);
+    }
+
+    let bytes = contents.as_bytes();
+    let mut nested_parentheses = 0usize;
+    let mut end = bytes.len();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index = index.saturating_add(2);
+            continue;
+        }
+        match bytes[index] {
+            b'(' => nested_parentheses = nested_parentheses.saturating_add(1),
+            b')' if nested_parentheses > 0 => nested_parentheses -= 1,
+            byte if byte.is_ascii_whitespace() && nested_parentheses == 0 => {
+                end = index;
+                break;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+
+    unescape_markdown_destination(contents[..end].trim_end())
+}
+
+fn unescape_markdown_destination(destination: &str) -> Option<String> {
+    if destination.is_empty() {
+        return None;
+    }
+
+    let mut result = String::with_capacity(destination.len());
+    let mut characters = destination.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            result.push(characters.next()?);
+        } else {
+            result.push(character);
+        }
+    }
+    Some(result)
+}
+
+fn is_escaped(bytes: &[u8], index: usize) -> bool {
+    let preceding_backslashes = bytes[..index]
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count();
+    preceding_backslashes % 2 == 1
+}
+
+fn resolve_relative_markdown_link(current_file: &Path, target: &str) -> Option<PathBuf> {
+    let path_end = target.find(['#', '?']).unwrap_or(target.len());
+    let target = &target[..path_end];
+    if target.is_empty() || target.starts_with("//") || has_uri_scheme(target) {
+        return None;
+    }
+
+    let target = percent_decode_str(target).decode_utf8().ok()?;
+    let target = Path::new(target.as_ref());
+    if target.is_absolute() {
+        return None;
+    }
+
+    let parent = current_file.parent()?;
+    util::paths::normalize_lexically(&parent.join(target)).ok()
+}
+
+fn has_uri_scheme(target: &str) -> bool {
+    let Some(colon_index) = target.find(':') else {
+        return false;
+    };
+    let scheme = &target[..colon_index];
+    !scheme.is_empty()
+        && scheme.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphabetic() || (index > 0 && b"+-.".contains(&byte))
+        })
+}
+
 fn markdown_entry_filter(markdown_only: bool) -> EntryFilter {
     Arc::new(move |path: &Path, is_directory| {
         is_directory || !markdown_only || is_markdown_path(path)
@@ -813,6 +976,18 @@ fn bind_default_editor_keymaps(cx: &mut App) -> Result<()> {
             Some("Editor && extension == md"),
         ),
         KeyBinding::new("cmd-shift-v", TogglePreview, Some("MarkdownPreview")),
+        KeyBinding::new(
+            "enter",
+            FollowLink,
+            Some("Editor && extension == md && VimControl && vim_mode == normal"),
+        ),
+        KeyBinding::new(
+            "enter",
+            FollowLink,
+            Some("Editor && extension == markdown && VimControl && vim_mode == normal"),
+        ),
+        KeyBinding::new("ctrl--", zed_workspace::GoBack, Some("Pane")),
+        KeyBinding::new("ctrl-_", zed_workspace::GoForward, Some("Pane")),
         KeyBinding::new(
             "cmd-s",
             zed_workspace::Save { save_intent: None },
@@ -1404,6 +1579,62 @@ fn open_preview(workspace: &mut Workspace, window: &mut Window, cx: &mut gpui::C
     MarkdownPreviewView::open_preview_in_pane(workspace, editor, pane, window, cx);
 }
 
+fn follow_link(workspace: &mut Workspace, window: &mut Window, cx: &mut gpui::Context<Workspace>) {
+    let Some(editor) = workspace.active_item_as::<Editor>(cx) else {
+        return;
+    };
+    let target_path = editor.update(cx, |editor, cx| {
+        let cursor = editor.newest_selection(cx).head();
+        let buffer = editor.buffer().read(cx).as_singleton()?;
+        let buffer = buffer.read(cx);
+        let source_path = buffer.file()?.as_local()?.abs_path(cx);
+        let cursor_offset = buffer.snapshot().point_to_offset(cursor);
+        let target = markdown_link_target_at(&editor.text(cx), cursor_offset)?;
+        resolve_relative_markdown_link(&source_path, &target)
+    });
+
+    let Some(target_path) = target_path else {
+        match cx.build_action("vim::NextLineStart", None) {
+            Ok(action) => window.dispatch_action(action, cx),
+            Err(error) => log::error!("failed to build vim::NextLineStart: {error:#}"),
+        }
+        return;
+    };
+
+    let fs = workspace.app_state().fs.clone();
+    cx.spawn_in(window, async move |workspace, cx| {
+        if !fs.is_file(&target_path).await {
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    Toast::new(
+                        NotificationId::Named("notes-missing-link".into()),
+                        format!("Linked note not found: {}", target_path.display()),
+                    )
+                    .autohide(),
+                    cx,
+                );
+            })?;
+            return anyhow::Ok(());
+        }
+
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    target_path,
+                    OpenOptions {
+                        visible: Some(OpenVisible::None),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })?
+            .await?;
+        anyhow::Ok(())
+    })
+    .detach_and_prompt_err("Failed to open linked note", window, cx, |_, _, _| None);
+}
+
 fn dispatch_project_panel_action(
     workspace: &mut Workspace,
     action_name: &str,
@@ -1566,6 +1797,9 @@ fn init_workspace_composition(
         });
         workspace.register_action(|workspace, _: &OpenPreview, window, cx| {
             open_preview(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &FollowLink, window, cx| {
+            follow_link(workspace, window, cx);
         });
         workspace.register_action(|workspace, _: &New, window, cx| {
             dispatch_project_panel_action(workspace, "project_panel::NewFile", window, cx);
@@ -2066,7 +2300,7 @@ mod tests {
     use command_palette_hooks::GlobalCommandPaletteInterceptor;
     use editor::{DisplayPoint, SelectionEffects, display_map::DisplayRow};
     use fs::FakeFs;
-    use gpui::{TestAppContext, VisualTestContext, point};
+    use gpui::{Modifiers, TestAppContext, VisualTestContext, point};
     use project::ProjectPath;
     use serde_json::{Value, json};
     use settings::SettingsStore;
@@ -2314,6 +2548,74 @@ mod tests {
                 .join("zednotes")
         );
         assert!(!application_support_dir().starts_with(env!("CARGO_MANIFEST_DIR")));
+    }
+
+    #[test]
+    fn test_relative_markdown_link_resolution() {
+        for (current_file, target, expected) in [
+            ("/vault/current.md", "target.md", "/vault/target.md"),
+            (
+                "/vault/projects/current.md",
+                "nested/target.md",
+                "/vault/projects/nested/target.md",
+            ),
+            (
+                "/vault/projects/current.md",
+                "../target.md",
+                "/vault/target.md",
+            ),
+        ] {
+            assert_eq!(
+                resolve_relative_markdown_link(Path::new(current_file), target),
+                Some(PathBuf::from(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn test_relative_markdown_link_resolution_decodes_paths_and_strips_fragments() {
+        assert_eq!(
+            resolve_relative_markdown_link(
+                Path::new("/vault/current.md"),
+                "project%20notes.md#details"
+            ),
+            Some(PathBuf::from("/vault/project notes.md"))
+        );
+        assert_eq!(
+            resolve_relative_markdown_link(Path::new("/vault/current.md"), "https://example.com"),
+            None
+        );
+        assert_eq!(
+            resolve_relative_markdown_link(Path::new("/vault/current.md"), "/absolute.md"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_markdown_link_target_at_accepts_link_text_destination_and_title() {
+        let text = r#"See [Project notes](projects/notes\ \(draft\).md "Draft") today"#;
+        assert_eq!(
+            markdown_link_target_at(
+                text,
+                text.find("Project").expect("link text should be present")
+            ),
+            Some("projects/notes (draft).md".to_owned())
+        );
+        assert_eq!(
+            markdown_link_target_at(
+                text,
+                text.find("notes\\")
+                    .expect("link destination should be present")
+            ),
+            Some("projects/notes (draft).md".to_owned())
+        );
+        assert_eq!(
+            markdown_link_target_at(
+                text,
+                text.find("today").expect("plain text should be present")
+            ),
+            None
+        );
     }
 
     #[test]
@@ -3961,6 +4263,275 @@ mod tests {
                 .expect("the opened note should be active");
             assert!(editor.read(cx).focus_handle(cx).is_focused(window));
         });
+    }
+
+    #[gpui::test]
+    async fn test_cmd_click_opens_relative_markdown_link(cx: &mut TestAppContext) {
+        let mut test = test_window_with(
+            cx,
+            ExplorerSettings::default(),
+            json!({
+                "target.md": "# Target\n",
+                "nested": {
+                    "source.md": "[Target](../target.md)\n",
+                },
+            }),
+            "/notes/nested/source.md",
+        )
+        .await;
+        let editor = active_editor(&test, cx);
+        test.cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections
+                        .select_display_ranges([DisplayPoint::new(DisplayRow(0), 3)
+                            ..DisplayPoint::new(DisplayRow(0), 3)]);
+                });
+            });
+        });
+        test.cx.run_until_parked();
+
+        let click_position = workspace(&test, cx)
+            .read_with(cx, |workspace, cx| {
+                workspace
+                    .active_pane()
+                    .read(cx)
+                    .pixel_position_of_cursor(cx)
+            })
+            .expect("the link cursor should have a screen position");
+        test.cx
+            .simulate_mouse_move(click_position, None, Modifiers::secondary_key());
+        test.cx
+            .simulate_click(click_position, Modifiers::secondary_key());
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/target.md")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_enter_opens_relative_markdown_link_in_vim_normal_mode(cx: &mut TestAppContext) {
+        let mut test = test_window_with(
+            cx,
+            ExplorerSettings::default(),
+            json!({
+                "source.md": "Read [Target](nested/target.md)\n",
+                "nested": {
+                    "target.md": "# Target\n",
+                },
+            }),
+            "/notes/source.md",
+        )
+        .await;
+        let editor = active_editor(&test, cx);
+        test.cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections
+                        .select_display_ranges([DisplayPoint::new(DisplayRow(0), 8)
+                            ..DisplayPoint::new(DisplayRow(0), 8)]);
+                });
+            });
+        });
+
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/nested/target.md")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_enter_keeps_normal_vim_motion_when_cursor_is_not_on_link(
+        cx: &mut TestAppContext,
+    ) {
+        let mut test = test_window_with(
+            cx,
+            ExplorerSettings::default(),
+            json!({ "source.md": "first\n  second\n" }),
+            "/notes/source.md",
+        )
+        .await;
+
+        test.cx.simulate_keystrokes("enter");
+
+        let editor = active_editor(&test, cx);
+        let selections = test.cx.update(|_, cx| {
+            editor.update(cx, |editor, cx| {
+                editor
+                    .selections
+                    .display_ranges(&editor.display_snapshot(cx))
+            })
+        });
+        assert_eq!(
+            selections,
+            vec![DisplayPoint::new(DisplayRow(1), 2)..DisplayPoint::new(DisplayRow(1), 2)]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_missing_markdown_link_shows_notification_without_navigating(
+        cx: &mut TestAppContext,
+    ) {
+        let mut test = test_window_with(
+            cx,
+            ExplorerSettings::default(),
+            json!({ "source.md": "[Missing](missing.md)\n" }),
+            "/notes/source.md",
+        )
+        .await;
+        let editor = active_editor(&test, cx);
+        test.cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections
+                        .select_display_ranges([DisplayPoint::new(DisplayRow(0), 3)
+                            ..DisplayPoint::new(DisplayRow(0), 3)]);
+                });
+            });
+        });
+
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/source.md")
+        );
+        assert!(workspace(&test, cx).read_with(cx, |workspace, _| {
+            workspace
+                .notification_ids()
+                .contains(&NotificationId::Named("notes-missing-link".into()))
+        }));
+    }
+
+    #[gpui::test]
+    async fn test_cmd_click_missing_markdown_link_shows_notification(cx: &mut TestAppContext) {
+        let mut test = test_window_with(
+            cx,
+            ExplorerSettings::default(),
+            json!({ "source.md": "[Missing](missing.md)\n" }),
+            "/notes/source.md",
+        )
+        .await;
+        let editor = active_editor(&test, cx);
+        test.cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections
+                        .select_display_ranges([DisplayPoint::new(DisplayRow(0), 3)
+                            ..DisplayPoint::new(DisplayRow(0), 3)]);
+                });
+            });
+        });
+        test.cx.run_until_parked();
+
+        let click_position = workspace(&test, cx)
+            .read_with(cx, |workspace, cx| {
+                workspace
+                    .active_pane()
+                    .read(cx)
+                    .pixel_position_of_cursor(cx)
+            })
+            .expect("the missing link cursor should have a screen position");
+        test.cx
+            .simulate_mouse_move(click_position, None, Modifiers::secondary_key());
+        test.cx
+            .simulate_click(click_position, Modifiers::secondary_key());
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/source.md")
+        );
+        assert!(workspace(&test, cx).read_with(cx, |workspace, _| {
+            workspace
+                .notification_ids()
+                .contains(&NotificationId::Named("missing-file-link".into()))
+        }));
+    }
+
+    #[gpui::test]
+    async fn test_link_history_restores_selection_and_scroll_across_files(cx: &mut TestAppContext) {
+        let mut source = (0..50)
+            .map(|line| format!("source line {line}\n"))
+            .collect::<String>();
+        source.push_str("[Target](target.md)\n");
+        source.extend((51..90).map(|line| format!("source line {line}\n")));
+        let mut test = test_window_with(
+            cx,
+            ExplorerSettings::default(),
+            json!({
+                "source.md": source,
+                "target.md": "# Target\n",
+            }),
+            "/notes/source.md",
+        )
+        .await;
+        let source_editor = active_editor(&test, cx);
+        let expected_scroll = test.cx.update(|window, cx| {
+            source_editor.update(cx, |editor, cx| {
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections.select_display_ranges([DisplayPoint::new(DisplayRow(50), 10)
+                        ..DisplayPoint::new(DisplayRow(50), 15)]);
+                });
+                editor.set_scroll_position(point(0., 25.5), window, cx);
+                editor.scroll_position(cx)
+            })
+        });
+
+        test.cx.run_until_parked();
+        let click_position = workspace(&test, cx)
+            .read_with(cx, |workspace, cx| {
+                workspace
+                    .active_pane()
+                    .read(cx)
+                    .pixel_position_of_cursor(cx)
+            })
+            .expect("the link cursor should have a screen position");
+        test.cx
+            .simulate_mouse_move(click_position, None, Modifiers::secondary_key());
+        test.cx
+            .simulate_click(click_position, Modifiers::secondary_key());
+        test.cx.run_until_parked();
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/target.md")
+        );
+
+        test.cx.simulate_keystrokes("ctrl--");
+        test.cx.run_until_parked();
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/source.md")
+        );
+        let restored_editor = active_editor(&test, cx);
+        let (restored_selections, restored_scroll) = test.cx.update(|_, cx| {
+            restored_editor.update(cx, |editor, cx| {
+                (
+                    editor
+                        .selections
+                        .display_ranges(&editor.display_snapshot(cx)),
+                    editor.scroll_position(cx),
+                )
+            })
+        });
+        assert_eq!(
+            restored_selections,
+            vec![DisplayPoint::new(DisplayRow(50), 10)..DisplayPoint::new(DisplayRow(50), 15)]
+        );
+        assert_eq!(restored_scroll, expected_scroll);
+
+        test.cx.simulate_keystrokes("ctrl-_");
+        test.cx.run_until_parked();
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/target.md")
+        );
     }
 
     #[gpui::test]

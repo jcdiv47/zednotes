@@ -11293,6 +11293,7 @@ dependencies = [
  "markdown_preview",
  "node_runtime",
  "paths",
+ "percent-encoding",
  "picker",
  "project",
  "project_panel",

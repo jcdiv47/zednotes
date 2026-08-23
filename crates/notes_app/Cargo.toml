@@ -39,6 +39,7 @@ paths.workspace = true
 project.workspace = true
 project_panel.workspace = true
 picker.workspace = true
+percent-encoding.workspace = true
 release_channel.workspace = true
 search.workspace = true
 semver.workspace = true

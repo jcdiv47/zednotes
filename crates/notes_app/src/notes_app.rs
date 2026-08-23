@@ -24,7 +24,7 @@ use project_panel::{
     EntryFilter, Event as ProjectPanelEvent, ProjectPanel, ProjectPanelOptions,
     project_panel_settings::ProjectPanelSettings,
 };
-use search::BufferSearchBar;
+use search::{BufferSearchBar, ProjectSearchView, project_search::ProjectSearchBar};
 use semver::Version;
 use serde::Deserialize;
 use session::{AppSession, Session};
@@ -33,12 +33,13 @@ use theme::{ActiveTheme as _, LoadThemes};
 use vim::ModeIndicator;
 use workspace as zed_workspace;
 use zed_workspace::{
-    AppState, MultiWorkspace, SaveIntent, Toast, Workspace, WorkspaceStore, dock::DockPosition,
-    notifications::NotificationId,
+    AppState, Event as WorkspaceEvent, MultiWorkspace, Pane, SaveIntent, Toast, Workspace,
+    WorkspaceStore, dock::DockPosition, notifications::NotificationId,
 };
 
 const APP_NAME: &str = "zednotes";
 const NOTE_FILE_NAME: &str = "spike.md";
+const DEFAULT_MARKDOWN_SEARCH_FILTER: &str = "**/*.md, **/*.markdown";
 const DEFAULT_EXCLUDED_PATHS: &[&str] = &[".git", ".DS_Store", "node_modules", "target"];
 const DEFAULT_PREVIEW_MAX_WIDTH: u32 = 760;
 const DEFAULT_PREVIEW_MAX_FILE_SIZE_BYTES: u64 = 5 * 1024 * 1024;
@@ -56,6 +57,8 @@ actions!(
     [
         /// Opens a directory as the notes workspace.
         OpenFolder,
+        /// Searches Markdown notes in the workspace.
+        Search,
     ]
 );
 
@@ -280,6 +283,12 @@ fn load_editor_keymaps(cx: &mut App) -> Result<()> {
         KeyBinding::new("cmd-o", OpenFolder, None),
         KeyBinding::new("cmd-n", New, None),
         KeyBinding::new("cmd-b", ToggleExplorer, None),
+        KeyBinding::new("cmd-shift-f", Search, None),
+        KeyBinding::new(
+            "enter",
+            editor::actions::OpenExcerpts,
+            Some("ProjectSearchView > Editor"),
+        ),
         KeyBinding::new("a", New, Some("ProjectPanel && not_editing")),
         KeyBinding::new("shift-a", NewDirectory, Some("ProjectPanel && not_editing")),
         KeyBinding::new("r", Rename, Some("ProjectPanel && not_editing")),
@@ -337,7 +346,10 @@ fn init_editor_subsystems(cx: &mut App) -> Result<()> {
     ]);
     cx.set_menus([
         Menu::new(APP_NAME).items([MenuItem::action("Quit", Quit)]),
-        Menu::new("File").items([MenuItem::action("Open Folder…", OpenFolder)]),
+        Menu::new("File").items([
+            MenuItem::action("Open Folder…", OpenFolder),
+            MenuItem::action("Search Workspace", Search),
+        ]),
         Menu::new("Note").items([
             MenuItem::action("New Note…", New),
             MenuItem::action("New Directory…", NewDirectory),
@@ -519,6 +531,17 @@ fn init_workspace_composition(
         workspace.register_action(|workspace, _: &ToggleExplorer, window, cx| {
             workspace.toggle_dock(DockPosition::Left, window, cx);
         });
+        workspace.register_action(|workspace, _: &Search, window, cx| {
+            ProjectSearchView::deploy_search(
+                workspace,
+                &zed_workspace::DeploySearch {
+                    included_files: Some(DEFAULT_MARKDOWN_SEARCH_FILTER.to_owned()),
+                    ..Default::default()
+                },
+                window,
+                cx,
+            );
+        });
         workspace.register_action(|workspace, _: &TogglePreview, window, cx| {
             toggle_preview(workspace, window, cx);
         });
@@ -647,15 +670,39 @@ fn configure_workspace(
     window: &mut Window,
     cx: &mut gpui::Context<Workspace>,
 ) {
-    workspace.active_pane().update(cx, |pane, cx| {
-        pane.toolbar().update(cx, |toolbar, cx| {
-            let search_bar = cx.new(|cx| BufferSearchBar::new(None, window, cx));
-            toolbar.add_item(search_bar, window, cx);
-        });
-    });
+    let active_pane = workspace.active_pane().clone();
+    configure_pane(workspace, &active_pane, window, cx);
+    let workspace_entity = cx.entity();
+    cx.subscribe_in(
+        &workspace_entity,
+        window,
+        |workspace, _, event, window, cx| {
+            if let WorkspaceEvent::PaneAdded(pane) = event {
+                configure_pane(workspace, pane, window, cx);
+            }
+        },
+    )
+    .detach();
     workspace.status_bar().update(cx, |status_bar, cx| {
         let mode_indicator = cx.new(|cx| ModeIndicator::new(window, cx));
         status_bar.add_right_item(mode_indicator, window, cx);
+    });
+}
+
+fn configure_pane(
+    workspace: &Workspace,
+    pane: &gpui::Entity<Pane>,
+    window: &mut Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    let languages = workspace.project().read(cx).languages().clone();
+    pane.update(cx, |pane, cx| {
+        pane.toolbar().update(cx, |toolbar, cx| {
+            let buffer_search_bar = cx.new(|cx| BufferSearchBar::new(Some(languages), window, cx));
+            toolbar.add_item(buffer_search_bar, window, cx);
+            let project_search_bar = cx.new(|_| ProjectSearchBar::new());
+            toolbar.add_item(project_search_bar, window, cx);
+        });
     });
 }
 
@@ -897,6 +944,29 @@ mod tests {
         test.window
             .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
             .expect("failed to read the notes window")
+    }
+
+    fn buffer_search_bar(test: &TestWindow, cx: &TestAppContext) -> gpui::Entity<BufferSearchBar> {
+        workspace(test, cx).read_with(cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .toolbar()
+                .read(cx)
+                .item_of_type::<BufferSearchBar>()
+                .expect("notes panes should have a buffer search bar")
+        })
+    }
+
+    fn active_project_search(
+        test: &TestWindow,
+        cx: &TestAppContext,
+    ) -> gpui::Entity<ProjectSearchView> {
+        workspace(test, cx).read_with(cx, |workspace, cx| {
+            workspace
+                .active_item_as::<ProjectSearchView>(cx)
+                .expect("workspace search should be active")
+        })
     }
 
     fn execute_palette_command(test: &mut TestWindow, query: &str, cx: &mut TestAppContext) {
@@ -1284,6 +1354,13 @@ mod tests {
             workspace.read_with(cx, |workspace, _| workspace.panes().len()),
             2
         );
+        workspace.read_with(cx, |workspace, cx| {
+            for pane in workspace.panes() {
+                let toolbar = pane.read(cx).toolbar().read(cx);
+                assert!(toolbar.item_of_type::<BufferSearchBar>().is_some());
+                assert!(toolbar.item_of_type::<ProjectSearchBar>().is_some());
+            }
+        });
         assert_eq!(
             workspace.read_with(cx, |workspace, cx| workspace
                 .items_of_type::<MarkdownPreviewView>(cx)
@@ -1692,6 +1769,196 @@ mod tests {
             None
         });
         test.cx.run_until_parked();
+
+        execute_palette_command(&mut test, "workspace: search", cx);
+        active_project_search(&test, cx);
+    }
+
+    #[gpui::test]
+    async fn test_workspace_search_defaults_to_markdown_files(cx: &mut TestAppContext) {
+        let mut test = test_window_with(
+            cx,
+            ExplorerSettings::default(),
+            json!({
+                "alpha.md": "# Alpha\n\nneedle\n",
+                "ignored.txt": "needle\n",
+                "nested": {
+                    "beta.markdown": "# Beta\n\nneedle\n",
+                },
+            }),
+            "/notes/alpha.md",
+        )
+        .await;
+
+        test.cx.simulate_keystrokes("cmd-shift-f");
+        let search = active_project_search(&test, cx);
+        test.cx.simulate_input("needle");
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            search
+                .read_with(cx, |search, cx| search.get_matches(cx))
+                .len(),
+            2
+        );
+    }
+
+    #[gpui::test]
+    async fn test_workspace_search_finds_saved_text_and_enter_opens_exact_match(
+        cx: &mut TestAppContext,
+    ) {
+        let mut test = test_window_with(
+            cx,
+            ExplorerSettings::default(),
+            json!({
+                "alpha.md": "# Alpha\n",
+                "ignored.txt": "fresh result\n",
+            }),
+            "/notes/alpha.md",
+        )
+        .await;
+
+        test.cx
+            .simulate_keystrokes("i f r e s h space r e s u l t enter escape cmd-s");
+        test.cx.run_until_parked();
+        test.cx.simulate_keystrokes("cmd-shift-f");
+        let search = active_project_search(&test, cx);
+        test.cx.simulate_input("fresh result");
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            search
+                .read_with(cx, |search, cx| search.get_matches(cx))
+                .len(),
+            1
+        );
+
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/alpha.md")
+        );
+
+        test.cx.simulate_keystrokes("i x escape cmd-s");
+        test.cx.run_until_parked();
+        assert_eq!(
+            test.fs.load(Path::new("/notes/alpha.md")).await.unwrap(),
+            "xfresh result\n# Alpha\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_workspace_search_toggles_and_directory_filter_narrow_results(
+        cx: &mut TestAppContext,
+    ) {
+        let mut test = test_window_with(
+            cx,
+            ExplorerSettings::default(),
+            json!({
+                "root.md": "Needle\nneedle\nneedleish\n",
+                "nested": {
+                    "note.md": "needle\n",
+                },
+            }),
+            "/notes/root.md",
+        )
+        .await;
+
+        test.cx.simulate_keystrokes("cmd-shift-f");
+        let search = active_project_search(&test, cx);
+        test.cx.simulate_input("needle");
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+        assert_eq!(
+            search
+                .read_with(cx, |search, cx| search.get_matches(cx))
+                .len(),
+            4
+        );
+
+        test.cx.dispatch_action(search::ToggleCaseSensitive);
+        test.cx.dispatch_action(Search);
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+        assert_eq!(
+            search
+                .read_with(cx, |search, cx| search.get_matches(cx))
+                .len(),
+            3
+        );
+
+        test.cx.dispatch_action(search::ToggleWholeWord);
+        test.cx.dispatch_action(Search);
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+        assert_eq!(
+            search
+                .read_with(cx, |search, cx| search.get_matches(cx))
+                .len(),
+            2
+        );
+
+        test.cx.dispatch_action(Search);
+        test.cx.simulate_keystrokes("tab cmd-a");
+        test.cx.simulate_input("nested/**");
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+        assert_eq!(
+            search
+                .read_with(cx, |search, cx| search.get_matches(cx))
+                .len(),
+            1
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cmd_f_find_replace_and_vim_slash_search_remain_independent(
+        cx: &mut TestAppContext,
+    ) {
+        let mut test = test_window(cx).await;
+
+        test.cx.simulate_keystrokes("cmd-f");
+        test.cx.simulate_input("fast");
+        test.cx.run_until_parked();
+        let search_bar = buffer_search_bar(&test, cx);
+        assert!(!search_bar.read_with(cx, |search_bar, _| search_bar.is_dismissed()));
+        assert_eq!(
+            search_bar.read_with(cx, |search_bar, cx| search_bar.query(cx)),
+            "fast"
+        );
+        assert!(test.cx.update(|window, cx| {
+            search_bar.update(cx, |search_bar, cx| search_bar.match_exists(window, cx))
+        }));
+
+        test.cx.dispatch_action(search::ToggleCaseSensitive);
+        test.cx.dispatch_action(search::ToggleWholeWord);
+        test.cx.dispatch_action(search::ToggleRegex);
+        search_bar.update(cx, |search_bar, _cx| {
+            assert!(search_bar.has_search_option(search::SearchOptions::CASE_SENSITIVE));
+            assert!(search_bar.has_search_option(search::SearchOptions::WHOLE_WORD));
+            assert!(search_bar.has_search_option(search::SearchOptions::REGEX));
+        });
+
+        test.cx.dispatch_action(search::ToggleReplace);
+        test.cx.simulate_input("quick");
+        test.cx.dispatch_action(search::ReplaceAll);
+        test.cx.run_until_parked();
+        assert_eq!(
+            active_editor(&test, cx).read_with(cx, |editor, cx| editor.text(cx)),
+            "# Spike\n\n- **quick** editing\n"
+        );
+
+        test.cx.simulate_keystrokes("escape escape /");
+        test.cx.simulate_input("Spike");
+        test.cx.simulate_keystrokes("enter i x escape cmd-s");
+        test.cx.run_until_parked();
+        assert_eq!(
+            test.fs.load(Path::new(TEST_NOTE_PATH)).await.unwrap(),
+            "# xSpike\n\n- **quick** editing\n"
+        );
     }
 
     #[gpui::test]

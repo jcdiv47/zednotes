@@ -29,7 +29,9 @@ use settings::{DockSide, KeybindSource, KeymapFile, Settings as _, SettingsStore
 use theme::{ActiveTheme as _, LoadThemes};
 use vim::ModeIndicator;
 use workspace as zed_workspace;
-use zed_workspace::{AppState, MultiWorkspace, SaveIntent, Workspace, WorkspaceStore};
+use zed_workspace::{
+    AppState, MultiWorkspace, SaveIntent, Workspace, WorkspaceStore, dock::DockPosition,
+};
 
 const APP_NAME: &str = "zednotes";
 const NOTE_FILE_NAME: &str = "spike.md";
@@ -70,6 +72,14 @@ actions!(
         TogglePreview,
         /// Opens the active note as a preview-only tab.
         OpenPreview,
+    ]
+);
+
+actions!(
+    view,
+    [
+        /// Toggles the notes explorer.
+        ToggleExplorer,
     ]
 );
 
@@ -194,17 +204,17 @@ fn exclusion_glob(path: &str) -> String {
     }
 }
 
+fn is_markdown_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown")
+        })
+}
+
 fn markdown_entry_filter(markdown_only: bool) -> EntryFilter {
     Arc::new(move |path: &Path, is_directory| {
-        is_directory
-            || !markdown_only
-            || path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| {
-                    extension.eq_ignore_ascii_case("md")
-                        || extension.eq_ignore_ascii_case("markdown")
-                })
+        is_directory || !markdown_only || is_markdown_path(path)
     })
 }
 
@@ -246,6 +256,7 @@ fn load_editor_keymaps(cx: &mut App) -> Result<()> {
     }
     cx.bind_keys([
         KeyBinding::new("cmd-o", OpenFolder, None),
+        KeyBinding::new("cmd-b", ToggleExplorer, None),
         KeyBinding::new(
             "enter",
             project_panel::OpenPermanent,
@@ -270,6 +281,7 @@ fn init_editor_subsystems(cx: &mut App) -> Result<()> {
     zed_actions::init();
     command_palette::init(cx);
     editor::init(cx);
+    file_finder::init_with_file_filter(Arc::new(is_markdown_path), cx);
     markdown_preview::init(cx);
     project_panel::init(cx);
     search::init(cx);
@@ -303,7 +315,10 @@ fn init_editor_subsystems(cx: &mut App) -> Result<()> {
             MenuItem::action("Toggle Preview", TogglePreview),
             MenuItem::action("Open Preview", OpenPreview),
         ]),
-        Menu::new("View").items([MenuItem::action("Toggle Hidden Files", ToggleHiddenFiles)]),
+        Menu::new("View").items([
+            MenuItem::action("Toggle Explorer", ToggleExplorer),
+            MenuItem::action("Toggle Hidden Files", ToggleHiddenFiles),
+        ]),
     ]);
     cx.on_window_closed(|cx, _window_id| {
         if cx.windows().is_empty() {
@@ -451,6 +466,9 @@ fn init_workspace_composition(
         });
         workspace.register_action(|workspace, _: &FocusEditor, window, cx| {
             workspace.focus_center_pane(window, cx);
+        });
+        workspace.register_action(|workspace, _: &ToggleExplorer, window, cx| {
+            workspace.toggle_dock(DockPosition::Left, window, cx);
         });
         workspace.register_action(|workspace, _: &TogglePreview, window, cx| {
             toggle_preview(workspace, window, cx);
@@ -621,7 +639,7 @@ mod tests {
     use project::ProjectPath;
     use serde_json::{Value, json};
     use settings::SettingsStore;
-    use std::path::Path;
+    use std::{path::Path, time::Duration};
     use util::rel_path::rel_path;
 
     const TEST_NOTE_PATH: &str = "/notes/spike.md";
@@ -767,6 +785,26 @@ mod tests {
                     .expect("active editor should be file-backed")
             })
             .expect("failed to read the notes window")
+    }
+
+    fn workspace(test: &TestWindow, cx: &TestAppContext) -> gpui::Entity<Workspace> {
+        test.window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("failed to read the notes window")
+    }
+
+    fn execute_palette_command(test: &mut TestWindow, query: &str, cx: &mut TestAppContext) {
+        test.cx.simulate_keystrokes("cmd-shift-p");
+        assert!(
+            workspace(test, cx).read_with(cx, |workspace, cx| workspace
+                .active_modal::<command_palette::CommandPalette>(cx)
+                .is_some()),
+            "Cmd+Shift+P should open the command palette"
+        );
+        test.cx.simulate_input(query);
+        test.cx.run_until_parked();
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
     }
 
     #[gpui::test]
@@ -1226,6 +1264,137 @@ mod tests {
         test.cx.simulate_keystrokes("cmd-b");
 
         assert!(!workspace.read_with(cx, |workspace, cx| workspace.left_dock().read(cx).is_open()));
+    }
+
+    #[gpui::test]
+    async fn test_cmd_p_opens_markdown_notes_and_restores_editor_focus(cx: &mut TestAppContext) {
+        let mut test = test_window_with(
+            cx,
+            ExplorerSettings::default(),
+            json!({
+                "alpha.md": "# Alpha\n",
+                "nested": {
+                    "project-plan.markdown": "# Project plan\n",
+                },
+            }),
+            "/notes/alpha.md",
+        )
+        .await;
+        let workspace = workspace(&test, cx);
+
+        test.cx.simulate_keystrokes("cmd-p");
+        assert!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .active_modal::<file_finder::FileFinder>(cx)
+                .is_some()),
+            "Cmd+P should open quick open"
+        );
+        test.cx.simulate_input("prjpln");
+        test.cx.executor().advance_clock(Duration::from_millis(100));
+        test.cx.run_until_parked();
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/nested/project-plan.markdown")
+        );
+        assert!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .active_modal::<file_finder::FileFinder>(cx)
+                .is_none()),
+            "opening a note should dismiss quick open"
+        );
+
+        test.cx.simulate_keystrokes("cmd-p");
+        test.cx.run_until_parked();
+        test.cx.simulate_keystrokes("escape");
+        assert!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .active_modal::<file_finder::FileFinder>(cx)
+                .is_none()),
+            "Escape should dismiss quick open"
+        );
+        test.cx.update(|window, cx| {
+            let editor = workspace
+                .read(cx)
+                .active_item_as::<Editor>(cx)
+                .expect("the opened note should be active");
+            assert!(editor.read(cx).focus_handle(cx).is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_quick_open_excludes_non_markdown_files(cx: &mut TestAppContext) {
+        let mut test = test_window_with(
+            cx,
+            ExplorerSettings::default(),
+            json!({
+                "alpha.md": "# Alpha\n",
+                "private.txt": "not a note\n",
+            }),
+            "/notes/alpha.md",
+        )
+        .await;
+        let workspace = workspace(&test, cx);
+
+        test.cx.simulate_keystrokes("cmd-p");
+        test.cx.simulate_input("private.txt");
+        test.cx.executor().advance_clock(Duration::from_millis(100));
+        test.cx.run_until_parked();
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            active_editor_path(&test, cx),
+            PathBuf::from("/notes/alpha.md")
+        );
+        assert!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .active_modal::<file_finder::FileFinder>(cx)
+                .is_some()),
+            "a non-Markdown query should have no selectable result"
+        );
+        test.cx.simulate_keystrokes("escape");
+    }
+
+    #[gpui::test]
+    async fn test_command_palette_executes_all_major_notes_actions(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+        let workspace = workspace(&test, cx);
+
+        assert!(workspace.read_with(cx, |workspace, cx| workspace.left_dock().read(cx).is_open()));
+        execute_palette_command(&mut test, "view: toggle explorer", cx);
+        assert!(!workspace.read_with(cx, |workspace, cx| workspace.left_dock().read(cx).is_open()));
+        test.cx.simulate_keystrokes("cmd-b");
+        assert!(workspace.read_with(cx, |workspace, cx| workspace.left_dock().read(cx).is_open()));
+
+        execute_palette_command(&mut test, "note: toggle preview", cx);
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .items_of_type::<MarkdownPreviewView>(cx)
+                .count()),
+            1
+        );
+        test.cx.simulate_keystrokes("cmd-shift-v");
+        test.cx.run_until_parked();
+
+        test.cx.simulate_keystrokes("i x escape");
+        execute_palette_command(&mut test, "workspace: save", cx);
+        assert_eq!(
+            test.fs.load(Path::new(TEST_NOTE_PATH)).await.unwrap(),
+            format!("x{TEST_NOTE}")
+        );
+
+        execute_palette_command(&mut test, "workspace: open folder", cx);
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|options| {
+            assert!(!options.files);
+            assert!(options.directories);
+            assert!(!options.multiple);
+            None
+        });
+        test.cx.run_until_parked();
     }
 
     #[gpui::test]

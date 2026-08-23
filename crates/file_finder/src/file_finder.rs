@@ -72,8 +72,23 @@ pub struct FileFinder {
     init_modifiers: Option<Modifiers>,
 }
 
+/// Restricts the paths shown by the file finder.
+pub type FileFilter = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+
 pub fn init(cx: &mut App) {
-    cx.observe_new(FileFinder::register).detach();
+    init_with_optional_file_filter(None, cx);
+}
+
+/// Initializes the file finder with an application-wide path filter.
+pub fn init_with_file_filter(file_filter: FileFilter, cx: &mut App) {
+    init_with_optional_file_filter(Some(file_filter), cx);
+}
+
+fn init_with_optional_file_filter(file_filter: Option<FileFilter>, cx: &mut App) {
+    cx.observe_new(move |workspace, window, cx| {
+        FileFinder::register(workspace, window, file_filter.clone(), cx)
+    })
+    .detach();
     cx.observe_new(OpenPathPrompt::register).detach();
     cx.observe_new(OpenPathPrompt::register_new_path).detach();
 }
@@ -82,15 +97,18 @@ impl FileFinder {
     fn register(
         workspace: &mut Workspace,
         _window: Option<&mut Window>,
+        file_filter: Option<FileFilter>,
         _: &mut Context<Workspace>,
     ) {
-        workspace.register_action(
-            |workspace, action: &workspace::ToggleFileFinder, window, cx| {
+        workspace.register_action({
+            let file_filter = file_filter.clone();
+            move |workspace, action: &workspace::ToggleFileFinder, window, cx| {
                 let Some(file_finder) = workspace.active_modal::<Self>(cx) else {
                     Self::open(
                         workspace,
                         action.separate_history,
                         action.include_ignored,
+                        file_filter.clone(),
                         window,
                         cx,
                     )
@@ -104,14 +122,15 @@ impl FileFinder {
                         picker.cycle_selection(window, cx);
                     });
                 });
-            },
-        );
+            }
+        });
     }
 
     fn open(
         workspace: &mut Workspace,
         separate_history: bool,
         include_ignored: Option<bool>,
+        file_filter: Option<FileFilter>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Task<()> {
@@ -165,6 +184,7 @@ impl FileFinder {
                             history_items.collect(),
                             separate_history,
                             include_ignored,
+                            file_filter,
                             window,
                             cx,
                         );
@@ -386,6 +406,7 @@ pub struct FileFinderDelegate {
     first_update: bool,
     focus_handle: FocusHandle,
     include_ignored: Option<bool>,
+    file_filter: Option<FileFilter>,
     include_ignored_refresh: Task<()>,
     debounce_next_refresh: bool,
 }
@@ -971,6 +992,7 @@ impl FileFinderDelegate {
         history_items: Vec<FoundPath>,
         separate_history: bool,
         include_ignored: Option<bool>,
+        file_filter: Option<FileFilter>,
         window: &mut Window,
         cx: &mut Context<FileFinder>,
     ) -> Self {
@@ -980,6 +1002,19 @@ impl FileFinderDelegate {
         } else {
             None
         };
+        let currently_opened_path = currently_opened_path.filter(|path| {
+            file_filter
+                .as_ref()
+                .is_none_or(|filter| filter(path.project.path.as_std_path()))
+        });
+        let history_items = history_items
+            .into_iter()
+            .filter(|path| {
+                file_filter
+                    .as_ref()
+                    .is_none_or(|filter| filter(path.project.path.as_std_path()))
+            })
+            .collect();
         Self {
             file_finder,
             workspace,
@@ -1001,6 +1036,7 @@ impl FileFinderDelegate {
             first_update: true,
             focus_handle: cx.focus_handle(),
             include_ignored: include_ignored.or(FileFinderSettings::get_global(cx).include_ignored),
+            file_filter,
             include_ignored_refresh: Task::ready(()),
             debounce_next_refresh: false,
         }
@@ -1081,14 +1117,21 @@ impl FileFinderDelegate {
         self.cancel_flag.store(true, atomic::Ordering::Release);
         self.cancel_flag = Arc::new(AtomicBool::new(false));
         let cancel_flag = self.cancel_flag.clone();
+        let file_filter = self
+            .file_filter
+            .clone()
+            .map(|file_filter| move |path: &RelPath| file_filter(path.as_std_path()));
         cx.spawn_in(window, async move |picker, cx| {
-            let matches = fuzzy_nucleo::match_path_sets(
+            let matches = fuzzy_nucleo::match_path_sets_with_filter(
                 candidate_sets.as_slice(),
                 query.path_query(),
                 &relative_to,
                 fuzzy_nucleo::Case::Ignore,
                 100,
                 &cancel_flag,
+                file_filter
+                    .as_ref()
+                    .map(|filter| filter as &(dyn Fn(&RelPath) -> bool + Sync)),
                 cx.background_executor().clone(),
             )
             .await
@@ -1248,6 +1291,10 @@ impl FileFinderDelegate {
                     if worktree.entry_for_path(&query_path).is_none()
                         && !query.path_query().ends_with('/')
                         && !(path_style.is_windows() && query.path_query().ends_with('\\'))
+                        && self
+                            .file_filter
+                            .as_ref()
+                            .is_none_or(|filter| filter(query_path.as_std_path()))
                     {
                         self.matches.matches.push(Match::CreateNew(ProjectPath {
                             worktree_id: worktree.id(),
@@ -1484,6 +1531,7 @@ impl FileFinderDelegate {
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Task<bool> {
+        let file_filter = self.file_filter.clone();
         cx.spawn_in(window, async move |picker, cx| {
             let Some(project) = picker
                 .read_with(cx, |picker, _| picker.delegate.project.clone())
@@ -1504,7 +1552,10 @@ impl FileFinderDelegate {
 
             if abs_file_exists {
                 project.update(cx, |project, cx| {
-                    if let Some((worktree, relative_path)) = project.find_worktree(query_path, cx) {
+                    if file_filter.as_ref().is_none_or(|filter| filter(query_path))
+                        && let Some((worktree, relative_path)) =
+                            project.find_worktree(query_path, cx)
+                    {
                         path_matches.push(ProjectPanelOrdMatch(PathMatch {
                             score: 1.0,
                             positions: Vec::new(),

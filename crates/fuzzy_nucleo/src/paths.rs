@@ -270,6 +270,30 @@ pub async fn match_path_sets<'a, Set: PathMatchCandidateSet<'a>>(
     cancel_flag: &AtomicBool,
     executor: BackgroundExecutor,
 ) -> Vec<PathMatch> {
+    match_path_sets_with_filter(
+        candidate_sets,
+        query,
+        relative_to,
+        case,
+        max_results,
+        cancel_flag,
+        None,
+        executor,
+    )
+    .await
+}
+
+/// Matches paths while excluding candidates that do not satisfy `path_filter`.
+pub async fn match_path_sets_with_filter<'a, Set: PathMatchCandidateSet<'a>>(
+    candidate_sets: &'a [Set],
+    query: &str,
+    relative_to: &Option<Arc<RelPath>>,
+    case: Case,
+    max_results: usize,
+    cancel_flag: &AtomicBool,
+    path_filter: Option<&(dyn Fn(&RelPath) -> bool + Sync)>,
+    executor: BackgroundExecutor,
+) -> Vec<PathMatch> {
     let path_count: usize = candidate_sets.iter().map(|s| s.len()).sum();
     if path_count == 0 {
         return Vec::new();
@@ -315,7 +339,12 @@ pub async fn match_path_sets<'a, Set: PathMatchCandidateSet<'a>>(
                         if tree_start < segment_end && segment_start < tree_end {
                             let start = tree_start.max(segment_start) - tree_start;
                             let end = tree_end.min(segment_end) - tree_start;
-                            let candidates = candidate_set.candidates(start).take(end - start);
+                            let candidates = candidate_set
+                                .candidates(start)
+                                .take(end - start)
+                                .filter(|candidate| {
+                                    path_filter.is_none_or(|filter| filter(candidate.path))
+                                });
 
                             if path_match_helper(
                                 matcher,
@@ -353,4 +382,105 @@ pub async fn match_path_sets<'a, Set: PathMatchCandidateSet<'a>>(
     let mut results = segment_results.concat();
     gpui_util::truncate_to_bottom_n_sorted_by(&mut results, max_results, &|a, b| b.cmp(a));
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestCandidateSet {
+        paths: Vec<Arc<RelPath>>,
+    }
+
+    struct TestCandidates<'a> {
+        paths: std::slice::Iter<'a, Arc<RelPath>>,
+    }
+
+    impl<'a> Iterator for TestCandidates<'a> {
+        type Item = PathMatchCandidate<'a>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.paths
+                .next()
+                .map(|path| PathMatchCandidate::new(path, false, None))
+        }
+    }
+
+    impl<'a> PathMatchCandidateSet<'a> for TestCandidateSet {
+        type Candidates = TestCandidates<'a>;
+
+        fn id(&self) -> usize {
+            0
+        }
+
+        fn len(&self) -> usize {
+            self.paths.len()
+        }
+
+        fn root_is_file(&self) -> bool {
+            false
+        }
+
+        fn prefix(&self) -> Arc<RelPath> {
+            RelPath::empty_arc()
+        }
+
+        fn candidates(&'a self, start: usize) -> Self::Candidates {
+            TestCandidates {
+                paths: self.paths[start.min(self.paths.len())..].iter(),
+            }
+        }
+
+        fn path_style(&self) -> PathStyle {
+            PathStyle::Unix
+        }
+    }
+
+    #[gpui::test]
+    async fn test_path_filter_is_applied_before_result_limit(executor: BackgroundExecutor) {
+        let candidate_sets = [TestCandidateSet {
+            paths: vec![
+                Arc::from(RelPath::new_test("target.txt").as_ref()),
+                Arc::from(RelPath::new_test("nested/target-notes.md").as_ref()),
+            ],
+        }];
+        let cancel_flag = AtomicBool::new(false);
+        let relative_to = None;
+
+        let unfiltered = match_path_sets(
+            &candidate_sets,
+            "target",
+            &relative_to,
+            Case::Ignore,
+            1,
+            &cancel_flag,
+            executor.clone(),
+        )
+        .await;
+        assert_eq!(
+            unfiltered
+                .first()
+                .map(|path_match| path_match.path.as_unix_str()),
+            Some("target.txt")
+        );
+
+        let filter = |path: &RelPath| path.extension() == Some("md");
+        let filtered = match_path_sets_with_filter(
+            &candidate_sets,
+            "target",
+            &relative_to,
+            Case::Ignore,
+            1,
+            &cancel_flag,
+            Some(&filter),
+            executor,
+        )
+        .await;
+        assert_eq!(
+            filtered
+                .first()
+                .map(|path_match| path_match.path.as_unix_str()),
+            Some("nested/target-notes.md")
+        );
+    }
 }

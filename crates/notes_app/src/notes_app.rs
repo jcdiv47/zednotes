@@ -30,7 +30,10 @@ use gpui::{
     WeakEntity, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
 };
 use http_client::BlockedHttpClient;
-use language::{Buffer, BufferEvent, Capability, DiskState, Language, LanguageRegistry};
+use language::{
+    Buffer, BufferEvent, Capability, DiskState, Language, LanguageConfig, LanguageMatcher,
+    LanguageRegistry,
+};
 use markdown_preview::markdown_preview_view::MarkdownPreviewView;
 use node_runtime::NodeRuntime;
 use percent_encoding::percent_decode_str;
@@ -1284,23 +1287,90 @@ fn markdown_entry_filter(markdown_only: bool) -> EntryFilter {
     })
 }
 
-fn markdown_language(name: &str, grammar: tree_sitter::Language) -> Result<Arc<Language>> {
+fn built_in_language(name: &str, grammar: tree_sitter::Language) -> Result<Arc<Language>> {
     let language = Language::new(grammars::load_config(name), Some(grammar))
         .with_queries(grammars::load_queries(name))
         .with_context(|| format!("failed to load Tree-sitter queries for {name}"))?;
     Ok(Arc::new(language))
 }
 
+fn bundled_preview_language(
+    name: &'static str,
+    fence_aliases: &[&str],
+    grammar: tree_sitter::Language,
+    highlights_query: &str,
+) -> Result<Arc<Language>> {
+    let language = Language::new(
+        LanguageConfig {
+            name: name.into(),
+            code_fence_block_name: Some(name.to_lowercase().into()),
+            matcher: LanguageMatcher {
+                path_suffixes: fence_aliases
+                    .iter()
+                    .map(|alias| (*alias).to_owned())
+                    .collect(),
+                ..LanguageMatcher::default()
+            }
+            .into(),
+            ..LanguageConfig::default()
+        },
+        Some(grammar),
+    )
+    .with_highlights_query(highlights_query)
+    .with_context(|| format!("failed to load Tree-sitter highlights for {name}"))?;
+    Ok(Arc::new(language))
+}
+
+fn register_built_in_languages(languages: &LanguageRegistry) -> Result<()> {
+    let native_grammars = grammars::native_grammars();
+    let tsx_grammar = native_grammars
+        .iter()
+        .find_map(|(name, grammar)| (*name == "tsx").then(|| grammar.clone()))
+        .context("bundled TSX grammar is unavailable")?;
+
+    for (name, grammar) in native_grammars {
+        languages.add(built_in_language(name, grammar)?);
+    }
+
+    // JavaScript shares the TSX parser but has its own highlight queries and
+    // file/fence aliases.
+    languages.add(built_in_language("javascript", tsx_grammar)?);
+    languages.add(bundled_preview_language(
+        "HTML",
+        &["html", "htm", "shtml"],
+        tree_sitter_html::LANGUAGE.into(),
+        tree_sitter_html::HIGHLIGHTS_QUERY,
+    )?);
+    languages.add(bundled_preview_language(
+        "SQL",
+        &["sql", "postgres", "postgresql", "mysql", "sqlite", "plsql"],
+        tree_sitter_sequel::LANGUAGE.into(),
+        tree_sitter_sequel::HIGHLIGHTS_QUERY,
+    )?);
+    languages.add(bundled_preview_language(
+        "XML",
+        &["xml", "xsd", "xsl", "xslt", "svg"],
+        tree_sitter_xml::LANGUAGE_XML.into(),
+        tree_sitter_xml::XML_HIGHLIGHT_QUERY,
+    )?);
+    languages.add(bundled_preview_language(
+        "DTD",
+        &["dtd"],
+        tree_sitter_xml::LANGUAGE_DTD.into(),
+        tree_sitter_xml::DTD_HIGHLIGHT_QUERY,
+    )?);
+    languages.add(bundled_preview_language(
+        "TOML",
+        &["toml"],
+        tree_sitter_toml_ng::LANGUAGE.into(),
+        tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
+    )?);
+    Ok(())
+}
+
 fn markdown_languages(cx: &App) -> Result<Arc<LanguageRegistry>> {
     let languages = Arc::new(LanguageRegistry::new(cx.background_executor().clone()));
-    languages.add(markdown_language(
-        "markdown-inline",
-        tree_sitter_md::INLINE_LANGUAGE.into(),
-    )?);
-    languages.add(markdown_language(
-        "markdown",
-        tree_sitter_md::LANGUAGE.into(),
-    )?);
+    register_built_in_languages(&languages)?;
     languages.set_theme(cx.theme().clone());
     Ok(languages)
 }
@@ -3086,15 +3156,10 @@ mod tests {
         let fs = app_state.fs.as_fake().clone();
         fs.insert_tree("/notes", tree).await;
         let project = Project::test(app_state.fs.clone(), [Path::new("/notes")], cx).await;
-        project.read_with(cx, |project, _| {
-            project.languages().add(
-                markdown_language("markdown-inline", tree_sitter_md::INLINE_LANGUAGE.into())
-                    .expect("failed to create inline Markdown language"),
-            );
-            project.languages().add(
-                markdown_language("markdown", tree_sitter_md::LANGUAGE.into())
-                    .expect("failed to create Markdown language"),
-            );
+        project.read_with(cx, |project, cx| {
+            register_built_in_languages(project.languages())
+                .expect("failed to register built-in languages");
+            project.languages().set_theme(cx.theme().clone());
         });
 
         let window = cx
@@ -5110,6 +5175,84 @@ mod tests {
             settings.max_file_size_bytes,
             Some(DEFAULT_PREVIEW_MAX_FILE_SIZE_BYTES)
         );
+    }
+
+    #[gpui::test]
+    async fn test_preview_registry_resolves_built_in_fenced_code_languages(
+        cx: &mut TestAppContext,
+    ) {
+        let test = test_window(cx).await;
+        let languages = test
+            .project
+            .read_with(cx, |project, _| project.languages().clone());
+
+        for (fence_name, expected_language) in [
+            ("rust", "Rust"),
+            ("rs", "Rust"),
+            ("python", "Python"),
+            ("py", "Python"),
+            ("javascript", "JavaScript"),
+            ("js", "JavaScript"),
+            ("typescript", "TypeScript"),
+            ("ts", "TypeScript"),
+            ("bash", "Shell Script"),
+            ("json", "JSON"),
+            ("yaml", "YAML"),
+            ("go", "Go"),
+            ("cpp", "C++"),
+            ("html", "HTML"),
+            ("sql", "SQL"),
+            ("postgresql", "SQL"),
+            ("xml", "XML"),
+            ("xsd", "XML"),
+            ("dtd", "DTD"),
+            ("toml", "TOML"),
+        ] {
+            let language = languages
+                .language_for_name_or_extension(fence_name)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("failed to resolve {fence_name:?} code fence: {error}")
+                });
+            assert_eq!(language.name().as_ref(), expected_language);
+            assert!(
+                language.grammar().is_some(),
+                "{fence_name:?} code fences need a grammar"
+            );
+        }
+
+        let rust = languages
+            .language_for_name_or_extension("rust")
+            .await
+            .expect("failed to load Rust highlighting");
+        let source = "fn main() { let answer = 42; }";
+        assert!(
+            !rust
+                .highlight_text(&language::Rope::from(source), 0..source.len())
+                .is_empty(),
+            "the bundled Rust queries should produce syntax highlights"
+        );
+
+        for (fence_name, source) in [
+            ("html", "<main class=\"content\">Hello</main>"),
+            ("sql", "SELECT name FROM users WHERE active = TRUE;"),
+            ("xml", "<?xml version=\"1.0\"?><note id=\"1\">Hello</note>"),
+            ("dtd", "<!ELEMENT note (#PCDATA)>"),
+            ("toml", "[package]\nname = \"zednotes\""),
+        ] {
+            let language = languages
+                .language_for_name_or_extension(fence_name)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("failed to load {fence_name:?} highlighting: {error}")
+                });
+            assert!(
+                !language
+                    .highlight_text(&language::Rope::from(source), 0..source.len())
+                    .is_empty(),
+                "the bundled {fence_name:?} queries should produce syntax highlights"
+            );
+        }
     }
 
     #[gpui::test]

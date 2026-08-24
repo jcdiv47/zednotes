@@ -41,3 +41,15 @@ process smoke check.
 
 Manual acceptance remains for visual inspection of the split, typography, representative Markdown
 constructs, local image formats, and the large-document prompt in the live app.
+
+**2026-08-24 — fenced code syntax highlighting enabled.**
+
+The notes language registry now includes Zed's bundled native Tree-sitter languages instead of only
+Markdown. Preview resolves common fenced-code tags and extensions such as `rust`/`rs`,
+`python`/`py`, `javascript`/`js`, `typescript`/`ts`, `bash`, `json`, `yaml`, `go`, and `cpp`, then
+renders tokens with the active syntax theme. This remains fully local and does not initialize
+language servers, extensions, or network-backed grammar downloads.
+
+HTML, SQL, XML/DTD, and TOML grammars and highlight queries are also compiled into zednotes. Common
+fence aliases, including `postgresql`, `mysql`, `sqlite`, `xsd`, `xslt`, and `svg`, resolve locally
+without extension initialization or runtime downloads.

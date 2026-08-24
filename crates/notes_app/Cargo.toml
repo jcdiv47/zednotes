@@ -29,7 +29,7 @@ futures.workspace = true
 gpui.workspace = true
 gpui_platform = { workspace = true, features = ["font-kit"] }
 gpui_tokio.workspace = true
-grammars.workspace = true
+grammars = { workspace = true, features = ["load-grammars"] }
 http_client.workspace = true
 language.workspace = true
 log.workspace = true
@@ -50,7 +50,10 @@ settings.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
 tree-sitter.workspace = true
-tree-sitter-md.workspace = true
+tree-sitter-html.workspace = true
+tree-sitter-sequel.workspace = true
+tree-sitter-toml-ng.workspace = true
+tree-sitter-xml.workspace = true
 util.workspace = true
 uuid.workspace = true
 vim.workspace = true

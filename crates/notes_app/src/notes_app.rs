@@ -2822,9 +2822,9 @@ fn configure_workspace(
         let details = cx.new(|_| NotesStatusDetails::new());
         let cursor = cx.new(|cx| NotesCursorStatus::new(details.clone(), cx));
         let mode_indicator = cx.new(|cx| ModeIndicator::new(window, cx));
-        status_bar.add_right_item(cursor, window, cx);
         status_bar.add_right_item(mode_indicator, window, cx);
         status_bar.add_right_item(details, window, cx);
+        status_bar.add_right_item(cursor, window, cx);
     });
 }
 
@@ -3895,9 +3895,9 @@ mod tests {
         let status_bar =
             workspace(&test, cx).read_with(cx, |workspace, _| workspace.status_bar().clone());
         let details = status_bar.read_with(cx, |status_bar, _| {
-            assert_eq!(status_bar.position_of_item::<NotesCursorStatus>(), Some(0));
-            assert_eq!(status_bar.position_of_item::<ModeIndicator>(), Some(1));
-            assert_eq!(status_bar.position_of_item::<NotesStatusDetails>(), Some(2));
+            assert_eq!(status_bar.position_of_item::<ModeIndicator>(), Some(0));
+            assert_eq!(status_bar.position_of_item::<NotesStatusDetails>(), Some(1));
+            assert_eq!(status_bar.position_of_item::<NotesCursorStatus>(), Some(2));
             assert!(status_bar.item_of_type::<PanelButtons>().is_none());
             status_bar
                 .item_of_type::<NotesStatusDetails>()

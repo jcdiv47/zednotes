@@ -193,6 +193,8 @@ actions!(
         FollowLink,
         /// Reports word and character counts for the active note.
         Statistics,
+        /// Saves the active note and returns its editor to Vim Normal mode.
+        SaveAndReturnToNormal,
     ]
 );
 
@@ -1483,6 +1485,16 @@ fn bind_default_editor_keymaps(cx: &mut App) -> Result<()> {
             Some("Editor"),
         ),
         KeyBinding::new(
+            "cmd-s",
+            SaveAndReturnToNormal,
+            Some("Editor && vim_mode == insert"),
+        ),
+        KeyBinding::new(
+            "j k",
+            SaveAndReturnToNormal,
+            Some("Editor && vim_mode == insert"),
+        ),
+        KeyBinding::new(
             "enter",
             editor::actions::OpenExcerpts,
             Some("ProjectSearchView > Editor"),
@@ -2417,6 +2429,18 @@ fn follow_link(workspace: &mut Workspace, window: &mut Window, cx: &mut gpui::Co
     .detach_and_prompt_err("Failed to open linked note", window, cx, |_, _, _| None);
 }
 
+fn save_and_return_to_normal(window: &mut Window, cx: &mut gpui::Context<Workspace>) {
+    match cx.build_action("vim::NormalBefore", None) {
+        Ok(action) => window.dispatch_action(action, cx),
+        Err(error) => log::error!("failed to build vim::NormalBefore: {error:#}"),
+    }
+    cx.defer_in(window, |workspace, window, cx| {
+        workspace
+            .save_active_item(SaveIntent::Save, window, cx)
+            .detach_and_prompt_err("Failed to save", window, cx, |_, _, _| None);
+    });
+}
+
 fn dispatch_project_panel_action(
     workspace: &mut Workspace,
     action_name: &str,
@@ -2604,6 +2628,9 @@ fn init_workspace_composition(
         });
         workspace.register_action(|workspace, _: &Statistics, _, cx| {
             show_note_statistics(workspace, cx);
+        });
+        workspace.register_action(|_, _: &SaveAndReturnToNormal, window, cx| {
+            save_and_return_to_normal(window, cx);
         });
         workspace.register_action(|workspace, _: &New, window, cx| {
             dispatch_project_panel_action(workspace, "project_panel::NewFile", window, cx);
@@ -3936,15 +3963,67 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_cmd_s_saves_the_editor_buffer(cx: &mut TestAppContext) {
-        let mut test = test_window(cx).await;
+    async fn test_cmd_s_saves_and_returns_to_normal_mode(cx: &mut TestAppContext) {
+        let mut test = test_window_with_settings(
+            cx,
+            ExplorerSettings::default(),
+            AutosaveSettings {
+                enabled: false,
+                delay_ms: DEFAULT_AUTOSAVE_DELAY_MS,
+            },
+            json!({ "spike.md": TEST_NOTE }),
+            TEST_NOTE_PATH,
+        )
+        .await;
 
-        test.cx.simulate_keystrokes("i x escape cmd-s");
+        test.cx.simulate_keystrokes("i x cmd-s");
         test.cx.run_until_parked();
 
         assert_eq!(
             test.fs.load(Path::new(TEST_NOTE_PATH)).await.unwrap(),
             format!("x{TEST_NOTE}")
+        );
+        test.cx.simulate_keystrokes("x");
+        assert_eq!(
+            test.editor.read_with(cx, |editor, cx| editor.text(cx)),
+            TEST_NOTE,
+            "Cmd+S should return the editor to Normal mode"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_jk_saves_without_persisting_the_pending_j_and_returns_to_normal_mode(
+        cx: &mut TestAppContext,
+    ) {
+        let mut test = test_window_with_settings(
+            cx,
+            ExplorerSettings::default(),
+            AutosaveSettings {
+                enabled: false,
+                delay_ms: DEFAULT_AUTOSAVE_DELAY_MS,
+            },
+            json!({ "spike.md": TEST_NOTE }),
+            TEST_NOTE_PATH,
+        )
+        .await;
+
+        test.cx.simulate_keystrokes("i x j k");
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            test.fs.load(Path::new(TEST_NOTE_PATH)).await.unwrap(),
+            format!("x{TEST_NOTE}")
+        );
+        assert_eq!(
+            test.editor.read_with(cx, |editor, cx| editor.text(cx)),
+            format!("x{TEST_NOTE}"),
+            "the pending j should be removed before saving"
+        );
+        test.cx.simulate_keystrokes("x");
+        assert_eq!(
+            test.editor.read_with(cx, |editor, cx| editor.text(cx)),
+            TEST_NOTE,
+            "jk should return the editor to Normal mode"
         );
     }
 

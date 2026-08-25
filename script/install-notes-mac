@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+open_after_install=false
+
+usage() {
+	printf '%s\n' \
+		"Usage: ${0##*/} [--open]" \
+		"" \
+		"Build Zednotes with the release-fast profile and install it at" \
+		"~/Applications/Zednotes.app." \
+		"" \
+		"Options:" \
+		"  --open      Open Zednotes after installation." \
+		"  -h, --help  Show this help."
+}
+
+fail() {
+	printf 'error: %s\n' "$1" >&2
+	exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--open)
+		open_after_install=true
+		;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	*)
+		usage >&2
+		fail "unknown option: $1"
+		;;
+	esac
+	shift
+done
+
+[[ "$(uname -s)" == "Darwin" ]] || fail "this installer only supports macOS"
+
+for required_command in cargo codesign ditto git iconutil plutil sips; do
+	command -v "$required_command" >/dev/null || fail "missing required command: $required_command"
+done
+if [[ "$open_after_install" == true ]]; then
+	command -v open >/dev/null || fail "missing required command: open"
+fi
+
+script_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repository_root="$(cd "$script_directory/.." && pwd)"
+cd "$repository_root"
+
+package_id="$(cargo pkgid --quiet --package notes_app)"
+application_version="${package_id##*#}"
+application_version="${application_version##*@}"
+[[ "$application_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+	fail "notes_app version must use numeric MAJOR.MINOR.PATCH form"
+
+target_directory="${CARGO_TARGET_DIR:-$repository_root/target}"
+if [[ "$target_directory" != /* ]]; then
+	target_directory="$repository_root/$target_directory"
+fi
+binary_path="$target_directory/release-fast/notes_app"
+
+source_revision="$(git rev-parse HEAD)"
+source_dirty=false
+if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+	source_dirty=true
+	printf '%s\n' "warning: the worktree is dirty; the bundle will be marked non-reproducible" >&2
+fi
+
+if git rev-parse --verify --quiet 'upstream/main^{commit}' >/dev/null; then
+	upstream_reference=upstream/main
+elif git rev-parse --verify --quiet 'main^{commit}' >/dev/null; then
+	upstream_reference=main
+else
+	fail "cannot find upstream/main or main to determine the Zed base"
+fi
+upstream_revision="$(git merge-base HEAD "$upstream_reference")"
+
+printf 'Building Zednotes %s with release-fast...\n' "$application_version"
+cargo build --package notes_app --profile release-fast
+[[ -x "$binary_path" ]] || fail "expected executable was not produced at $binary_path"
+
+temporary_directory="$(mktemp -d "${TMPDIR:-/tmp}/zednotes-install.XXXXXX")"
+cleanup() {
+	rm -rf "$temporary_directory"
+}
+trap cleanup EXIT
+
+staged_bundle="$temporary_directory/Zednotes.app"
+contents_directory="$staged_bundle/Contents"
+macos_directory="$contents_directory/MacOS"
+resources_directory="$contents_directory/Resources"
+info_plist="$contents_directory/Info.plist"
+mkdir -p "$macos_directory" "$resources_directory"
+install -m 755 "$binary_path" "$macos_directory/notes_app"
+
+plutil -create xml1 "$info_plist"
+plutil -insert CFBundleDevelopmentRegion -string en "$info_plist"
+plutil -insert CFBundleDisplayName -string Zednotes "$info_plist"
+plutil -insert CFBundleExecutable -string notes_app "$info_plist"
+plutil -insert CFBundleIconFile -string Zednotes "$info_plist"
+plutil -insert CFBundleIdentifier -string dev.jcdiv47.Zednotes "$info_plist"
+plutil -insert CFBundleInfoDictionaryVersion -string 6.0 "$info_plist"
+plutil -insert CFBundleName -string Zednotes "$info_plist"
+plutil -insert CFBundlePackageType -string APPL "$info_plist"
+plutil -insert CFBundleShortVersionString -string "$application_version" "$info_plist"
+plutil -insert CFBundleVersion -string "$application_version" "$info_plist"
+plutil -insert LSApplicationCategoryType -string public.app-category.productivity "$info_plist"
+plutil -insert LSMinimumSystemVersion -string 10.15.7 "$info_plist"
+plutil -insert NSHighResolutionCapable -bool true "$info_plist"
+plutil -insert NSPrincipalClass -string NSApplication "$info_plist"
+plutil -insert ZednotesSourceDirty -bool "$source_dirty" "$info_plist"
+plutil -insert ZednotesSourceRevision -string "$source_revision" "$info_plist"
+plutil -insert ZednotesUpstreamRevision -string "$upstream_revision" "$info_plist"
+
+icon_source="$repository_root/crates/zed/resources/app-icon-dev@2x.png"
+[[ -f "$icon_source" ]] || fail "missing app icon source: $icon_source"
+iconset_directory="$temporary_directory/Zednotes.iconset"
+mkdir -p "$iconset_directory"
+
+create_icon() {
+	local filename=$1
+	local pixel_size=$2
+	sips --resampleHeightWidth "$pixel_size" "$pixel_size" "$icon_source" \
+		--out "$iconset_directory/$filename" >/dev/null
+}
+
+create_icon icon_16x16.png 16
+create_icon icon_16x16@2x.png 32
+create_icon icon_32x32.png 32
+create_icon icon_32x32@2x.png 64
+create_icon icon_128x128.png 128
+create_icon icon_128x128@2x.png 256
+create_icon icon_256x256.png 256
+create_icon icon_256x256@2x.png 512
+create_icon icon_512x512.png 512
+create_icon icon_512x512@2x.png 1024
+iconutil --convert icns "$iconset_directory" --output "$resources_directory/Zednotes.icns"
+
+plutil -lint "$info_plist" >/dev/null
+codesign --force --deep --sign - "$staged_bundle"
+codesign --verify --deep --strict "$staged_bundle"
+
+install_parent="$HOME/Applications"
+installed_bundle="$install_parent/Zednotes.app"
+mkdir -p "$install_parent"
+[[ "$installed_bundle" == "$HOME/Applications/Zednotes.app" ]] ||
+	fail "refusing to replace unexpected install path: $installed_bundle"
+rm -rf "$installed_bundle"
+ditto "$staged_bundle" "$installed_bundle"
+codesign --verify --deep --strict "$installed_bundle"
+
+printf 'Installed Zednotes %s at %s\n' "$application_version" "$installed_bundle"
+printf 'Source: %s%s\n' "$source_revision" "$(if [[ "$source_dirty" == true ]]; then printf '%s' ' (dirty)'; fi)"
+printf 'Zed base: %s\n' "$upstream_revision"
+
+if [[ "$open_after_install" == true ]]; then
+	printf 'Opening %s\n' "$installed_bundle"
+	open "$installed_bundle"
+fi

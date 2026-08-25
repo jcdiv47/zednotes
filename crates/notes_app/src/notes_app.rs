@@ -3027,7 +3027,9 @@ fn watch_configuration_files(fs: Arc<dyn Fs>, cx: &mut App) {
 
 /// Initializes the local-only services needed by the file-backed editor.
 pub fn init(session: Session, cx: &mut App) -> Result<Arc<AppState>> {
-    release_channel::init(Version::new(0, 1, 0), cx);
+    let version = Version::parse(env!("CARGO_PKG_VERSION"))
+        .expect("Cargo package version should be valid semver");
+    release_channel::init(version, cx);
     gpui_tokio::init(cx);
     settings::init(cx);
     theme_settings::init(LoadThemes::All(Box::new(Assets)), cx);

@@ -18,7 +18,7 @@ Run the app with `cargo run -p notes_app`. Use `./script/clippy` rather than `ca
 
 ## Release provenance
 
-Tag Zednotes releases as `vMAJOR.MINOR.PATCH`. The tagged commit records the exact source of every bundled Zed workspace crate; also record the Zednotes commit and upstream Zed base SHA, because local commits may patch generic Zed crates and a nominal Zed version alone is ambiguous. The tag's `Cargo.lock` pins third-party dependencies, and builds from a dirty worktree must be identified as non-reproducible.
+Tag Zednotes releases as `vMAJOR.MINOR.PATCH-zednotes` to avoid collisions with upstream Zed tags. The tagged commit records the exact source of every bundled Zed workspace crate; also record the Zednotes commit and upstream Zed base SHA, because local commits may patch generic Zed crates and a nominal Zed version alone is ambiguous. The tag's `Cargo.lock` pins third-party dependencies, and builds from a dirty worktree must be identified as non-reproducible.
 
 ## Inherited Zed agent rules
 

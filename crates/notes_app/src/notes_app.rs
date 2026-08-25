@@ -50,9 +50,9 @@ use serde::{Deserialize, Serialize};
 use session::{AppSession, Session};
 use settings::{
     AutosaveSetting, BufferLineHeight, CodeLens, CommandAliasTarget, DockSide, FontFamilyName,
-    KeybindSource, KeymapFile, KeymapFileLoadResult, ScrollbarDiagnostics, Settings as _,
-    SettingsStore, ShowDiagnostics, ShowMinimap, SoftWrap, ThemeAppearanceMode, ThemeName,
-    ThemeSelection, WordsCompletionMode,
+    KeybindSource, KeymapFile, KeymapFileLoadResult, RelativeLineNumbers, ScrollbarDiagnostics,
+    Settings as _, SettingsStore, ShowDiagnostics, ShowMinimap, SoftWrap, ThemeAppearanceMode,
+    ThemeName, ThemeSelection, WordsCompletionMode,
 };
 use theme::{ActiveTheme as _, GlobalTheme, LoadThemes};
 use util::ResultExt as _;
@@ -90,9 +90,11 @@ const INITIAL_SETTINGS_CONTENT: &str = r#"{
   // system, light, or dark
   "theme": "system",
   "vim_mode": true,
+  "relative_line_numbers": "disabled",
 
   "vim": {
     "leader": "space",
+    "toggle_relative_line_numbers": false,
   },
 
   "ui": {
@@ -286,6 +288,7 @@ struct AutosaveSettings {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct NotesVimSettings {
     leader: String,
+    toggle_relative_line_numbers: bool,
 }
 
 impl Default for AutosaveSettings {
@@ -301,6 +304,7 @@ impl Default for NotesVimSettings {
     fn default() -> Self {
         Self {
             leader: DEFAULT_VIM_LEADER.to_owned(),
+            toggle_relative_line_numbers: false,
         }
     }
 }
@@ -335,6 +339,7 @@ impl Default for ExplorerSettings {
 struct NotesSettings {
     theme: NotesTheme,
     vim_mode: bool,
+    relative_line_numbers: RelativeLineNumbers,
     vim: NotesVimSettings,
     ui: NotesUiSettings,
     editor: NotesEditorSettings,
@@ -348,6 +353,7 @@ impl Default for NotesSettings {
         Self {
             theme: NotesTheme::System,
             vim_mode: true,
+            relative_line_numbers: RelativeLineNumbers::Disabled,
             vim: NotesVimSettings::default(),
             ui: NotesUiSettings::default(),
             editor: NotesEditorSettings::default(),
@@ -865,6 +871,7 @@ impl PickerDelegate for RecentWorkspacePickerDelegate {
 struct NotesSettingsContent {
     theme: Option<NotesTheme>,
     vim_mode: Option<bool>,
+    relative_line_numbers: Option<RelativeLineNumbers>,
     vim: Option<NotesVimSettingsContent>,
     ui: Option<NotesUiSettingsContent>,
     editor: Option<NotesEditorSettingsContent>,
@@ -877,6 +884,7 @@ struct NotesSettingsContent {
 #[derive(Debug, Default, Deserialize)]
 struct NotesVimSettingsContent {
     leader: Option<String>,
+    toggle_relative_line_numbers: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -927,8 +935,14 @@ fn parse_notes_settings(content: &str) -> Result<NotesSettings> {
     let mut settings = NotesSettings::default();
     settings.theme = content.theme.unwrap_or(settings.theme);
     settings.vim_mode = content.vim_mode.unwrap_or(settings.vim_mode);
+    settings.relative_line_numbers = content
+        .relative_line_numbers
+        .unwrap_or(settings.relative_line_numbers);
     if let Some(vim) = content.vim {
         settings.vim.leader = vim.leader.unwrap_or(settings.vim.leader);
+        settings.vim.toggle_relative_line_numbers = vim
+            .toggle_relative_line_numbers
+            .unwrap_or(settings.vim.toggle_relative_line_numbers);
     }
     if let Some(ui) = content.ui {
         settings.ui.font_family = ui.font_family.unwrap_or(settings.ui.font_family);
@@ -1732,7 +1746,11 @@ fn apply_explorer_settings(settings: &ExplorerSettings, cx: &mut App) {
     });
 }
 
-fn apply_editor_settings(settings: &NotesEditorSettings, cx: &mut App) {
+fn apply_editor_settings(
+    settings: &NotesEditorSettings,
+    relative_line_numbers: RelativeLineNumbers,
+    cx: &mut App,
+) {
     cx.update_global::<SettingsStore, _>(|store, cx| {
         store.update_default_settings(cx, |content| {
             content.theme.buffer_font_family =
@@ -1741,6 +1759,7 @@ fn apply_editor_settings(settings: &NotesEditorSettings, cx: &mut App) {
                 Some(FontFamilyName::from(settings.font_family.clone()));
             content.theme.buffer_font_size = Some(settings.font_size.into());
             content.theme.buffer_line_height = Some(BufferLineHeight::Custom(settings.line_height));
+            content.editor.relative_line_numbers = Some(relative_line_numbers);
             content.editor.gutter.get_or_insert_default().line_numbers =
                 Some(settings.line_numbers);
             let gutter = content.editor.gutter.get_or_insert_default();
@@ -1881,7 +1900,7 @@ fn apply_notes_settings(settings: NotesSettings, cx: &mut App) {
         .is_some_and(|current| current.0.vim.leader != settings.vim.leader);
     apply_theme_setting(settings.theme, cx);
     apply_ui_settings(&settings.ui, cx);
-    apply_editor_settings(&settings.editor, cx);
+    apply_editor_settings(&settings.editor, settings.relative_line_numbers, cx);
     apply_explorer_settings(&settings.explorer, cx);
     apply_preview_settings(&settings.preview, cx);
     apply_autosave_settings(settings.autosave, cx);
@@ -1889,6 +1908,10 @@ fn apply_notes_settings(settings: NotesSettings, cx: &mut App) {
         store.update_default_settings(cx, |content| {
             content.vim_mode = Some(settings.vim_mode);
             content.helix_mode = Some(false);
+            content
+                .vim
+                .get_or_insert_default()
+                .toggle_relative_line_numbers = Some(settings.vim.toggle_relative_line_numbers);
             for (alias, target) in [
                 ("preview", "note::TogglePreview"),
                 ("explorer", "view::ToggleExplorer"),
@@ -3921,6 +3944,36 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_relative_line_number_settings_follow_vim_mode(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+        let mut settings = cx.update(|cx| cx.global::<CurrentNotesSettings>().0.clone());
+        settings.relative_line_numbers = RelativeLineNumbers::Enabled;
+        settings.vim.toggle_relative_line_numbers = true;
+
+        cx.update(|cx| apply_notes_settings(settings, cx));
+        test.cx.run_until_parked();
+        assert_eq!(
+            test.editor
+                .read_with(cx, |editor, cx| editor.relative_line_numbers(cx)),
+            RelativeLineNumbers::Enabled
+        );
+
+        test.cx.simulate_keystrokes("i");
+        assert_eq!(
+            test.editor
+                .read_with(cx, |editor, cx| editor.relative_line_numbers(cx)),
+            RelativeLineNumbers::Disabled
+        );
+
+        test.cx.simulate_keystrokes("escape");
+        assert_eq!(
+            test.editor
+                .read_with(cx, |editor, cx| editor.relative_line_numbers(cx)),
+            RelativeLineNumbers::Enabled
+        );
+    }
+
+    #[gpui::test]
     async fn test_notes_status_bar_tracks_counts_cursor_and_save_state(cx: &mut TestAppContext) {
         let mut test = test_window(cx).await;
         test.cx.run_until_parked();
@@ -4073,8 +4126,10 @@ mod tests {
             {
                 "theme": "dark",
                 "vim_mode": false,
+                "relative_line_numbers": "wrapped",
                 "vim": {
                     "leader": "ctrl-space",
+                    "toggle_relative_line_numbers": true,
                 },
                 "ui": {
                     "font_family": "Test Sans",
@@ -4101,7 +4156,9 @@ mod tests {
 
         assert_eq!(settings.theme, NotesTheme::Dark);
         assert!(!settings.vim_mode);
+        assert_eq!(settings.relative_line_numbers, RelativeLineNumbers::Wrapped);
         assert_eq!(settings.vim.leader, "ctrl-space");
+        assert!(settings.vim.toggle_relative_line_numbers);
         assert_eq!(settings.ui.font_family, "Test Sans");
         assert_eq!(settings.ui.font_size, 13.5);
         assert_eq!(settings.editor.font_family, "Test Mono");
@@ -4132,6 +4189,11 @@ mod tests {
         let settings = NotesSettings {
             theme: NotesTheme::Dark,
             vim_mode: false,
+            relative_line_numbers: RelativeLineNumbers::Wrapped,
+            vim: NotesVimSettings {
+                toggle_relative_line_numbers: true,
+                ..NotesVimSettings::default()
+            },
             ui: NotesUiSettings {
                 font_family: "Test Sans".to_owned(),
                 font_size: 13.0,
@@ -4164,6 +4226,8 @@ mod tests {
             line_height,
             theme_mode,
             line_numbers,
+            relative_line_numbers,
+            toggle_relative_line_numbers,
             soft_wrap,
             explorer_width,
             ui_font_family,
@@ -4185,6 +4249,12 @@ mod tests {
                 theme.buffer_line_height.value(),
                 theme.theme.mode(),
                 editor::EditorSettings::get_global(cx).gutter.line_numbers,
+                editor::EditorSettings::get_global(cx).relative_line_numbers,
+                cx.global::<SettingsStore>()
+                    .raw_default_settings()
+                    .vim
+                    .as_ref()
+                    .and_then(|vim| vim.toggle_relative_line_numbers),
                 language::language_settings::AllLanguageSettings::get_global(cx)
                     .defaults
                     .soft_wrap,
@@ -4223,6 +4293,8 @@ mod tests {
         assert_eq!(line_height, 1.4);
         assert_eq!(theme_mode, Some(ThemeAppearanceMode::Dark));
         assert!(line_numbers);
+        assert_eq!(relative_line_numbers, RelativeLineNumbers::Wrapped);
+        assert_eq!(toggle_relative_line_numbers, Some(true));
         assert_eq!(soft_wrap, SoftWrap::None);
         assert_eq!(explorer_width, px(320.0));
         assert_eq!(ui_font_family, "Test Sans");

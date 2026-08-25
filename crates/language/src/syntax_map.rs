@@ -1945,7 +1945,7 @@ impl Ord for ParseStep {
         let range_b = other.range();
         Ord::cmp(&other.depth, &self.depth)
             .then_with(|| Ord::cmp(&range_b.start, &range_a.start))
-            .then_with(|| Ord::cmp(&range_a.end, &range_b.end))
+            .then_with(|| Ord::cmp(&range_b.end, &range_a.end))
             .then_with(|| other.language.id().cmp(&self.language.id()))
     }
 }
@@ -2072,10 +2072,9 @@ impl SeekTarget<'_, SyntaxLayerSummary, SyntaxLayerSummary> for SyntaxLayerPosit
                     .cmp(&cursor_location.last_layer_range.start, buffer)
             })
             .then_with(|| {
-                cursor_location
-                    .last_layer_range
+                self.range
                     .end
-                    .cmp(&self.range.end, buffer)
+                    .cmp(&cursor_location.last_layer_range.end, buffer)
             })
             .then_with(|| self.language.cmp(&cursor_location.last_layer_language))
     }

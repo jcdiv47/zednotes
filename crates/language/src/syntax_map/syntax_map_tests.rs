@@ -995,6 +995,40 @@ fn test_combined_injection_with_leading_content_layer_ordering(cx: &mut App) {
 }
 
 #[gpui::test]
+fn test_combined_and_single_injections_with_equal_starts(cx: &mut App) {
+    // Markdown-Inline creates a combined HTML layer for the whole inline range.
+    // A leading LaTeX node creates a shorter sibling with the same start.
+    let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+    let markdown = markdown_lang();
+    let markdown_inline = Arc::new(
+        Language::new(
+            grammars::load_config("markdown-inline"),
+            Some(tree_sitter_md::INLINE_LANGUAGE.into()),
+        )
+        .with_queries(grammars::load_queries("markdown-inline"))
+        .unwrap(),
+    );
+    registry.add(markdown.clone());
+    registry.add(markdown_inline);
+    registry.add(Arc::new(html_lang()));
+
+    let mut buffer = Buffer::new(
+        ReplicaId::LOCAL,
+        BufferId::new(1).unwrap(),
+        "preceding paragraph\n\n$x$ followed by text".to_owned(),
+    );
+
+    let mut syntax_map = SyntaxMap::new(&buffer);
+    syntax_map.set_language_registry(registry);
+    syntax_map.reparse(markdown.clone(), &buffer);
+    assert!(syntax_map.contains_unknown_injections());
+
+    buffer.edit([(range_for_text(&buffer, "$x$"), "$xy$")]);
+    syntax_map.interpolate(&buffer);
+    syntax_map.reparse(markdown, &buffer);
+}
+
+#[gpui::test]
 fn test_comment_triggered_injection_toggle(cx: &mut App) {
     let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
 

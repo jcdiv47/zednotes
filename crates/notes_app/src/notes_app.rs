@@ -21,13 +21,16 @@ use db::kvp::KeyValueStore;
 use editor::{Editor, EditorEvent};
 use fs::{Fs, PathEventKind, RealFs};
 use futures::StreamExt as _;
+use git::GitHostingProviderRegistry;
+use git_ui::git_panel::GitPanel;
+use git_ui_core::worktree_picker::WorktreePicker;
 #[cfg(test)]
 use gpui::WindowHandle;
 use gpui::{
-    Action as _, AnyElement, App, AppContext as _, AsyncApp, BorrowAppContext as _, Bounds,
-    DismissEvent, Entity, Focusable as _, Global, KeyBinding, Keystroke, Menu, MenuItem, OsAction,
-    PathPromptOptions, Render, Subscription, SystemMenuType, Task, TaskExt as _, TitlebarOptions,
-    WeakEntity, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
+    Action as _, AnyElement, App, AppContext as _, AsyncApp, BorrowAppContext as _, Bounds, Entity,
+    Focusable as _, Global, KeyBinding, Keystroke, Menu, MenuItem, OsAction, PathPromptOptions,
+    Render, SharedString, Subscription, SystemMenuType, Task, TaskExt as _, TitlebarOptions,
+    WeakEntity, Window, WindowBounds, WindowOptions, actions, div, px, size,
 };
 use http_client::BlockedHttpClient;
 use image_viewer::ImageViewToolbarControls;
@@ -37,9 +40,14 @@ use language::{
 };
 use markdown_preview::markdown_preview_view::MarkdownPreviewView;
 use node_runtime::NodeRuntime;
+use outline_panel::OutlinePanel;
 use percent_encoding::percent_decode_str;
-use picker::{Picker, PickerDelegate};
-use project::Project;
+use platform_title_bar::PlatformTitleBar;
+use project::{
+    Project,
+    git_store::{GitStoreEvent, Repository},
+    linked_worktree_short_name,
+};
 use project_panel::{
     EntryFilter, Event as ProjectPanelEvent, ProjectPanel, ProjectPanelOptions,
     project_panel_settings::ProjectPanelSettings,
@@ -55,21 +63,29 @@ use settings::{
     ThemeName, ThemeSelection, WordsCompletionMode,
 };
 use theme::{ActiveTheme as _, GlobalTheme, LoadThemes};
+use ui::{
+    Button, ButtonStyle, Color, Icon, IconName, IconSize, Label, LabelSize, PopoverMenu, TintColor,
+    Tooltip, prelude::*,
+};
 use util::ResultExt as _;
 use vim::ModeIndicator;
 use workspace as zed_workspace;
+#[cfg(test)]
+use zed_workspace::dock::PanelButtons;
 use zed_workspace::{
-    AppState, CloseIntent, Event as WorkspaceEvent, ItemHandle as _, MultiWorkspace, OpenMode,
-    OpenOptions, OpenVisible, Pane, SaveIntent, SerializedWorkspaceLocation, SessionWorkspace,
-    SplitDirection, StatusBarSettings, StatusItemView, TabBarSettings, Toast, Workspace,
-    WorkspaceStore,
-    dock::{DockPosition, PanelButtons},
+    AppState, CloseIntent, Event as WorkspaceEvent, ItemHandle as _, MultiWorkspace, OpenOptions,
+    OpenVisible, Pane, SaveIntent, SessionWorkspace, SplitDirection, StatusBarSettings,
+    StatusItemView, TabBarSettings, Toast, Workspace, WorkspaceStore,
+    dock::DockPosition,
     item::SaveOptions,
     notifications::{DetachAndPromptErr as _, NotificationId},
     pane::Event as PaneEvent,
 };
 
 const APP_NAME: &str = "zednotes";
+const MAX_PROJECT_NAME_LENGTH: usize = 40;
+const MAX_BRANCH_NAME_LENGTH: usize = 40;
+const MAX_SHORT_SHA_LENGTH: usize = 8;
 const DEFAULT_MARKDOWN_SEARCH_FILTER: &str = "**/*.md, **/*.markdown";
 const DEFAULT_EXCLUDED_PATHS: &[&str] = &[".git", ".DS_Store", "node_modules", "target"];
 const DEFAULT_PREVIEW_MAX_WIDTH: u32 = 760;
@@ -436,6 +452,373 @@ fn note_statistics_message(text: &str) -> String {
     )
 }
 
+/// The subset of Zed's title bar that is useful in the local notes app.
+///
+/// Keeping this app-scoped avoids pulling collaboration, account, and updater
+/// controls into zednotes while preserving Zed's project and Git workflows.
+struct NotesTitleBar {
+    platform_title_bar: Entity<PlatformTitleBar>,
+    project: Entity<Project>,
+    workspace: WeakEntity<Workspace>,
+    multi_workspace: Option<WeakEntity<MultiWorkspace>>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl NotesTitleBar {
+    fn new(
+        workspace: &Workspace,
+        multi_workspace: Option<WeakEntity<MultiWorkspace>>,
+        cx: &mut gpui::Context<Self>,
+    ) -> Self {
+        let project = workspace.project().clone();
+        let git_store = project.read(cx).git_store().clone();
+        let mut subscriptions = vec![cx.observe(&project, |_, _, cx| cx.notify())];
+        subscriptions.push(cx.subscribe(&git_store, |_, _, event, cx| {
+            if matches!(
+                event,
+                GitStoreEvent::ActiveRepositoryChanged(_)
+                    | GitStoreEvent::RepositoryUpdated(_, _, true)
+            ) {
+                cx.notify();
+            }
+        }));
+        if let Some(workspace_entity) = workspace.weak_handle().upgrade() {
+            subscriptions.push(cx.observe(&workspace_entity, |_, _, cx| cx.notify()));
+        }
+
+        // zednotes' dock panels start below the title bar. Do not pass the
+        // multi-workspace through here: PlatformTitleBar would otherwise treat
+        // an open left dock as occupying the traffic-light area and remove the
+        // inset from the project switcher.
+        let platform_title_bar = cx.new(|cx| PlatformTitleBar::new("notes-title-bar", cx));
+
+        Self {
+            platform_title_bar,
+            project,
+            workspace: workspace.weak_handle(),
+            multi_workspace,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    fn effective_active_worktree(&self, cx: &App) -> Option<Entity<project::Worktree>> {
+        let project = self.project.read(cx);
+        if let Some(repository) = project.active_repository(cx) {
+            let repository_path = &repository.read(cx).work_directory_abs_path;
+            if let Some(worktree) = project.visible_worktrees(cx).find(|worktree| {
+                let worktree_path = worktree.read(cx).abs_path();
+                worktree_path == *repository_path
+                    || worktree_path.starts_with(repository_path.as_ref())
+            }) {
+                return Some(worktree);
+            }
+        }
+        project.visible_worktrees(cx).next()
+    }
+
+    fn repository_for_worktree(
+        &self,
+        worktree: &Entity<project::Worktree>,
+        cx: &App,
+    ) -> Option<Entity<Repository>> {
+        let project = self.project.read(cx);
+        let git_store = project.git_store().read(cx);
+        let worktree_path = worktree.read(cx).abs_path();
+        git_store
+            .repositories()
+            .values()
+            .filter(|repository| {
+                let repository_path = &repository.read(cx).work_directory_abs_path;
+                worktree_path == *repository_path
+                    || worktree_path.starts_with(repository_path.as_ref())
+            })
+            .max_by_key(|repository| {
+                repository
+                    .read(cx)
+                    .work_directory_abs_path
+                    .as_os_str()
+                    .len()
+            })
+            .cloned()
+    }
+
+    fn worktree_count(&self, cx: &App) -> usize {
+        self.project.read(cx).visible_worktrees(cx).count()
+    }
+
+    fn render_project_name(
+        &self,
+        project_name: Option<SharedString>,
+        cx: &mut gpui::Context<Self>,
+    ) -> AnyElement {
+        let workspace = self.workspace.clone();
+        let focus_handle = workspace
+            .upgrade()
+            .map(|workspace| workspace.read(cx).focus_handle(cx))
+            .unwrap_or_else(|| cx.focus_handle());
+        let project_groups = self
+            .multi_workspace
+            .as_ref()
+            .and_then(WeakEntity::upgrade)
+            .map(|multi_workspace| multi_workspace.read(cx).project_group_keys())
+            .unwrap_or_default();
+        let project_is_open = project_name.is_some();
+        let display_name = project_name
+            .as_ref()
+            .map(|name| util::truncate_and_trailoff(name, MAX_PROJECT_NAME_LENGTH))
+            .unwrap_or_else(|| "Open Recent Project".to_owned());
+
+        PopoverMenu::new("notes-recent-projects-menu")
+            .menu(move |window, cx| {
+                Some(recent_projects::RecentProjects::popover(
+                    workspace.clone(),
+                    project_groups.clone(),
+                    Some(false),
+                    focus_handle.clone(),
+                    window,
+                    cx,
+                ))
+            })
+            .trigger_with_tooltip(
+                Button::new("notes-project-name-trigger", display_name)
+                    .label_size(LabelSize::Small)
+                    .tab_index(0isize)
+                    .when(self.worktree_count(cx) > 1, |button| {
+                        button.end_icon(
+                            Icon::new(IconName::ChevronDown)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    })
+                    .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                    .when(!project_is_open, |button| button.color(Color::Muted)),
+                |_window, cx| {
+                    Tooltip::for_action("Switch Project", &zed_actions::OpenRecent::default(), cx)
+                },
+            )
+            .anchor(gpui::Anchor::TopLeft)
+            .into_any_element()
+    }
+
+    fn render_worktree_and_branch(
+        &self,
+        repository: Entity<Repository>,
+        linked_worktree_name: Option<SharedString>,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<AnyElement> {
+        let workspace = self.workspace.upgrade()?;
+        let (branch_name, icon_info, is_detached_head) = {
+            let repository = repository.read(cx);
+            let is_detached_head = repository.branch.is_none();
+            let branch_name = repository
+                .branch
+                .as_ref()
+                .map(|branch| util::truncate_and_trailoff(branch.name(), MAX_BRANCH_NAME_LENGTH))
+                .or_else(|| {
+                    repository.head_commit.as_ref().map(|commit| {
+                        commit
+                            .sha
+                            .chars()
+                            .take(MAX_SHORT_SHA_LENGTH)
+                            .collect::<String>()
+                    })
+                });
+            let status = repository.status_summary();
+            let tracked = status.index + status.worktree;
+            let icon_info = if status.conflict > 0 {
+                (IconName::Warning, Color::VersionControlConflict)
+            } else if tracked.modified > 0 {
+                (IconName::SquareDot, Color::VersionControlModified)
+            } else if tracked.added > 0 || status.untracked > 0 {
+                (IconName::SquarePlus, Color::VersionControlAdded)
+            } else if tracked.deleted > 0 {
+                (IconName::SquareMinus, Color::VersionControlDeleted)
+            } else {
+                (IconName::GitBranch, Color::Muted)
+            };
+            (branch_name, icon_info, is_detached_head)
+        };
+
+        let worktree_label = linked_worktree_name.unwrap_or_else(|| "main".into());
+        let (creation_in_progress, is_switch) = {
+            let creation = workspace.read(cx).active_worktree_creation();
+            (creation.label.clone(), creation.is_switch)
+        };
+        let is_creating = creation_in_progress.is_some();
+        let display_label: SharedString = match creation_in_progress {
+            Some(name) if is_switch => format!("Loading {name}…").into(),
+            Some(name) => format!("Creating {name}…").into(),
+            None => worktree_label.clone(),
+        };
+
+        let project = self.project.clone();
+        let workspace_handle = workspace.downgrade();
+        let worktree_button = PopoverMenu::new("notes-worktree-picker-menu")
+            .menu(move |window, cx| {
+                Some(cx.new(|cx| {
+                    WorktreePicker::new(project.clone(), workspace_handle.clone(), window, cx)
+                }))
+            })
+            .trigger_with_tooltip(
+                Button::new("notes-worktree-picker-trigger", display_label)
+                    .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                    .label_size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .tab_index(0isize)
+                    .loading(is_creating)
+                    .start_icon(
+                        Icon::new(IconName::GitWorktree)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                move |_window, cx| {
+                    Tooltip::with_meta(
+                        "Worktree",
+                        Some(&zed_actions::git::Worktree),
+                        format!("Currently In Use: {worktree_label}"),
+                        cx,
+                    )
+                },
+            )
+            .anchor(gpui::Anchor::TopLeft);
+
+        let effective_repository = Some(repository);
+        let branch_picker = branch_name.map(|branch_name| {
+            let tooltip_branch_name = branch_name.clone();
+            let (branch_icon, branch_icon_color) = icon_info;
+            let trigger = if is_detached_head {
+                Button::new("notes-project-branch-trigger", "Create Branch")
+                    .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                    .label_size(LabelSize::Small)
+                    .tab_index(0isize)
+                    .start_icon(
+                        Icon::new(IconName::GitBranchPlus)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+            } else {
+                Button::new("notes-project-branch-trigger", branch_name)
+                    .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                    .label_size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .tab_index(0isize)
+                    .start_icon(
+                        Icon::new(branch_icon)
+                            .size(IconSize::XSmall)
+                            .color(branch_icon_color),
+                    )
+            };
+            PopoverMenu::new("notes-branch-menu")
+                .menu(move |window, cx| {
+                    git_ui_core::build_branch_picker(
+                        workspace.downgrade(),
+                        effective_repository.clone(),
+                        window,
+                        cx,
+                    )
+                })
+                .trigger_with_tooltip(trigger, move |_window, cx| {
+                    let meta = if is_detached_head {
+                        format!("Detached HEAD: {tooltip_branch_name}")
+                    } else {
+                        format!("Currently Checked Out: {tooltip_branch_name}")
+                    };
+                    Tooltip::with_meta("Branch & Stash", Some(&zed_actions::git::Branch), meta, cx)
+                })
+                .anchor(gpui::Anchor::TopLeft)
+        });
+
+        Some(
+            h_flex()
+                .gap_px()
+                .child(worktree_button)
+                .when(branch_picker.is_some(), |row| {
+                    row.child(
+                        Label::new("/")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .alpha(0.25),
+                    )
+                })
+                .children(branch_picker)
+                .into_any_element(),
+        )
+    }
+}
+
+impl Render for NotesTitleBar {
+    fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        if self.multi_workspace.is_none()
+            && let Some(multi_workspace) = self
+                .workspace
+                .upgrade()
+                .and_then(|workspace| workspace.read(cx).multi_workspace().cloned())
+        {
+            self.multi_workspace = Some(multi_workspace);
+        }
+
+        let active_worktree = self.effective_active_worktree(cx);
+        let project_name = active_worktree.as_ref().and_then(|worktree| {
+            worktree
+                .read(cx)
+                .root_name()
+                .file_name()
+                .map(|name| SharedString::from(name.to_string()))
+        });
+        let repository = active_worktree
+            .as_ref()
+            .and_then(|worktree| self.repository_for_worktree(worktree, cx));
+        let linked_worktree_name = repository.as_ref().and_then(|repository| {
+            let repository = repository.read(cx);
+            repository
+                .main_worktree_abs_path()
+                .and_then(|main_worktree_path| {
+                    linked_worktree_short_name(
+                        main_worktree_path,
+                        repository.work_directory_abs_path.as_ref(),
+                    )
+                })
+                .or_else(|| {
+                    repository
+                        .is_linked_worktree()
+                        .then_some(project_name.clone())
+                        .flatten()
+                })
+        });
+
+        let controls = h_flex()
+            .h_full()
+            .gap_0p5()
+            .child(
+                div()
+                    .debug_selector(|| "notes-project-switcher".into())
+                    .child(self.render_project_name(project_name, cx)),
+            )
+            .children(repository.and_then(|repository| {
+                self.render_worktree_and_branch(repository, linked_worktree_name, cx)
+            }))
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .into_any_element();
+        self.platform_title_bar.update(cx, |title_bar, _| {
+            title_bar.set_children([controls]);
+        });
+        self.platform_title_bar.clone()
+    }
+}
+
+fn init_notes_title_bar(cx: &mut App) {
+    PlatformTitleBar::init(cx);
+    cx.observe_new(|workspace: &mut Workspace, window, cx| {
+        let Some(window) = window else {
+            return;
+        };
+        let title_bar =
+            cx.new(|cx| NotesTitleBar::new(workspace, workspace.multi_workspace().cloned(), cx));
+        workspace.set_titlebar_item(title_bar.into(), window, cx);
+    })
+    .detach();
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum NoteSaveState {
     #[default]
@@ -704,166 +1087,6 @@ impl Render for NotesEmptyState {
             .text_color(colors.text)
             .child(div().text_size(px(18.)).child(title))
             .child(div().text_color(colors.text_muted).child(shortcuts))
-    }
-}
-
-struct RecentWorkspacePickerDelegate {
-    workspace: WeakEntity<Workspace>,
-    workspaces: Vec<zed_workspace::RecentWorkspace>,
-    filtered_indices: Vec<usize>,
-    selected_index: usize,
-}
-
-impl RecentWorkspacePickerDelegate {
-    fn new(
-        workspace: WeakEntity<Workspace>,
-        workspaces: Vec<zed_workspace::RecentWorkspace>,
-    ) -> Self {
-        let filtered_indices = (0..workspaces.len()).collect();
-        Self {
-            workspace,
-            workspaces,
-            filtered_indices,
-            selected_index: 0,
-        }
-    }
-
-    fn workspace_label(workspace: &zed_workspace::RecentWorkspace) -> String {
-        workspace
-            .identity_paths
-            .ordered_paths()
-            .next()
-            .or_else(|| workspace.paths.ordered_paths().next())
-            .and_then(|path| path.file_name())
-            .map_or_else(
-                || "Notes Folder".to_owned(),
-                |name| name.to_string_lossy().into_owned(),
-            )
-    }
-
-    fn workspace_path(workspace: &zed_workspace::RecentWorkspace) -> String {
-        workspace
-            .paths
-            .ordered_paths()
-            .map(|path| path.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" · ")
-    }
-}
-
-impl PickerDelegate for RecentWorkspacePickerDelegate {
-    type ListItem = AnyElement;
-
-    fn name() -> &'static str {
-        "notes recent workspaces"
-    }
-
-    fn match_count(&self) -> usize {
-        self.filtered_indices.len()
-    }
-
-    fn selected_index(&self) -> usize {
-        self.selected_index
-    }
-
-    fn set_selected_index(
-        &mut self,
-        index: usize,
-        _window: &mut Window,
-        cx: &mut gpui::Context<Picker<Self>>,
-    ) {
-        self.selected_index = index.min(self.filtered_indices.len().saturating_sub(1));
-        cx.notify();
-    }
-
-    fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Search recent notes folders…".into()
-    }
-
-    fn update_matches(
-        &mut self,
-        query: String,
-        _window: &mut Window,
-        cx: &mut gpui::Context<Picker<Self>>,
-    ) -> Task<()> {
-        let query = query.to_lowercase();
-        self.filtered_indices = self
-            .workspaces
-            .iter()
-            .enumerate()
-            .filter_map(|(index, workspace)| {
-                let label = Self::workspace_label(workspace).to_lowercase();
-                let path = Self::workspace_path(workspace).to_lowercase();
-                (query.is_empty() || label.contains(&query) || path.contains(&query))
-                    .then_some(index)
-            })
-            .collect();
-        self.selected_index = self
-            .selected_index
-            .min(self.filtered_indices.len().saturating_sub(1));
-        cx.notify();
-        Task::ready(())
-    }
-
-    fn confirm(
-        &mut self,
-        _secondary: bool,
-        window: &mut Window,
-        cx: &mut gpui::Context<Picker<Self>>,
-    ) {
-        let Some(workspace_index) = self.filtered_indices.get(self.selected_index).copied() else {
-            return;
-        };
-        let Some(recent_workspace) = self.workspaces.get(workspace_index) else {
-            return;
-        };
-        let paths = recent_workspace.paths.paths().to_vec();
-        if let Some(workspace) = self.workspace.upgrade() {
-            workspace
-                .update(cx, |workspace, cx| {
-                    workspace.open_workspace_for_paths(OpenMode::Activate, paths, window, cx)
-                })
-                .detach_and_log_err(cx);
-        }
-        cx.emit(DismissEvent);
-    }
-
-    fn dismissed(&mut self, _window: &mut Window, cx: &mut gpui::Context<Picker<Self>>) {
-        cx.emit(DismissEvent);
-    }
-
-    fn render_match(
-        &self,
-        index: usize,
-        selected: bool,
-        _window: &mut Window,
-        cx: &mut gpui::Context<Picker<Self>>,
-    ) -> Option<Self::ListItem> {
-        let workspace_index = self.filtered_indices.get(index).copied()?;
-        let workspace = self.workspaces.get(workspace_index)?;
-        let colors = cx.theme().colors();
-        Some(
-            div()
-                .id(("recent-workspace", index))
-                .w_full()
-                .px_3()
-                .py_2()
-                .rounded_sm()
-                .when(selected, |element| element.bg(colors.element_selected))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(Self::workspace_label(workspace))
-                        .child(
-                            div()
-                                .text_color(colors.text_muted)
-                                .child(Self::workspace_path(workspace)),
-                        ),
-                )
-                .into_any_element(),
-        )
     }
 }
 
@@ -1615,7 +1838,7 @@ fn notes_menus() -> Vec<Menu> {
         Menu::new("File").items([
             MenuItem::action("New Note…", New),
             MenuItem::action("Open Folder…", OpenFolder),
-            MenuItem::action("Open Recent Folder…", OpenRecentWorkspace),
+            MenuItem::action("Switch Project…", OpenRecentWorkspace),
             MenuItem::separator(),
             MenuItem::action("Save", zed_workspace::Save { save_intent: None }),
             MenuItem::action("Save All", zed_workspace::SaveAll { save_intent: None }),
@@ -1643,6 +1866,7 @@ fn notes_menus() -> Vec<Menu> {
         ]),
         Menu::new("View").items([
             MenuItem::action("Toggle Explorer", ToggleExplorer),
+            MenuItem::action("Toggle Git Panel", zed_actions::git_panel::ToggleFocus),
             MenuItem::action("Toggle Preview", TogglePreview),
             MenuItem::action("Toggle Focus Mode", ToggleFocusMode),
             MenuItem::separator(),
@@ -1674,6 +1898,7 @@ fn init_editor_subsystems(cx: &mut App) -> Result<()> {
     zed_actions::init();
     command_palette::init(cx);
     editor::init(cx);
+    language_model::init(cx);
     file_finder::init_with_file_filter_file_creation_and_history_ranker(
         Arc::new(is_markdown_path),
         false,
@@ -1681,9 +1906,14 @@ fn init_editor_subsystems(cx: &mut App) -> Result<()> {
         cx,
     );
     image_viewer::init(cx);
+    GitHostingProviderRegistry::default_global(cx);
+    git_hosting_providers::init(cx);
+    git_ui::init(cx);
     markdown_preview::init(cx);
+    outline_panel::init(cx);
     project_panel::init(cx);
     search::init(cx);
+    init_notes_title_bar(cx);
     vim::init(cx);
     // Vim activates its settings observer at the end of this effect cycle, so
     // reapply the configured mode after that observer is live.
@@ -1770,7 +2000,7 @@ fn apply_editor_settings(
             let minimap = content.editor.minimap.get_or_insert_default();
             minimap.show = Some(ShowMinimap::Never);
             let scrollbar = content.editor.scrollbar.get_or_insert_default();
-            scrollbar.git_diff = Some(false);
+            scrollbar.git_diff = Some(true);
             scrollbar.diagnostics = Some(ScrollbarDiagnostics::None);
             let toolbar = content.editor.toolbar.get_or_insert_default();
             toolbar.breadcrumbs = Some(false);
@@ -1816,11 +2046,15 @@ fn apply_editor_settings(
                 .get_or_insert_default()
                 .enabled = Some(false);
             let tabs = content.tabs.get_or_insert_default();
-            tabs.git_status = Some(false);
+            tabs.git_status = Some(true);
             tabs.show_diagnostics = Some(ShowDiagnostics::Off);
             let project_panel = content.project_panel.get_or_insert_default();
-            project_panel.git_status = Some(false);
+            project_panel.git_status = Some(true);
             project_panel.show_diagnostics = Some(ShowDiagnostics::Off);
+            content.git_panel.get_or_insert_default().dock = Some(DockPosition::Left.into());
+            let outline_panel = content.outline_panel.get_or_insert_default();
+            outline_panel.button = Some(true);
+            outline_panel.dock = Some(DockSide::Left);
             let status_bar = content.status_bar.get_or_insert_default();
             status_bar.show_active_file = Some(false);
             status_bar.active_language_button = Some(false);
@@ -1831,7 +2065,7 @@ fn apply_editor_settings(
                 .get_or_insert_default()
                 .enabled
                 .get_or_insert_default()
-                .disable_git = Some(true);
+                .disable_git = Some(false);
         });
     });
 }
@@ -2483,34 +2717,26 @@ fn dispatch_project_panel_action(
     }
 }
 
-fn open_recent_workspace_picker(
+fn open_recent_projects(
     workspace: &mut Workspace,
+    create_new_window: Option<bool>,
     window: &mut Window,
     cx: &mut gpui::Context<Workspace>,
 ) {
-    let database = zed_workspace::WorkspaceDb::global(cx);
-    let fs = workspace.app_state().fs.clone();
-    let workspace_handle = cx.entity().downgrade();
-    cx.spawn_in(window, async move |workspace, cx| {
-        let recent_workspaces = database
-            .recent_project_workspaces(fs.as_ref())
-            .await?
-            .into_iter()
-            .filter(|workspace| matches!(workspace.location, SerializedWorkspaceLocation::Local))
-            .collect::<Vec<_>>();
-        workspace.update_in(cx, |workspace, window, cx| {
-            workspace.toggle_modal(window, cx, |window, cx| {
-                Picker::uniform_list(
-                    RecentWorkspacePickerDelegate::new(workspace_handle, recent_workspaces),
-                    window,
-                    cx,
-                )
-                .show_scrollbar(true)
-            });
-        })?;
-        anyhow::Ok(())
-    })
-    .detach_and_log_err(cx);
+    let project_groups = workspace
+        .multi_workspace()
+        .and_then(|multi_workspace| multi_workspace.upgrade())
+        .map(|multi_workspace| multi_workspace.read(cx).project_group_keys())
+        .unwrap_or_default();
+    let focus_handle = workspace.focus_handle(cx);
+    recent_projects::RecentProjects::open(
+        workspace,
+        create_new_window,
+        project_groups,
+        window,
+        focus_handle,
+        cx,
+    );
 }
 
 fn open_settings_file(
@@ -2584,7 +2810,10 @@ fn init_workspace_composition(
             }
         });
         workspace.register_action(|workspace, _: &OpenRecentWorkspace, window, cx| {
-            open_recent_workspace_picker(workspace, window, cx);
+            open_recent_projects(workspace, Some(false), window, cx);
+        });
+        workspace.register_action(|workspace, action: &zed_actions::OpenRecent, window, cx| {
+            open_recent_projects(workspace, action.create_new_window, window, cx);
         });
         workspace.register_action(|_, _: &OpenRecentNote, window, cx| {
             window.dispatch_action(
@@ -2676,7 +2905,7 @@ fn init_workspace_composition(
         let panel_task = cx.spawn_in(window, {
             let entry_filter = entry_filter.clone();
             async move |workspace, cx| {
-                let panel = ProjectPanel::load_with_options(
+                let project_panel = ProjectPanel::load_with_options(
                     workspace.clone(),
                     ProjectPanelOptions {
                         entry_filter: Some(entry_filter),
@@ -2686,8 +2915,10 @@ fn init_workspace_composition(
                     cx.clone(),
                 )
                 .await?;
+                let git_panel = GitPanel::load(workspace.clone(), cx.clone()).await?;
+                let outline_panel = OutlinePanel::load(workspace.clone(), cx.clone()).await?;
                 workspace.update_in(cx, |workspace, window, cx| {
-                    cx.subscribe_in(&panel, window, |workspace, _, event, _, cx| {
+                    cx.subscribe_in(&project_panel, window, |workspace, _, event, _, cx| {
                         let message = match event {
                             ProjectPanelEvent::EntryCreated {
                                 project_path,
@@ -2721,7 +2952,9 @@ fn init_workspace_composition(
                         }
                     })
                     .detach();
-                    workspace.add_panel(panel, window, cx);
+                    workspace.add_panel(project_panel, window, cx);
+                    workspace.add_panel(git_panel, window, cx);
+                    workspace.add_panel(outline_panel, window, cx);
                     workspace.finish_dock_restoration(cx);
                 })?;
                 anyhow::Ok(())
@@ -2868,9 +3101,6 @@ fn configure_workspace(
     })
     .detach();
     workspace.status_bar().update(cx, |status_bar, cx| {
-        while let Some(position) = status_bar.position_of_item::<PanelButtons>() {
-            status_bar.remove_item_at(position, cx);
-        }
         let details = cx.new(|_| NotesStatusDetails::new());
         let cursor = cx.new(|cx| NotesCursorStatus::new(details.clone(), cx));
         let mode_indicator = cx.new(|cx| ModeIndicator::new(window, cx));
@@ -2967,10 +3197,11 @@ fn notes_window_options(_display: Option<uuid::Uuid>, cx: &mut App) -> WindowOpt
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {
-            title: Some(APP_NAME.into()),
-            appears_transparent: false,
-            traffic_light_position: None,
+            title: None,
+            appears_transparent: true,
+            traffic_light_position: Some(gpui::point(px(9.), px(9.))),
         }),
+        app_owns_titlebar_drag: true,
         window_min_size: Some(size(px(480.), px(360.))),
         ..Default::default()
     }
@@ -3428,16 +3659,17 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_notes_windows_keep_the_native_macos_titlebar(cx: &mut TestAppContext) {
+    fn test_notes_windows_embed_controls_in_the_macos_titlebar(cx: &mut TestAppContext) {
         let titlebar = cx
             .update(|cx| notes_window_options(None, cx))
             .titlebar
             .expect("a notes window must have a titlebar");
 
         assert!(
-            !titlebar.appears_transparent,
-            "the traffic lights must be drawn by macOS, not by us"
+            titlebar.appears_transparent,
+            "project and Git controls should share the macOS titlebar"
         );
+        assert!(titlebar.title.is_none());
     }
 
     #[test]
@@ -3570,7 +3802,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_recent_note_and_workspace_pickers_open(cx: &mut TestAppContext) {
+    async fn test_recent_note_and_project_pickers_open(cx: &mut TestAppContext) {
         let mut test = test_window(cx).await;
 
         test.cx.simulate_keystrokes("cmd-e");
@@ -3590,9 +3822,18 @@ mod tests {
         test.cx.run_until_parked();
         assert!(
             workspace(&test, cx).read_with(cx, |workspace, cx| workspace
-                .active_modal::<Picker<RecentWorkspacePickerDelegate>>(cx)
+                .active_modal::<recent_projects::RecentProjects>(cx)
                 .is_some()),
-            "Workspace: Open Recent should open the recent-workspace picker"
+            "Workspace: Open Recent should open Zed's recent-projects picker"
+        );
+        test.cx.simulate_keystrokes("escape");
+        test.cx.simulate_keystrokes("alt-cmd-o");
+        test.cx.run_until_parked();
+        assert!(
+            workspace(&test, cx).read_with(cx, |workspace, cx| workspace
+                .active_modal::<recent_projects::RecentProjects>(cx)
+                .is_some()),
+            "Zed's default project-switcher shortcut should remain available"
         );
     }
 
@@ -3672,7 +3913,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    OpenMode::Activate,
+                    zed_workspace::OpenMode::Activate,
                     cx,
                 )
             })
@@ -3977,13 +4218,55 @@ mod tests {
     async fn test_notes_status_bar_tracks_counts_cursor_and_save_state(cx: &mut TestAppContext) {
         let mut test = test_window(cx).await;
         test.cx.run_until_parked();
-        let status_bar =
-            workspace(&test, cx).read_with(cx, |workspace, _| workspace.status_bar().clone());
+        test.cx.update(|window, cx| window.draw(cx).clear(cx));
+        let project_switcher_bounds = test
+            .cx
+            .debug_bounds("notes-project-switcher")
+            .expect("the project switcher should be rendered in the title bar");
+        assert!(
+            project_switcher_bounds.origin.x >= px(ui::utils::TRAFFIC_LIGHT_PADDING),
+            "the project switcher should start after the macOS traffic lights"
+        );
+        let workspace = workspace(&test, cx);
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(
+                workspace
+                    .titlebar_item()
+                    .is_some_and(|item| item.downcast::<NotesTitleBar>().is_ok()),
+                "notes workspaces should install the project and Git title bar"
+            );
+            assert!(workspace.panel::<ProjectPanel>(cx).is_some());
+            assert!(workspace.panel::<GitPanel>(cx).is_some());
+            assert!(workspace.panel::<OutlinePanel>(cx).is_some());
+            let left_dock = workspace.left_dock().read(cx);
+            assert_eq!(left_dock.panel_index_for_type::<ProjectPanel>(), Some(0));
+            assert_eq!(left_dock.panel_index_for_type::<GitPanel>(), Some(1));
+            assert_eq!(left_dock.panel_index_for_type::<OutlinePanel>(), Some(2));
+            assert!(
+                workspace
+                    .right_dock()
+                    .read(cx)
+                    .panel::<GitPanel>()
+                    .is_none()
+            );
+            assert!(
+                workspace
+                    .right_dock()
+                    .read(cx)
+                    .panel::<OutlinePanel>()
+                    .is_none()
+            );
+        });
+        let status_bar = workspace.read_with(cx, |workspace, _| workspace.status_bar().clone());
         let details = status_bar.read_with(cx, |status_bar, _| {
-            assert_eq!(status_bar.position_of_item::<ModeIndicator>(), Some(0));
-            assert_eq!(status_bar.position_of_item::<NotesStatusDetails>(), Some(1));
-            assert_eq!(status_bar.position_of_item::<NotesCursorStatus>(), Some(2));
-            assert!(status_bar.item_of_type::<PanelButtons>().is_none());
+            assert!(status_bar.item_of_type::<PanelButtons>().is_some());
+            assert!(status_bar.position_of_item::<ModeIndicator>().is_some());
+            assert!(
+                status_bar
+                    .position_of_item::<NotesStatusDetails>()
+                    .is_some()
+            );
+            assert!(status_bar.position_of_item::<NotesCursorStatus>().is_some());
             status_bar
                 .item_of_type::<NotesStatusDetails>()
                 .expect("notes details should be on the right")
@@ -4306,8 +4589,11 @@ mod tests {
         assert_eq!(word_completions, WordsCompletionMode::Disabled);
         assert!(!lsp_completions);
         assert!(!language_server);
-        assert!(!git_status);
-        assert!(!git_diff);
+        assert!(git_status);
+        assert!(git_diff);
+        assert!(workspace(&test, cx).read_with(cx, |workspace, cx| {
+            workspace.panel::<GitPanel>(cx).is_some()
+        }));
 
         test.cx.simulate_keystrokes("x");
         assert_eq!(

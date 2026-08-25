@@ -30,6 +30,7 @@ use gpui::{
     WeakEntity, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
 };
 use http_client::BlockedHttpClient;
+use image_viewer::ImageViewToolbarControls;
 use language::{
     Buffer, BufferEvent, Capability, DiskState, Language, LanguageConfig, LanguageMatcher,
     LanguageRegistry,
@@ -1665,6 +1666,7 @@ fn init_editor_subsystems(cx: &mut App) -> Result<()> {
         Arc::new(recent_note_score),
         cx,
     );
+    image_viewer::init(cx);
     markdown_preview::init(cx);
     project_panel::init(cx);
     search::init(cx);
@@ -2909,6 +2911,8 @@ fn configure_pane(
             toolbar.add_item(buffer_search_bar, window, cx);
             let project_search_bar = cx.new(|_| ProjectSearchBar::new());
             toolbar.add_item(project_search_bar, window, cx);
+            let image_view_toolbar = cx.new(|_| ImageViewToolbarControls::new());
+            toolbar.add_item(image_view_toolbar, window, cx);
         });
     });
     cx.subscribe_in(pane, window, |workspace, _, event, window, cx| {
@@ -2926,7 +2930,7 @@ fn configure_pane(
                             .read(cx)
                             .absolute_path(&project_path, cx)
                     });
-                if let Some(active_path) = active_path {
+                if let Some(active_path) = active_path.filter(|path| is_markdown_path(path)) {
                     record_recent_note(active_path, cx);
                 }
             }
@@ -3139,6 +3143,7 @@ mod tests {
     use editor::{DisplayPoint, SelectionEffects, display_map::DisplayRow};
     use fs::FakeFs;
     use gpui::{Modifiers, TestAppContext, VisualTestContext, point};
+    use image_viewer::ImageView;
     use project::ProjectPath;
     use serde_json::{Value, json};
     use settings::SettingsStore;
@@ -5379,6 +5384,107 @@ mod tests {
                 .count()),
             0
         );
+    }
+
+    #[gpui::test]
+    async fn test_opens_png_and_jpeg_in_image_tabs_but_svg_as_text(cx: &mut TestAppContext) {
+        let test = test_window_with(
+            cx,
+            ExplorerSettings {
+                markdown_only: false,
+                ..ExplorerSettings::default()
+            },
+            json!({ "spike.md": TEST_NOTE }),
+            TEST_NOTE_PATH,
+        )
+        .await;
+        test.fs
+            .insert_file(
+                "/notes/pixel.png",
+                vec![
+                    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49,
+                    0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06,
+                    0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44,
+                    0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D,
+                    0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42,
+                    0x60, 0x82,
+                ],
+            )
+            .await;
+        test.fs
+            .insert_file(
+                "/notes/photo.jpg",
+                include_bytes!("../../gpui/examples/image/exif-orientation-rotate-180.jpg")
+                    .to_vec(),
+            )
+            .await;
+        test.fs
+            .insert_file(
+                "/notes/diagram.svg",
+                br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="40" height="20"/></svg>"#
+                    .to_vec(),
+            )
+            .await;
+        cx.run_until_parked();
+
+        for path in ["/notes/pixel.png", "/notes/photo.jpg"] {
+            test.window
+                .update(cx, |multi_workspace, window, cx| {
+                    multi_workspace.workspace().update(cx, |workspace, cx| {
+                        workspace.open_abs_path(
+                            PathBuf::from(path),
+                            OpenOptions::default(),
+                            window,
+                            cx,
+                        )
+                    })
+                })
+                .expect("failed to schedule image open")
+                .await
+                .unwrap_or_else(|error| panic!("failed to open {path}: {error:#}"));
+            cx.run_until_parked();
+
+            test.window
+                .read_with(cx, |multi_workspace, cx| {
+                    assert!(
+                        multi_workspace
+                            .workspace()
+                            .read(cx)
+                            .active_item_as::<ImageView>(cx)
+                            .is_some(),
+                        "{path} should open in an image tab"
+                    );
+                })
+                .expect("failed to inspect image tab");
+        }
+
+        let svg_path = "/notes/diagram.svg";
+        test.window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    workspace.open_abs_path(
+                        PathBuf::from(svg_path),
+                        OpenOptions::default(),
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .expect("failed to schedule SVG open")
+            .await
+            .unwrap_or_else(|error| panic!("failed to open {svg_path}: {error:#}"));
+        cx.run_until_parked();
+
+        test.window
+            .read_with(cx, |multi_workspace, cx| {
+                let workspace = multi_workspace.workspace().read(cx);
+                assert!(workspace.active_item_as::<ImageView>(cx).is_none());
+                assert!(
+                    workspace.active_item_as::<Editor>(cx).is_some(),
+                    "SVG should open as text, matching Zed"
+                );
+            })
+            .expect("failed to inspect SVG tab");
     }
 
     #[gpui::test]

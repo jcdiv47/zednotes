@@ -11288,6 +11288,7 @@ dependencies = [
  "gpui_tokio",
  "grammars",
  "http_client",
+ "image_viewer",
  "language",
  "log",
  "markdown_preview",

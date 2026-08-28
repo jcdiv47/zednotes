@@ -100,6 +100,7 @@ const DEFAULT_UI_FONT_SIZE: f32 = 14.0;
 const DEFAULT_PREVIEW_FONT_FAMILY: &str = ".SystemUIFont";
 const DEFAULT_PREVIEW_FONT_SIZE: f32 = 16.0;
 const DEFAULT_VIM_LEADER: &str = "space";
+const DEFAULT_WHICH_KEY_DELAY_MS: u64 = 500;
 const RECENT_NOTES_KEY: &str = "notes_recent_usage";
 const MAX_RECENT_NOTES: usize = 512;
 const INITIAL_SETTINGS_CONTENT: &str = r#"{
@@ -111,6 +112,11 @@ const INITIAL_SETTINGS_CONTENT: &str = r#"{
   "vim": {
     "leader": "space",
     "toggle_relative_line_numbers": false,
+  },
+
+  "which_key": {
+    "enabled": true,
+    "delay_ms": 500,
   },
 
   "ui": {
@@ -307,6 +313,12 @@ struct NotesVimSettings {
     toggle_relative_line_numbers: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NotesWhichKeySettings {
+    enabled: bool,
+    delay_ms: u64,
+}
+
 impl Default for AutosaveSettings {
     fn default() -> Self {
         Self {
@@ -321,6 +333,15 @@ impl Default for NotesVimSettings {
         Self {
             leader: DEFAULT_VIM_LEADER.to_owned(),
             toggle_relative_line_numbers: false,
+        }
+    }
+}
+
+impl Default for NotesWhichKeySettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            delay_ms: DEFAULT_WHICH_KEY_DELAY_MS,
         }
     }
 }
@@ -357,6 +378,7 @@ struct NotesSettings {
     vim_mode: bool,
     relative_line_numbers: RelativeLineNumbers,
     vim: NotesVimSettings,
+    which_key: NotesWhichKeySettings,
     ui: NotesUiSettings,
     editor: NotesEditorSettings,
     autosave: AutosaveSettings,
@@ -371,6 +393,7 @@ impl Default for NotesSettings {
             vim_mode: true,
             relative_line_numbers: RelativeLineNumbers::Disabled,
             vim: NotesVimSettings::default(),
+            which_key: NotesWhichKeySettings::default(),
             ui: NotesUiSettings::default(),
             editor: NotesEditorSettings::default(),
             autosave: AutosaveSettings::default(),
@@ -1096,6 +1119,7 @@ struct NotesSettingsContent {
     vim_mode: Option<bool>,
     relative_line_numbers: Option<RelativeLineNumbers>,
     vim: Option<NotesVimSettingsContent>,
+    which_key: Option<NotesWhichKeySettingsContent>,
     ui: Option<NotesUiSettingsContent>,
     editor: Option<NotesEditorSettingsContent>,
     autosave: Option<AutosaveSettingsContent>,
@@ -1108,6 +1132,12 @@ struct NotesSettingsContent {
 struct NotesVimSettingsContent {
     leader: Option<String>,
     toggle_relative_line_numbers: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct NotesWhichKeySettingsContent {
+    enabled: Option<bool>,
+    delay_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1166,6 +1196,10 @@ fn parse_notes_settings(content: &str) -> Result<NotesSettings> {
         settings.vim.toggle_relative_line_numbers = vim
             .toggle_relative_line_numbers
             .unwrap_or(settings.vim.toggle_relative_line_numbers);
+    }
+    if let Some(which_key) = content.which_key {
+        settings.which_key.enabled = which_key.enabled.unwrap_or(settings.which_key.enabled);
+        settings.which_key.delay_ms = which_key.delay_ms.unwrap_or(settings.which_key.delay_ms);
     }
     if let Some(ui) = content.ui {
         settings.ui.font_family = ui.font_family.unwrap_or(settings.ui.font_family);
@@ -1668,6 +1702,18 @@ fn notes_vim_key_bindings(leader: &str) -> Vec<KeyBinding> {
             zed_workspace::CloseActiveItem::default(),
             CONTEXT,
         ),
+        KeyBinding::new(&keys("b b"), tab_switcher::ToggleAll, CONTEXT),
+        KeyBinding::new(&keys("o"), zed_actions::outline::ToggleOutline, CONTEXT),
+        KeyBinding::new(&keys("m m"), editor::actions::ToggleBookmark, CONTEXT),
+        KeyBinding::new(
+            &keys("m l"),
+            editor::actions::ToggleBookmarkWithLabel,
+            CONTEXT,
+        ),
+        KeyBinding::new(&keys("m e"), editor::actions::EditBookmark, CONTEXT),
+        KeyBinding::new(&keys("m n"), editor::actions::GoToNextBookmark, CONTEXT),
+        KeyBinding::new(&keys("m p"), editor::actions::GoToPreviousBookmark, CONTEXT),
+        KeyBinding::new(&keys("m v"), editor::actions::ViewBookmarks, CONTEXT),
         KeyBinding::new(&keys("w h"), zed_workspace::ActivatePaneLeft, CONTEXT),
         KeyBinding::new(&keys("w j"), zed_workspace::ActivatePaneDown, CONTEXT),
         KeyBinding::new(&keys("w k"), zed_workspace::ActivatePaneUp, CONTEXT),
@@ -1900,6 +1946,9 @@ fn notes_menus() -> Vec<Menu> {
         Menu::new("Go").items([
             MenuItem::action("Quick Open…", zed_workspace::ToggleFileFinder::default()),
             MenuItem::action("Open Recent Note…", OpenRecentNote),
+            MenuItem::action("Switch Open Note…", tab_switcher::ToggleAll),
+            MenuItem::action("Outline…", zed_actions::outline::ToggleOutline),
+            MenuItem::action("View Bookmarks", editor::actions::ViewBookmarks),
             MenuItem::separator(),
             MenuItem::action("Back", zed_workspace::GoBack),
             MenuItem::action("Forward", zed_workspace::GoForward),
@@ -1931,11 +1980,14 @@ fn init_editor_subsystems(cx: &mut App) -> Result<()> {
     git_hosting_providers::init(cx);
     git_ui::init(cx);
     markdown_preview::init(cx);
+    outline::init(cx);
     outline_panel::init(cx);
     project_panel::init(cx);
     search::init(cx);
+    tab_switcher::init(cx);
     init_notes_title_bar(cx);
     vim::init(cx);
+    which_key::init(cx);
     // Vim activates its settings observer at the end of this effect cycle, so
     // reapply the configured mode after that observer is live.
     cx.defer(|cx| {
@@ -2149,6 +2201,16 @@ fn apply_autosave_settings(settings: AutosaveSettings, cx: &mut App) {
     });
 }
 
+fn apply_which_key_settings(settings: NotesWhichKeySettings, cx: &mut App) {
+    cx.update_global::<SettingsStore, _>(|store, cx| {
+        store.update_default_settings(cx, |content| {
+            let which_key = content.which_key.get_or_insert_default();
+            which_key.enabled = Some(settings.enabled);
+            which_key.delay_ms = Some(settings.delay_ms);
+        });
+    });
+}
+
 fn apply_notes_settings(settings: NotesSettings, cx: &mut App) {
     let leader_changed = cx
         .try_global::<CurrentNotesSettings>()
@@ -2159,6 +2221,7 @@ fn apply_notes_settings(settings: NotesSettings, cx: &mut App) {
     apply_explorer_settings(&settings.explorer, cx);
     apply_preview_settings(&settings.preview, cx);
     apply_autosave_settings(settings.autosave, cx);
+    apply_which_key_settings(settings.which_key, cx);
     cx.update_global::<SettingsStore, _>(|store, cx| {
         store.update_default_settings(cx, |content| {
             content.vim_mode = Some(settings.vim_mode);
@@ -4581,6 +4644,36 @@ mod tests {
     }
 
     #[test]
+    fn test_parses_which_key_settings_from_jsonc() {
+        assert_eq!(
+            parse_notes_settings("{}")
+                .expect("default settings should parse")
+                .which_key,
+            NotesWhichKeySettings {
+                enabled: true,
+                delay_ms: DEFAULT_WHICH_KEY_DELAY_MS,
+            }
+        );
+
+        assert_eq!(
+            parse_notes_settings(
+                r#"{
+                    "which_key": {
+                        "enabled": false,
+                        "delay_ms": 900,
+                    },
+                }"#,
+            )
+            .expect("which-key settings should parse")
+            .which_key,
+            NotesWhichKeySettings {
+                enabled: false,
+                delay_ms: 900,
+            }
+        );
+    }
+
+    #[test]
     fn test_parses_editor_theme_vim_and_explorer_width_settings() {
         let settings = parse_notes_settings(
             r#"
@@ -5381,6 +5474,14 @@ mod tests {
             "note::Delete",
             "note::Duplicate",
             "note::Statistics",
+            "outline::Toggle",
+            "tab_switcher::ToggleAll",
+            "editor::ToggleBookmark",
+            "editor::ToggleBookmarkWithLabel",
+            "editor::EditBookmark",
+            "editor::GoToNextBookmark",
+            "editor::GoToPreviousBookmark",
+            "editor::ViewBookmarks",
             "view::ToggleFocusMode",
             "view::UseSystemTheme",
             "view::UseLightTheme",
@@ -5543,6 +5644,14 @@ mod tests {
             ("space b n", "pane::ActivateNextItem"),
             ("space b p", "pane::ActivatePreviousItem"),
             ("space b d", "pane::CloseActiveItem"),
+            ("space b b", "tab_switcher::ToggleAll"),
+            ("space o", "outline::Toggle"),
+            ("space m m", "editor::ToggleBookmark"),
+            ("space m l", "editor::ToggleBookmarkWithLabel"),
+            ("space m e", "editor::EditBookmark"),
+            ("space m n", "editor::GoToNextBookmark"),
+            ("space m p", "editor::GoToPreviousBookmark"),
+            ("space m v", "editor::ViewBookmarks"),
             ("space w h", "workspace::ActivatePaneLeft"),
             ("space w j", "workspace::ActivatePaneDown"),
             ("space w k", "workspace::ActivatePaneUp"),
@@ -5609,6 +5718,76 @@ mod tests {
                 .count()),
             1
         );
+    }
+
+    #[gpui::test]
+    async fn test_which_key_opens_for_an_incomplete_notes_leader_group(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+        let workspace = workspace(&test, cx);
+
+        test.cx.simulate_keystrokes("space m");
+        test.cx
+            .executor()
+            .advance_clock(Duration::from_millis(DEFAULT_WHICH_KEY_DELAY_MS));
+        test.cx.run_until_parked();
+
+        assert!(test.cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| workspace.has_active_modal(window, cx))
+        }));
+    }
+
+    #[gpui::test]
+    async fn test_vim_leader_o_opens_outline_modal(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+
+        test.cx.simulate_keystrokes("space o");
+        test.cx.run_until_parked();
+
+        assert!(workspace(&test, cx).read_with(cx, |workspace, cx| {
+            workspace.active_modal::<outline::OutlineView>(cx).is_some()
+        }));
+    }
+
+    #[gpui::test]
+    async fn test_vim_leader_bb_opens_global_tab_switcher(cx: &mut TestAppContext) {
+        let mut test = test_window_with(
+            cx,
+            ExplorerSettings::default(),
+            json!({
+                "alpha.md": "# Alpha\n",
+                "beta.md": "# Beta\n",
+            }),
+            "/notes/alpha.md",
+        )
+        .await;
+        focus_project_path(&mut test, "beta.md", cx);
+        test.cx.simulate_keystrokes("enter");
+        test.cx.run_until_parked();
+
+        test.cx.simulate_keystrokes("space b b");
+        test.cx.run_until_parked();
+
+        assert!(workspace(&test, cx).read_with(cx, |workspace, cx| {
+            workspace
+                .active_modal::<tab_switcher::TabSwitcher>(cx)
+                .is_some()
+        }));
+    }
+
+    #[gpui::test]
+    async fn test_vim_leader_mm_toggles_a_persistent_bookmark(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+
+        test.cx.simulate_keystrokes("space m m");
+        test.cx.run_until_parked();
+
+        let bookmark_store = test
+            .project
+            .read_with(cx, |project, _| project.bookmark_store());
+        let bookmarks =
+            bookmark_store.read_with(cx, |store, cx| store.all_serialized_bookmarks(cx));
+        assert_eq!(bookmarks.len(), 1);
+        assert_eq!(bookmarks.values().next().map(Vec::len), Some(1));
     }
 
     #[gpui::test]

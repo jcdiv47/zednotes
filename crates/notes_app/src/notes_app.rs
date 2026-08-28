@@ -2164,6 +2164,10 @@ fn apply_notes_settings(settings: NotesSettings, cx: &mut App) {
             content.vim_mode = Some(settings.vim_mode);
             content.helix_mode = Some(false);
             content
+                .session
+                .get_or_insert_default()
+                .restore_unsaved_buffers = Some(true);
+            content
                 .vim
                 .get_or_insert_default()
                 .toggle_relative_line_numbers = Some(settings.vim.toggle_relative_line_numbers);
@@ -4199,6 +4203,134 @@ mod tests {
                     .root_paths(cx))
                 .expect("failed to inspect the Dock-reopened window"),
             vec![Arc::<Path>::from(Path::new("/session-notes"))]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_hot_exit_restores_unsaved_note_without_writing_it_to_disk(
+        cx: &mut TestAppContext,
+    ) {
+        use session::Session;
+
+        const NOTE_PATH: &str = "/hot-exit-notes/draft.md";
+        const SAVED_NOTE: &str = "# Saved on disk\n";
+        const UNSAVED_NOTE: &str = "# Unsaved recovery copy\n\nStill being written.\n";
+
+        let test = test_window(cx).await;
+        let app_state = cx.read(AppState::global);
+        test.window
+            .update(cx, |_, window, _| window.remove_window())
+            .expect("failed to remove the setup window");
+        test.fs
+            .insert_tree("/hot-exit-notes", json!({ "draft.md": SAVED_NOTE }))
+            .await;
+        cx.run_until_parked();
+
+        let mut notes_settings = cx.update(|cx| cx.global::<CurrentNotesSettings>().0.clone());
+        notes_settings.autosave.enabled = false;
+        cx.update(|cx| apply_notes_settings(notes_settings, cx));
+
+        let session_id = cx.read(|cx| app_state.session.read(cx).id().to_owned());
+        let zed_workspace::OpenResult { window, .. } = cx
+            .update(|cx| {
+                Workspace::new_local(
+                    vec![PathBuf::from("/hot-exit-notes")],
+                    app_state.clone(),
+                    None,
+                    None,
+                    None,
+                    zed_workspace::OpenMode::Activate,
+                    cx,
+                )
+            })
+            .await
+            .expect("failed to open the hot-exit workspace");
+        let open_note = window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    workspace.open_abs_path(
+                        PathBuf::from(NOTE_PATH),
+                        OpenOptions::default(),
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .expect("failed to schedule the draft open");
+        open_note.await.expect("failed to open the draft");
+        cx.run_until_parked();
+
+        window
+            .update(cx, |multi_workspace, window, cx| {
+                let editor = multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .active_item_as::<Editor>(cx)
+                    .expect("the draft should be active");
+                editor.update(cx, |editor, cx| {
+                    editor.set_text(UNSAVED_NOTE, window, cx);
+                });
+            })
+            .expect("failed to edit the draft");
+        cx.run_until_parked();
+        assert_eq!(
+            test.fs.load(Path::new(NOTE_PATH)).await.unwrap(),
+            SAVED_NOTE,
+            "the recovery checkpoint must not become an implicit save"
+        );
+
+        cx.executor()
+            .advance_clock(zed_workspace::SERIALIZATION_THROTTLE_TIME);
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .expect("failed to simulate the terminated window");
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            app_state.session.update(cx, |app_session, _| {
+                app_session.replace_session_for_test(Session::test_with_old_session(session_id));
+            });
+        });
+        let mut async_cx = cx.to_async();
+        assert_eq!(
+            restore_session_workspaces(app_state.clone(), &mut async_cx)
+                .await
+                .expect("failed to restore the hot-exit session"),
+            1
+        );
+        cx.run_until_parked();
+
+        let restored_window = cx
+            .read(|cx| {
+                cx.windows()
+                    .into_iter()
+                    .find_map(|window| window.downcast::<MultiWorkspace>())
+            })
+            .expect("the restored hot-exit window should exist");
+        restored_window
+            .read_with(cx, |multi_workspace, cx| {
+                let editor = multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .active_item_as::<Editor>(cx)
+                    .expect("the recovered draft should be active");
+                assert_eq!(editor.read(cx).text(cx), UNSAVED_NOTE);
+                assert!(
+                    editor
+                        .read(cx)
+                        .buffer()
+                        .read(cx)
+                        .as_singleton()
+                        .is_some_and(|buffer| buffer.read(cx).is_dirty()),
+                    "the recovered contents should remain visibly unsaved"
+                );
+            })
+            .expect("failed to inspect the recovered draft");
+        assert_eq!(
+            test.fs.load(Path::new(NOTE_PATH)).await.unwrap(),
+            SAVED_NOTE,
+            "restoring the checkpoint must leave the filesystem authoritative"
         );
     }
 

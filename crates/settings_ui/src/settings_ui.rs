@@ -74,6 +74,70 @@ const CONTENT_GROUP_TAB_INDEX: isize = 5;
 const SIDEBAR_WIDTH: Pixels = px(226.);
 const CONTENT_MIN_WIDTH: Pixels = px(400.);
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SettingsPageKind {
+    General,
+    Appearance,
+    Keymap,
+    Editor,
+    LanguagesAndTools,
+    SearchAndFiles,
+    WindowAndLayout,
+    Panels,
+    Debugger,
+    Terminal,
+    VersionControl,
+    Collaboration,
+    Ai,
+    Network,
+    Developer,
+}
+
+#[derive(Clone)]
+pub struct SettingsUiOptions {
+    window_title: SharedString,
+    visible_pages: Option<HashSet<SettingsPageKind>>,
+}
+
+impl SettingsUiOptions {
+    pub fn new(window_title: impl Into<SharedString>) -> Self {
+        Self {
+            window_title: window_title.into(),
+            visible_pages: None,
+        }
+    }
+
+    pub fn with_visible_pages(mut self, pages: impl IntoIterator<Item = SettingsPageKind>) -> Self {
+        self.visible_pages = Some(pages.into_iter().collect());
+        self
+    }
+
+    fn is_page_visible(&self, page: SettingsPageKind) -> bool {
+        self.visible_pages
+            .as_ref()
+            .is_none_or(|pages| pages.contains(&page))
+    }
+}
+
+impl Default for SettingsUiOptions {
+    fn default() -> Self {
+        Self::new("Zed — Settings")
+    }
+}
+
+impl Global for SettingsUiOptions {}
+
+pub(crate) fn settings_page_is_visible(page: SettingsPageKind, cx: &App) -> bool {
+    cx.try_global::<SettingsUiOptions>()
+        .is_none_or(|options| options.is_page_visible(page))
+}
+
+fn settings_window_title(cx: &App) -> SharedString {
+    cx.try_global::<SettingsUiOptions>()
+        .map(|options| options.window_title.clone())
+        .unwrap_or_else(|| SettingsUiOptions::default().window_title)
+}
+
 actions!(
     settings_editor,
     [
@@ -429,6 +493,11 @@ struct SettingsFieldMetadata {
 }
 
 pub fn init(cx: &mut App) {
+    init_with_options(SettingsUiOptions::default(), cx);
+}
+
+pub fn init_with_options(options: SettingsUiOptions, cx: &mut App) {
+    cx.set_global(options);
     init_renderers(cx);
     let queue = ProjectSettingsUpdateQueue::new(cx);
     cx.set_global(queue);
@@ -870,7 +939,7 @@ fn open_settings_editor_with(
         cx.open_window(
             WindowOptions {
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Zed — Settings".into()),
+                    title: Some(settings_window_title(cx)),
                     appears_transparent: true,
                     traffic_light_position: Some(point(px(12.0), px(12.0))),
                 }),
@@ -1809,44 +1878,53 @@ impl SettingsWindow {
         })
         .detach();
 
-        use feature_flags::FeatureFlagAppExt as _;
-        let mut last_is_staff = cx.is_staff();
-        cx.observe_global_in::<feature_flags::FeatureFlagStore>(window, move |this, window, cx| {
-            let is_staff = cx.is_staff();
-            if is_staff != last_is_staff {
-                last_is_staff = is_staff;
-                this.rebuild_pages(window, cx);
-            }
-        })
-        .detach();
+        if settings_page_is_visible(SettingsPageKind::Developer, cx) {
+            use feature_flags::FeatureFlagAppExt as _;
+            let mut last_is_staff = cx.is_staff();
+            cx.observe_global_in::<feature_flags::FeatureFlagStore>(
+                window,
+                move |this, window, cx| {
+                    let is_staff = cx.is_staff();
+                    if is_staff != last_is_staff {
+                        last_is_staff = is_staff;
+                        this.rebuild_pages(window, cx);
+                    }
+                },
+            )
+            .detach();
+        }
 
-        cx.observe_global_in::<SkillIndex>(window, |this, _window, cx| {
-            if let Some(skill_index) = cx.try_global::<SkillIndex>() {
-                this.hidden_deleted_skill_directory_paths
-                    .retain(|directory_path| {
-                        skill_index
-                            .global_skills
-                            .iter()
-                            .chain(
-                                skill_index
-                                    .project_skills
-                                    .iter()
-                                    .flat_map(|group| group.skills.iter()),
-                            )
-                            .any(|skill| skill.directory_path.as_path() == directory_path.as_path())
-                    });
-            } else {
-                this.hidden_deleted_skill_directory_paths.clear();
-            }
-            cx.notify();
-        })
-        .detach();
+        if settings_page_is_visible(SettingsPageKind::Ai, cx) {
+            cx.observe_global_in::<SkillIndex>(window, |this, _window, cx| {
+                if let Some(skill_index) = cx.try_global::<SkillIndex>() {
+                    this.hidden_deleted_skill_directory_paths
+                        .retain(|directory_path| {
+                            skill_index
+                                .global_skills
+                                .iter()
+                                .chain(
+                                    skill_index
+                                        .project_skills
+                                        .iter()
+                                        .flat_map(|group| group.skills.iter()),
+                                )
+                                .any(|skill| {
+                                    skill.directory_path.as_path() == directory_path.as_path()
+                                })
+                        });
+                } else {
+                    this.hidden_deleted_skill_directory_paths.clear();
+                }
+                cx.notify();
+            })
+            .detach();
 
-        let language_model_registry = language_model::LanguageModelRegistry::global(cx);
-        cx.subscribe(&language_model_registry, |_, _, _event, cx| {
-            cx.notify();
-        })
-        .detach();
+            let language_model_registry = language_model::LanguageModelRegistry::global(cx);
+            cx.subscribe(&language_model_registry, |_, _, _event, cx| {
+                cx.notify();
+            })
+            .detach();
+        }
 
         cx.on_window_closed(|cx, _window_id| {
             if let Some(existing_window) = cx
@@ -5373,6 +5451,24 @@ pub mod test {
         editor::init(cx);
         menu::init();
         language_model::init(cx);
+    }
+
+    #[gpui::test]
+    fn test_settings_ui_options_filter_pages_and_set_title(cx: &mut App) {
+        register_settings(cx);
+        cx.set_global(
+            SettingsUiOptions::new("Test Settings")
+                .with_visible_pages([SettingsPageKind::Appearance, SettingsPageKind::Editor]),
+        );
+
+        assert_eq!(settings_window_title(cx).as_ref(), "Test Settings");
+        assert_eq!(
+            page_data::settings_data(cx)
+                .into_iter()
+                .map(|page| page.title)
+                .collect::<Vec<_>>(),
+            ["Appearance", "Editor"]
+        );
     }
 
     fn parse(input: &'static str, window: &mut Window, cx: &mut App) -> SettingsWindow {

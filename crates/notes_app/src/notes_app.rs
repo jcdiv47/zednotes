@@ -75,7 +75,7 @@ use zed_workspace::dock::PanelButtons;
 use zed_workspace::{
     AppState, CloseIntent, Event as WorkspaceEvent, ItemHandle as _, MultiWorkspace, OpenOptions,
     OpenVisible, Pane, SaveIntent, SessionWorkspace, SplitDirection, StatusBarSettings,
-    StatusItemView, TabBarSettings, Toast, Workspace, WorkspaceStore,
+    StatusItemView, TabBarSettings, Toast, Workspace, WorkspaceSettings, WorkspaceStore,
     dock::DockPosition,
     item::SaveOptions,
     notifications::{DetachAndPromptErr as _, NotificationId},
@@ -104,13 +104,16 @@ const DEFAULT_WHICH_KEY_DELAY_MS: u64 = 500;
 const RECENT_NOTES_KEY: &str = "notes_recent_usage";
 const MAX_RECENT_NOTES: usize = 512;
 const INITIAL_SETTINGS_CONTENT: &str = r#"{
-  // system, light, or dark
-  "theme": "system",
+  // Standard Zed settings. These are also editable through Cmd+,.
+  "theme": {
+    "mode": "system",
+    "light": "One Light",
+    "dark": "One Dark",
+  },
   "vim_mode": true,
   "relative_line_numbers": "disabled",
 
   "vim": {
-    "leader": "space",
     "toggle_relative_line_numbers": false,
   },
 
@@ -119,34 +122,52 @@ const INITIAL_SETTINGS_CONTENT: &str = r#"{
     "delay_ms": 500,
   },
 
-  "ui": {
-    "font_family": ".SystemUIFont",
-    "font_size": 14,
+  "ui_font_family": ".SystemUIFont",
+  "ui_font_size": 14,
+  "buffer_font_family": ".ZedMono",
+  "buffer_font_size": 15,
+  "buffer_line_height": {
+    "custom": 1.55,
   },
-
-  "editor": {
-    "font_family": ".ZedMono",
-    "font_size": 15,
-    "line_height": 1.55,
+  "gutter": {
     "line_numbers": false,
-    "soft_wrap": true,
   },
+  "soft_wrap": "editor_width",
 
   "autosave": {
-    "enabled": true,
-    "delay_ms": 750,
+    "after_delay": {
+      "milliseconds": 750,
+    },
   },
 
-  "explorer": {
-    "width": 240,
-    "markdown_only": true,
-    "show_hidden": false,
+  "project_panel": {
+    "default_width": 240,
+    "hide_hidden": true,
   },
+  "file_scan_exclusions": [
+    "**/.git",
+    "**/.DS_Store",
+    "**/node_modules",
+    "**/target",
+  ],
 
-  "preview": {
-    "font_family": ".SystemUIFont",
-    "font_size": 16,
+  "markdown_preview_font_family": ".SystemUIFont",
+  "markdown_preview_font_size": 16,
+  "markdown_preview": {
+    "limit_content_width": true,
     "max_width": 760,
+    "allow_remote_images": false,
+    "max_file_size_bytes": 5242880,
+  },
+
+  // Zednotes-only policy. Upstream Zed settings stay at the root above.
+  "zednotes": {
+    "vim": {
+      "leader": "space",
+    },
+    "explorer": {
+      "markdown_only": true,
+    },
   },
 }
 "#;
@@ -155,7 +176,7 @@ actions!(
     notes,
     [
         /// Opens the user-owned zednotes settings file.
-        OpenSettings,
+        OpenSettingsFile,
         /// Quits zednotes.
         Quit,
         /// Hides zednotes.
@@ -1114,7 +1135,7 @@ impl Render for NotesEmptyState {
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct NotesSettingsContent {
+struct LegacyNotesSettingsContent {
     theme: Option<NotesTheme>,
     vim_mode: Option<bool>,
     relative_line_numbers: Option<RelativeLineNumbers>,
@@ -1182,9 +1203,9 @@ struct PreviewSettingsContent {
     max_file_size_bytes: Option<u64>,
 }
 
-fn parse_notes_settings(content: &str) -> Result<NotesSettings> {
-    let content = settings::parse_json_with_comments::<NotesSettingsContent>(content)
-        .context("failed to parse zednotes settings")?;
+fn parse_legacy_notes_settings(content: &str) -> Result<NotesSettings> {
+    let content = settings::parse_json_with_comments::<LegacyNotesSettingsContent>(content)
+        .context("failed to parse legacy zednotes settings")?;
     let mut settings = NotesSettings::default();
     settings.theme = content.theme.unwrap_or(settings.theme);
     settings.vim_mode = content.vim_mode.unwrap_or(settings.vim_mode);
@@ -1285,8 +1306,292 @@ fn parse_notes_settings(content: &str) -> Result<NotesSettings> {
     Ok(settings)
 }
 
-fn config_dir_path() -> PathBuf {
+#[derive(Debug, Default, Deserialize)]
+struct ZednotesSettingsRoot {
+    zednotes: Option<ZednotesSettingsContent>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ZednotesSettingsContent {
+    vim: Option<ZednotesVimSettingsContent>,
+    explorer: Option<ZednotesExplorerSettingsContent>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ZednotesVimSettingsContent {
+    leader: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ZednotesExplorerSettingsContent {
+    markdown_only: Option<bool>,
+}
+
+fn validate_notes_settings(settings: &NotesSettings) -> Result<()> {
+    anyhow::ensure!(
+        !settings.vim.leader.is_empty() && !settings.vim.leader.chars().any(char::is_whitespace),
+        "zednotes.vim.leader must be one GPUI keystroke"
+    );
+    Keystroke::parse(&settings.vim.leader)
+        .with_context(|| format!("invalid zednotes.vim.leader {:?}", settings.vim.leader))?;
+    Ok(())
+}
+
+fn parse_notes_settings(content: &str) -> Result<NotesSettings> {
+    let document = settings::parse_json_with_comments::<serde_json::Value>(content)
+        .context("failed to parse zednotes settings")?;
+    let root = document
+        .as_object()
+        .context("zednotes settings must be a JSON object")?;
+    if is_legacy_settings(root) {
+        return parse_legacy_notes_settings(content);
+    }
+
+    let content = settings::parse_json_with_comments::<ZednotesSettingsRoot>(content)
+        .context("failed to parse zednotes settings")?;
+    let mut settings = NotesSettings::default();
+    if let Some(zednotes) = content.zednotes {
+        if let Some(vim) = zednotes.vim {
+            settings.vim.leader = vim.leader.unwrap_or(settings.vim.leader);
+        }
+        if let Some(explorer) = zednotes.explorer {
+            settings.explorer.markdown_only = explorer
+                .markdown_only
+                .unwrap_or(settings.explorer.markdown_only);
+        }
+    }
+    validate_notes_settings(&settings)?;
+    Ok(settings)
+}
+
+fn is_legacy_settings(root: &serde_json::Map<String, serde_json::Value>) -> bool {
+    root.get("theme").is_some_and(|theme| {
+        theme
+            .as_str()
+            .is_some_and(|theme| matches!(theme, "system" | "light" | "dark"))
+    }) || ["ui", "editor", "explorer", "files", "preview"]
+        .iter()
+        .any(|key| root.contains_key(*key))
+        || root.get("autosave").is_some_and(|autosave| {
+            autosave.as_object().is_some_and(|autosave| {
+                autosave.contains_key("enabled") || autosave.contains_key("delay_ms")
+            })
+        })
+        || root.get("vim").is_some_and(|vim| {
+            vim.as_object()
+                .is_some_and(|vim| vim.contains_key("leader"))
+        })
+}
+
+fn nested_object<'a>(
+    object: &'a mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> &'a mut serde_json::Map<String, serde_json::Value> {
+    let value = object
+        .entry(key.to_owned())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !value.is_object() {
+        *value = serde_json::Value::Object(serde_json::Map::new());
+    }
+    value
+        .as_object_mut()
+        .expect("nested settings value was replaced with an object")
+}
+
+fn rounded_setting_number(value: f32) -> f64 {
+    (f64::from(value) * 100.0).round() / 100.0
+}
+
+fn migrate_legacy_settings_content(content: &str) -> Result<Option<String>> {
+    let mut document = settings::parse_json_with_comments::<serde_json::Value>(content)
+        .context("failed to parse legacy zednotes settings")?;
+    let root = document
+        .as_object_mut()
+        .context("zednotes settings must be a JSON object")?;
+    if !is_legacy_settings(root) {
+        return Ok(None);
+    }
+
+    let settings = parse_legacy_notes_settings(content)?;
+    for legacy_key in ["ui", "editor", "explorer", "files", "preview"] {
+        root.remove(legacy_key);
+    }
+
+    let theme_mode = match settings.theme {
+        NotesTheme::System => "system",
+        NotesTheme::Light => "light",
+        NotesTheme::Dark => "dark",
+    };
+    root.insert(
+        "theme".to_owned(),
+        serde_json::json!({
+            "mode": theme_mode,
+            "light": "One Light",
+            "dark": "One Dark",
+        }),
+    );
+    root.insert("vim_mode".to_owned(), settings.vim_mode.into());
+    root.insert(
+        "relative_line_numbers".to_owned(),
+        serde_json::to_value(settings.relative_line_numbers)?,
+    );
+    let vim = nested_object(root, "vim");
+    vim.remove("leader");
+    vim.insert(
+        "toggle_relative_line_numbers".to_owned(),
+        settings.vim.toggle_relative_line_numbers.into(),
+    );
+    root.insert(
+        "which_key".to_owned(),
+        serde_json::json!({
+            "enabled": settings.which_key.enabled,
+            "delay_ms": settings.which_key.delay_ms,
+        }),
+    );
+    root.insert(
+        "ui_font_family".to_owned(),
+        settings.ui.font_family.clone().into(),
+    );
+    root.insert(
+        "ui_font_size".to_owned(),
+        rounded_setting_number(settings.ui.font_size).into(),
+    );
+    root.insert(
+        "buffer_font_family".to_owned(),
+        settings.editor.font_family.clone().into(),
+    );
+    root.insert(
+        "buffer_font_size".to_owned(),
+        rounded_setting_number(settings.editor.font_size).into(),
+    );
+    root.insert(
+        "buffer_line_height".to_owned(),
+        serde_json::json!({
+            "custom": rounded_setting_number(settings.editor.line_height),
+        }),
+    );
+    root.insert(
+        "gutter".to_owned(),
+        serde_json::json!({ "line_numbers": settings.editor.line_numbers }),
+    );
+    root.insert(
+        "soft_wrap".to_owned(),
+        if settings.editor.soft_wrap {
+            "editor_width"
+        } else {
+            "none"
+        }
+        .into(),
+    );
+    root.insert(
+        "autosave".to_owned(),
+        if settings.autosave.enabled {
+            serde_json::json!({
+                "after_delay": { "milliseconds": settings.autosave.delay_ms },
+            })
+        } else {
+            "off".into()
+        },
+    );
+    root.insert(
+        "project_panel".to_owned(),
+        serde_json::json!({
+            "default_width": settings.explorer.width,
+            "hide_hidden": !settings.explorer.show_hidden,
+        }),
+    );
+    root.insert(
+        "file_scan_exclusions".to_owned(),
+        settings
+            .explorer
+            .excluded_paths
+            .iter()
+            .map(|path| exclusion_glob(path))
+            .collect::<Vec<_>>()
+            .into(),
+    );
+    root.insert(
+        "markdown_preview_font_family".to_owned(),
+        settings.preview.font_family.clone().into(),
+    );
+    root.insert(
+        "markdown_preview_font_size".to_owned(),
+        rounded_setting_number(settings.preview.font_size).into(),
+    );
+    root.insert(
+        "markdown_preview".to_owned(),
+        serde_json::json!({
+            "limit_content_width": true,
+            "max_width": settings.preview.max_width,
+            "allow_remote_images": settings.preview.allow_remote_images,
+            "max_file_size_bytes": settings.preview.max_file_size_bytes,
+        }),
+    );
+    let zednotes = nested_object(root, "zednotes");
+    nested_object(zednotes, "vim").insert("leader".to_owned(), settings.vim.leader.clone().into());
+    nested_object(zednotes, "explorer").insert(
+        "markdown_only".to_owned(),
+        settings.explorer.markdown_only.into(),
+    );
+
+    let mut migrated = serde_json::to_string_pretty(&document)?;
+    migrated.push('\n');
+    Ok(Some(migrated))
+}
+
+fn native_settings_document(content: &str) -> Result<serde_json::Value> {
+    let migrated = migrate_legacy_settings_content(content)?;
+    settings::parse_json_with_comments(migrated.as_deref().unwrap_or(content))
+        .context("failed to parse settings document")
+}
+
+fn merge_settings_documents(base: &mut serde_json::Value, overlay: serde_json::Value) {
+    match (base, overlay) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(overlay)) => {
+            for (key, overlay_value) in overlay {
+                if let Some(base_value) = base.get_mut(&key) {
+                    merge_settings_documents(base_value, overlay_value);
+                } else {
+                    base.insert(key, overlay_value);
+                }
+            }
+        }
+        (base, overlay) => {
+            *base = overlay;
+        }
+    }
+}
+
+fn merge_split_settings_contents(
+    canonical_content: Option<&str>,
+    split_content: &str,
+    split_wins: bool,
+) -> Result<String> {
+    let canonical = canonical_content
+        .map(native_settings_document)
+        .transpose()?
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    let split = native_settings_document(split_content)?;
+    let (mut merged, overlay) = if split_wins {
+        (canonical, split)
+    } else {
+        (split, canonical)
+    };
+    merge_settings_documents(&mut merged, overlay);
+    let mut content = serde_json::to_string_pretty(&merged)?;
+    content.push('\n');
+    settings::parse_json_with_comments::<settings::UserSettingsContent>(&content)
+        .context("merged settings are not valid native Zed settings")?;
+    parse_notes_settings(&content).context("merged zednotes settings are invalid")?;
+    Ok(content)
+}
+
+pub fn default_config_dir() -> PathBuf {
     paths::home_dir().join(".config").join(APP_NAME)
+}
+
+fn config_dir() -> PathBuf {
+    paths::config_dir().clone()
 }
 
 pub fn application_support_dir() -> PathBuf {
@@ -1318,11 +1623,88 @@ pub fn old_log_file() -> &'static PathBuf {
 }
 
 fn notes_settings_path() -> PathBuf {
-    config_dir_path().join("settings.json")
+    paths::settings_file().clone()
 }
 
 fn notes_keymap_path() -> PathBuf {
-    config_dir_path().join("keymap.json")
+    paths::keymap_file().clone()
+}
+
+fn write_settings_migration(path: &Path, content: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    let temporary_path = parent.join(format!(
+        ".settings.json.{}.{}.tmp",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::write(&temporary_path, content)
+        .with_context(|| format!("failed to write {}", temporary_path.display()))?;
+    if let Err(error) = std::fs::rename(&temporary_path, path) {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(error).with_context(|| format!("failed to replace {}", path.display()));
+    }
+    Ok(())
+}
+
+fn migrate_legacy_settings_file() -> Result<bool> {
+    let path = notes_settings_path();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let Some(migrated) = migrate_legacy_settings_content(&content)? else {
+        return Ok(false);
+    };
+    write_settings_migration(&path, &migrated)?;
+    Ok(true)
+}
+
+fn migrate_split_settings_file() -> Result<bool> {
+    let split_path = application_support_dir().join("config/settings.json");
+    let canonical_path = notes_settings_path();
+    if split_path == canonical_path {
+        return Ok(false);
+    }
+    let split_content = match std::fs::read_to_string(&split_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", split_path.display()));
+        }
+    };
+    let canonical_content = match std::fs::read_to_string(&canonical_path) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read {}", canonical_path.display()));
+        }
+    };
+    let split_modified = std::fs::metadata(&split_path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(UNIX_EPOCH);
+    let canonical_modified = std::fs::metadata(&canonical_path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(UNIX_EPOCH);
+    let merged = merge_split_settings_contents(
+        canonical_content.as_deref(),
+        &split_content,
+        split_modified >= canonical_modified,
+    )?;
+    write_settings_migration(&canonical_path, &merged)?;
+    std::fs::remove_file(&split_path)
+        .with_context(|| format!("failed to retire {}", split_path.display()))?;
+    Ok(true)
 }
 
 fn load_recent_notes(cx: &mut App) {
@@ -1755,7 +2137,8 @@ fn bind_default_editor_keymaps(cx: &mut App) -> Result<()> {
     }
     cx.bind_keys(leader_bindings);
     cx.bind_keys([
-        KeyBinding::new("cmd-,", OpenSettings, Some("Workspace")),
+        KeyBinding::new("cmd-,", zed_actions::OpenSettings, Some("Workspace")),
+        KeyBinding::new("cmd-alt-,", OpenSettingsFile, Some("Workspace")),
         KeyBinding::new("cmd-o", OpenFolder, None),
         KeyBinding::new("cmd-e", OpenRecentNote, Some("Editor")),
         KeyBinding::new("cmd-e", OpenRecentNote, Some("MarkdownPreview")),
@@ -1842,6 +2225,7 @@ fn reload_editor_keymaps(mut user_key_bindings: Vec<KeyBinding>, cx: &mut App) -
         cx.set_global(CurrentUserKeyBindings(user_key_bindings.clone()));
     }
     cx.bind_keys(user_key_bindings);
+    keymap_editor::KeymapEventChannel::trigger_keymap_changed(cx);
     Ok(())
 }
 
@@ -1885,7 +2269,10 @@ fn load_user_keymap(cx: &mut App) -> Result<()> {
 
 fn notes_menus() -> Vec<Menu> {
     let mut application_items = vec![
-        MenuItem::action("Settings…", OpenSettings),
+        MenuItem::action("Settings…", zed_actions::OpenSettings),
+        MenuItem::action("Keyboard Shortcuts…", zed_actions::OpenKeymap),
+        MenuItem::action("Open Settings File…", OpenSettingsFile),
+        MenuItem::action("Open Keymap File…", zed_actions::OpenKeymapFile),
         MenuItem::separator(),
     ];
     #[cfg(target_os = "macos")]
@@ -1980,6 +2367,21 @@ fn init_editor_subsystems(cx: &mut App) -> Result<()> {
     git_hosting_providers::init(cx);
     git_ui::init(cx);
     markdown_preview::init(cx);
+    settings_ui::init_with_options(
+        settings_ui::SettingsUiOptions::new("Zednotes — Settings").with_visible_pages([
+            settings_ui::SettingsPageKind::General,
+            settings_ui::SettingsPageKind::Appearance,
+            settings_ui::SettingsPageKind::Keymap,
+            settings_ui::SettingsPageKind::Editor,
+            settings_ui::SettingsPageKind::LanguagesAndTools,
+            settings_ui::SettingsPageKind::SearchAndFiles,
+            settings_ui::SettingsPageKind::WindowAndLayout,
+            settings_ui::SettingsPageKind::Panels,
+            settings_ui::SettingsPageKind::VersionControl,
+        ]),
+        cx,
+    );
+    keymap_editor::init(cx);
     outline::init(cx);
     outline_panel::init(cx);
     project_panel::init(cx);
@@ -2265,7 +2667,10 @@ fn apply_notes_settings(settings: NotesSettings, cx: &mut App) {
 }
 
 fn autosave_enabled(cx: &App) -> bool {
-    cx.global::<CurrentNotesSettings>().0.autosave.enabled
+    !matches!(
+        WorkspaceSettings::get_global(cx).autosave,
+        AutosaveSetting::Off
+    )
 }
 
 fn hide(_: &Hide, cx: &mut App) {
@@ -2709,6 +3114,21 @@ fn use_theme(theme: NotesTheme, cx: &mut App) {
     let mut settings = cx.global::<CurrentNotesSettings>().0.clone();
     settings.theme = theme;
     apply_notes_settings(settings, cx);
+
+    let mode = match theme {
+        NotesTheme::System => ThemeAppearanceMode::System,
+        NotesTheme::Light => ThemeAppearanceMode::Light,
+        NotesTheme::Dark => ThemeAppearanceMode::Dark,
+    };
+    settings::update_settings_file(<dyn Fs>::global(cx), cx, move |content, _| {
+        let selection = ThemeSelection::Dynamic {
+            mode,
+            light: ThemeName(settings::DEFAULT_LIGHT_THEME.into()),
+            dark: ThemeName(settings::DEFAULT_DARK_THEME.into()),
+        };
+        content.theme.theme = Some(selection.clone());
+        content.theme.markdown_preview_theme = Some(selection);
+    });
 }
 
 fn open_preview(workspace: &mut Workspace, window: &mut Window, cx: &mut gpui::Context<Workspace>) {
@@ -2827,18 +3247,19 @@ fn open_recent_projects(
     );
 }
 
-fn open_settings_file(
+fn open_config_file(
     workspace: &mut Workspace,
+    path: PathBuf,
+    initial_content: SharedString,
     window: &mut Window,
     cx: &mut gpui::Context<Workspace>,
 ) {
-    let path = notes_settings_path();
-    let config_dir = config_dir_path();
+    let config_dir = config_dir();
     let fs = workspace.app_state().fs.clone();
     let project = workspace.project().clone();
     cx.spawn_in(window, async move |workspace, cx| {
         if !fs.is_file(&path).await {
-            fs.save(&path, &INITIAL_SETTINGS_CONTENT.into(), Default::default())
+            fs.save(&path, &initial_content.as_ref().into(), Default::default())
                 .await
                 .with_context(|| format!("failed to create {}", path.display()))?;
         }
@@ -2863,6 +3284,34 @@ fn open_settings_file(
         anyhow::Ok(())
     })
     .detach_and_log_err(cx);
+}
+
+fn open_settings_file(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    open_config_file(
+        workspace,
+        notes_settings_path(),
+        INITIAL_SETTINGS_CONTENT.into(),
+        window,
+        cx,
+    );
+}
+
+fn open_keymap_file(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    open_config_file(
+        workspace,
+        notes_keymap_path(),
+        settings::initial_keymap_content().into_owned().into(),
+        window,
+        cx,
+    );
 }
 
 fn init_workspace_composition(
@@ -2920,9 +3369,15 @@ fn init_workspace_composition(
                     content.project_panel.get_or_insert_default().hide_hidden = Some(!hide_hidden);
                 });
             });
+            settings::update_settings_file(<dyn Fs>::global(cx), cx, move |content, _| {
+                content.project_panel.get_or_insert_default().hide_hidden = Some(!hide_hidden);
+            });
         });
-        workspace.register_action(|workspace, _: &OpenSettings, window, cx| {
+        workspace.register_action(|workspace, _: &OpenSettingsFile, window, cx| {
             open_settings_file(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &zed_actions::OpenKeymapFile, window, cx| {
+            open_keymap_file(workspace, window, cx);
         });
         workspace.register_action(|workspace, _: &FocusEditor, window, cx| {
             workspace.focus_center_pane(window, cx);
@@ -3063,7 +3518,7 @@ fn init_workspace_composition(
 }
 
 fn watch_configuration_files(fs: Arc<dyn Fs>, cx: &mut App) {
-    let config_dir = config_dir_path();
+    let config_dir = config_dir();
     let settings_path = notes_settings_path();
     let keymap_path = notes_keymap_path();
     cx.spawn(async move |cx| {
@@ -3079,14 +3534,8 @@ fn watch_configuration_files(fs: Arc<dyn Fs>, cx: &mut App) {
             }
 
             if settings_changed {
-                let settings = match fs.load(&settings_path).await {
-                    Ok(content) => parse_notes_settings(&content).unwrap_or_else(|error| {
-                        log::error!(
-                            "failed to load {}: {error:#}; using defaults",
-                            settings_path.display()
-                        );
-                        NotesSettings::default()
-                    }),
+                let content = match fs.load(&settings_path).await {
+                    Ok(content) => content,
                     Err(error) => {
                         if fs.is_file(&settings_path).await {
                             log::error!(
@@ -3094,10 +3543,28 @@ fn watch_configuration_files(fs: Arc<dyn Fs>, cx: &mut App) {
                                 settings_path.display()
                             );
                         }
-                        NotesSettings::default()
+                        "{}".to_owned()
                     }
                 };
-                cx.update(|cx| apply_notes_settings(settings, cx));
+                let notes_settings = parse_notes_settings(&content).unwrap_or_else(|error| {
+                    log::error!(
+                        "failed to load {}: {error:#}; using defaults",
+                        settings_path.display()
+                    );
+                    NotesSettings::default()
+                });
+                cx.update(|cx| {
+                    let result = cx.update_global::<SettingsStore, _>(|store, cx| {
+                        store.set_user_settings(&content, cx)
+                    });
+                    if let Err(error) = result.result() {
+                        log::error!(
+                            "failed to load native settings from {}: {error:#}",
+                            settings_path.display()
+                        );
+                    }
+                    apply_notes_settings(notes_settings, cx);
+                });
             }
 
             if keymap_changed {
@@ -3130,15 +3597,38 @@ pub fn init(session: Session, cx: &mut App) -> Result<Arc<AppState>> {
     gpui_tokio::init(cx);
     settings::init(cx);
     theme_settings::init(LoadThemes::All(Box::new(Assets)), cx);
+
+    if let Err(error) = std::fs::create_dir_all(config_dir()) {
+        log::error!("failed to create zednotes config directory: {error}");
+    }
+    match migrate_split_settings_file() {
+        Ok(true) => log::info!(
+            "merged the former Application Support settings into {}",
+            notes_settings_path().display()
+        ),
+        Ok(false) => {}
+        Err(error) => log::error!("failed to merge split zednotes settings: {error:#}"),
+    }
+    match migrate_legacy_settings_file() {
+        Ok(true) => log::info!(
+            "migrated {} to the native Zed settings schema",
+            notes_settings_path().display()
+        ),
+        Ok(false) => {}
+        Err(error) => log::error!("failed to migrate legacy zednotes settings: {error:#}"),
+    }
     let notes_settings = load_notes_settings();
     apply_notes_settings(notes_settings.clone(), cx);
 
-    if let Err(error) = std::fs::create_dir_all(config_dir_path()) {
-        log::error!("failed to create zednotes config directory: {error}");
-    }
-
     let fs: Arc<dyn Fs> = Arc::new(RealFs::new(None, cx.background_executor().clone()));
     <dyn Fs>::set_global(fs.clone(), cx);
+    cx.update_global::<SettingsStore, _>(|store, cx| {
+        store.watch_settings_files(fs.clone(), cx, |settings_file, result, _| {
+            if let Err(error) = result.result() {
+                log::error!("failed to load {settings_file:?}: {error:#}");
+            }
+        });
+    });
     cx.set_http_client(Arc::new(BlockedHttpClient::new()));
     load_recent_notes(cx);
 
@@ -3522,6 +4012,7 @@ mod tests {
         initial_note_path: &str,
     ) -> TestWindow {
         let app_state = cx.update(|cx| {
+            release_channel::init(Version::new(0, 0, 0), cx);
             let settings = SettingsStore::test(cx);
             cx.set_global(settings);
             let app_state = AppState::test(cx);
@@ -4610,9 +5101,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parses_autosave_settings_from_jsonc() {
+    fn test_legacy_parser_reads_autosave_settings_from_jsonc() {
         assert_eq!(
-            parse_notes_settings("{}")
+            parse_legacy_notes_settings("{}")
                 .expect("default settings should parse")
                 .autosave,
             AutosaveSettings {
@@ -4621,7 +5112,7 @@ mod tests {
             }
         );
 
-        let settings = parse_notes_settings(
+        let settings = parse_legacy_notes_settings(
             r#"
             {
                 "autosave": {
@@ -4644,9 +5135,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parses_which_key_settings_from_jsonc() {
+    fn test_legacy_parser_reads_which_key_settings_from_jsonc() {
         assert_eq!(
-            parse_notes_settings("{}")
+            parse_legacy_notes_settings("{}")
                 .expect("default settings should parse")
                 .which_key,
             NotesWhichKeySettings {
@@ -4656,7 +5147,7 @@ mod tests {
         );
 
         assert_eq!(
-            parse_notes_settings(
+            parse_legacy_notes_settings(
                 r#"{
                     "which_key": {
                         "enabled": false,
@@ -4674,8 +5165,8 @@ mod tests {
     }
 
     #[test]
-    fn test_parses_editor_theme_vim_and_explorer_width_settings() {
-        let settings = parse_notes_settings(
+    fn test_legacy_parser_reads_editor_theme_vim_and_explorer_width_settings() {
+        let settings = parse_legacy_notes_settings(
             r#"
             {
                 "theme": "dark",
@@ -4727,14 +5218,146 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_settings_are_rejected_for_the_loader_to_fall_back() {
-        assert!(parse_notes_settings("{ invalid").is_err());
-        assert!(parse_notes_settings(r#"{ "ui": { "font_size": 0 } }"#).is_err());
-        assert!(parse_notes_settings(r#"{ "editor": { "line_height": 0.5 } }"#).is_err());
-        assert!(parse_notes_settings(r#"{ "preview": { "font_family": "" } }"#).is_err());
-        assert!(parse_notes_settings(r#"{ "vim": { "leader": "" } }"#).is_err());
-        assert!(parse_notes_settings(r#"{ "vim": { "leader": "g g" } }"#).is_err());
-        assert!(parse_notes_settings(r#"{ "vim": { "leader": "ctrl-alt-x-y" } }"#).is_err());
+    fn test_invalid_legacy_settings_are_rejected_for_migration() {
+        assert!(parse_legacy_notes_settings("{ invalid").is_err());
+        assert!(parse_legacy_notes_settings(r#"{ "ui": { "font_size": 0 } }"#).is_err());
+        assert!(parse_legacy_notes_settings(r#"{ "editor": { "line_height": 0.5 } }"#).is_err());
+        assert!(parse_legacy_notes_settings(r#"{ "preview": { "font_family": "" } }"#).is_err());
+        assert!(parse_legacy_notes_settings(r#"{ "vim": { "leader": "" } }"#).is_err());
+        assert!(parse_legacy_notes_settings(r#"{ "vim": { "leader": "g g" } }"#).is_err());
+        assert!(parse_legacy_notes_settings(r#"{ "vim": { "leader": "ctrl-alt-x-y" } }"#).is_err());
+    }
+
+    #[test]
+    fn test_reads_only_zednotes_policy_from_native_settings() {
+        let settings = parse_notes_settings(
+            r#"{
+                "vim_mode": false,
+                "buffer_font_size": 22,
+                "zednotes": {
+                    "vim": { "leader": "ctrl-space" },
+                    "explorer": { "markdown_only": false },
+                },
+            }"#,
+        )
+        .expect("native settings with zednotes policy should parse");
+
+        assert_eq!(settings.vim.leader, "ctrl-space");
+        assert!(!settings.explorer.markdown_only);
+        assert!(
+            settings.vim_mode,
+            "standard settings are owned by SettingsStore rather than the notes policy parser"
+        );
+        assert_eq!(settings.editor.font_size, DEFAULT_EDITOR_FONT_SIZE);
+        assert!(parse_notes_settings(r#"{ "zednotes": { "vim": { "leader": "g g" } } }"#).is_err());
+    }
+
+    #[test]
+    fn test_migrates_legacy_settings_to_native_schema_and_zednotes_namespace() {
+        let migrated = migrate_legacy_settings_content(
+            r#"{
+                // Preserve unrelated user-owned keys during the one-time migration.
+                "custom_unknown": { "value": 7 },
+                "theme": "dark",
+                "vim_mode": false,
+                "relative_line_numbers": "wrapped",
+                "vim": {
+                    "leader": "ctrl-space",
+                    "toggle_relative_line_numbers": true,
+                },
+                "which_key": { "enabled": false, "delay_ms": 900 },
+                "ui": { "font_family": "Test Sans", "font_size": 13.5 },
+                "editor": {
+                    "font_family": "Test Mono",
+                    "font_size": 18.5,
+                    "line_height": 1.4,
+                    "line_numbers": true,
+                    "soft_wrap": false,
+                },
+                "autosave": { "enabled": true, "delay_ms": 1250 },
+                "explorer": {
+                    "width": 320,
+                    "markdown_only": false,
+                    "show_hidden": true,
+                },
+                "files": { "exclude": ["drafts", "**/*.tmp"] },
+                "preview": {
+                    "font_family": "Test Serif",
+                    "font_size": 17,
+                    "max_width": 680,
+                    "allow_remote_images": true,
+                    "max_file_size_bytes": 2048,
+                },
+            }"#,
+        )
+        .expect("legacy settings should be migratable")
+        .expect("legacy settings should require migration");
+        let document: serde_json::Value = serde_json::from_str(&migrated).unwrap();
+
+        assert_eq!(document["custom_unknown"]["value"], 7);
+        assert_eq!(document["theme"]["mode"], "dark");
+        assert_eq!(document["ui_font_family"], "Test Sans");
+        assert_eq!(document["buffer_font_family"], "Test Mono");
+        assert_eq!(document["buffer_line_height"]["custom"], 1.4);
+        assert_eq!(document["gutter"]["line_numbers"], true);
+        assert_eq!(document["soft_wrap"], "none");
+        assert_eq!(document["autosave"]["after_delay"]["milliseconds"], 1250);
+        assert_eq!(document["project_panel"]["default_width"], 320);
+        assert_eq!(document["project_panel"]["hide_hidden"], false);
+        assert_eq!(document["file_scan_exclusions"][0], "**/drafts");
+        assert_eq!(document["file_scan_exclusions"][1], "**/*.tmp");
+        assert_eq!(document["markdown_preview"]["max_width"], 680);
+        assert_eq!(document["zednotes"]["vim"]["leader"], "ctrl-space");
+        assert_eq!(document["zednotes"]["explorer"]["markdown_only"], false);
+        for legacy_key in ["ui", "editor", "explorer", "files", "preview"] {
+            assert!(document.get(legacy_key).is_none());
+        }
+        settings::parse_json_with_comments::<settings::UserSettingsContent>(&migrated)
+            .expect("migrated settings should be accepted by the native Zed settings parser");
+    }
+
+    #[test]
+    fn test_merges_former_gui_settings_into_the_canonical_file() {
+        let merged = merge_split_settings_contents(
+            Some(
+                r#"{
+                    "editor": { "font_size": 15 },
+                    "vim": { "leader": "ctrl-space" },
+                    "explorer": { "markdown_only": false },
+                }"#,
+            ),
+            r#"{
+                "buffer_font_size": 22,
+                "theme": {
+                    "mode": "dark",
+                    "light": "One Light",
+                    "dark": "One Dark",
+                },
+            }"#,
+            true,
+        )
+        .expect("split settings should merge");
+        let document: serde_json::Value = serde_json::from_str(&merged).unwrap();
+
+        assert_eq!(document["buffer_font_size"], 22);
+        assert_eq!(document["theme"]["mode"], "dark");
+        assert_eq!(document["zednotes"]["vim"]["leader"], "ctrl-space");
+        assert_eq!(document["zednotes"]["explorer"]["markdown_only"], false);
+        assert!(document.get("editor").is_none());
+        assert!(document.get("explorer").is_none());
+    }
+
+    #[test]
+    fn test_native_initial_settings_do_not_need_migration() {
+        assert!(
+            migrate_legacy_settings_content(INITIAL_SETTINGS_CONTENT)
+                .expect("initial settings should parse")
+                .is_none()
+        );
+        settings::parse_json_with_comments::<settings::UserSettingsContent>(
+            INITIAL_SETTINGS_CONTENT,
+        )
+        .expect("initial settings should use the native Zed schema");
     }
 
     #[gpui::test]
@@ -4939,7 +5562,7 @@ mod tests {
     #[gpui::test]
     async fn test_settings_and_keymap_edits_reload_without_restart(cx: &mut TestAppContext) {
         let mut test = test_window(cx).await;
-        let config_dir = config_dir_path();
+        let config_dir = config_dir();
         test.fs
             .insert_tree(
                 &config_dir,
@@ -4955,7 +5578,7 @@ mod tests {
         test.fs
             .save(
                 &notes_settings_path(),
-                &r#"{ "editor": { "line_numbers": true } }"#.into(),
+                &r#"{ "gutter": { "line_numbers": true } }"#.into(),
                 Default::default(),
             )
             .await
@@ -4994,18 +5617,69 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_cmd_comma_creates_and_opens_settings_as_an_editor(cx: &mut TestAppContext) {
+    async fn test_cmd_comma_opens_settings_window(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+
+        test.cx.simulate_keystrokes("cmd-,");
+        test.cx.run_until_parked();
+
+        assert!(cx.read(|cx| {
+            cx.windows()
+                .iter()
+                .any(|window| window.downcast::<settings_ui::SettingsWindow>().is_some())
+        }));
+        assert_eq!(active_editor_path(&test, cx), PathBuf::from(TEST_NOTE_PATH));
+    }
+
+    #[gpui::test]
+    async fn test_cmd_k_cmd_s_opens_full_keymap_editor(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+
+        test.cx.update(|window, _| window.activate_window());
+        test.cx.simulate_keystrokes("cmd-k cmd-s");
+        test.cx.run_until_parked();
+
+        let workspace = workspace(&test, cx);
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .active_item(cx)
+                    .expect("keymap editor should be active")
+                    .tab_content_text(0, cx)
+            }),
+            "Keymap Editor"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cmd_alt_comma_creates_and_opens_settings_file(cx: &mut TestAppContext) {
         let mut test = test_window(cx).await;
         let settings_path = notes_settings_path();
         assert!(!test.fs.is_file(&settings_path).await);
 
-        test.cx.simulate_keystrokes("cmd-,");
+        test.cx.simulate_keystrokes("cmd-alt-,");
         test.cx.run_until_parked();
 
         assert_eq!(active_editor_path(&test, cx), settings_path);
         assert_eq!(
             test.fs.load(&notes_settings_path()).await.unwrap(),
             INITIAL_SETTINGS_CONTENT
+        );
+    }
+
+    #[gpui::test]
+    async fn test_open_keymap_file_action_creates_the_canonical_keymap(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+        let keymap_path = notes_keymap_path();
+        assert!(!test.fs.is_file(&keymap_path).await);
+
+        test.cx.dispatch_action(zed_actions::OpenKeymapFile);
+        test.cx.run_until_parked();
+
+        assert_eq!(active_editor_path(&test, cx), keymap_path);
+        assert_eq!(
+            test.fs.load(&notes_keymap_path()).await.unwrap(),
+            settings::initial_keymap_content()
         );
     }
 
@@ -5923,8 +6597,8 @@ mod tests {
     }
 
     #[test]
-    fn test_parses_explorer_settings_from_jsonc() {
-        let settings = parse_notes_settings(
+    fn test_legacy_parser_reads_explorer_settings_from_jsonc() {
+        let settings = parse_legacy_notes_settings(
             r#"
             {
                 // Non-Markdown files are useful in mixed vaults.
@@ -5953,8 +6627,8 @@ mod tests {
     }
 
     #[test]
-    fn test_parses_preview_settings_from_jsonc() {
-        let settings = parse_notes_settings(
+    fn test_legacy_parser_reads_preview_settings_from_jsonc() {
+        let settings = parse_legacy_notes_settings(
             r#"
             {
                 "preview": {

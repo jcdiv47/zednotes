@@ -41,7 +41,9 @@ fn main() {
     log::info!("starting zednotes {}", env!("CARGO_PKG_VERSION"));
 
     let data_dir = notes_app::application_support_dir();
+    let config_dir = notes_app::default_config_dir();
     paths::set_custom_data_dir(data_dir.to_string_lossy().as_ref());
+    paths::set_custom_config_dir(config_dir.to_string_lossy().as_ref());
     let application = application().with_assets(Assets);
     application.on_reopen(notes_app::reopen);
     let database = AppDatabase::new();

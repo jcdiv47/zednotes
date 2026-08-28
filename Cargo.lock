@@ -11357,7 +11357,7 @@ dependencies = [
 
 [[package]]
 name = "notes_app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "assets",
@@ -11379,6 +11379,7 @@ dependencies = [
  "grammars",
  "http_client",
  "image_viewer",
+ "keymap_editor",
  "language",
  "language_model",
  "log",
@@ -11400,6 +11401,7 @@ dependencies = [
  "serde_json",
  "session",
  "settings",
+ "settings_ui",
  "tab_switcher",
  "theme",
  "theme_settings",

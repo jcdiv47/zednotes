@@ -51,6 +51,10 @@ pub const APP_NAME_LOWERCASE: &str = {
 /// The directory will be created if it doesn't exist when set.
 static CUSTOM_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+/// A custom configuration directory override, set only by
+/// `set_custom_config_dir`.
+static CUSTOM_CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
+
 /// The resolved data directory, combining custom override or platform defaults.
 /// This is set once and cached for subsequent calls.
 /// On macOS, this is `~/Library/Application Support/Zed`.
@@ -118,10 +122,31 @@ pub fn set_custom_data_dir(dir: &str) -> &'static PathBuf {
     })
 }
 
+/// Sets a custom directory for user configuration files, independently of the
+/// data directory.
+///
+/// This function must be called before [`config_dir`] or any path derived from
+/// it is initialized. The directory is created and canonicalized immediately.
+pub fn set_custom_config_dir(dir: &str) -> &'static PathBuf {
+    if CONFIG_DIR.get().is_some() {
+        panic!("set_custom_config_dir called after config_dir was initialized");
+    }
+    CUSTOM_CONFIG_DIR.get_or_init(|| {
+        let path = PathBuf::from(dir);
+        std::fs::create_dir_all(&path).expect("failed to create custom config directory");
+        let canonicalized = path
+            .canonicalize()
+            .expect("failed to canonicalize custom config directory's path to an absolute path");
+        SanitizedPath::new(&canonicalized).as_path().to_path_buf()
+    })
+}
+
 /// Returns the path to the configuration directory used by Zed.
 pub fn config_dir() -> &'static PathBuf {
     CONFIG_DIR.get_or_init(|| {
-        if let Some(custom_dir) = CUSTOM_DATA_DIR.get() {
+        if let Some(custom_dir) = CUSTOM_CONFIG_DIR.get() {
+            custom_dir.clone()
+        } else if let Some(custom_dir) = CUSTOM_DATA_DIR.get() {
             custom_dir.join("config")
         } else if cfg!(target_os = "windows") {
             dirs::config_dir()

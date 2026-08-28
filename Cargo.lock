@@ -11412,6 +11412,7 @@ dependencies = [
  "vim",
  "workspace",
  "zed_actions",
+ "zlog",
 ]
 
 [[package]]

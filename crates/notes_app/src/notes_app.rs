@@ -10,7 +10,7 @@ use std::{
     path::Path,
     path::PathBuf,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -1260,6 +1260,27 @@ pub fn application_support_dir() -> PathBuf {
         .join("Library")
         .join("Application Support")
         .join(APP_NAME)
+}
+
+pub fn logs_dir() -> &'static PathBuf {
+    static LOGS_DIR: OnceLock<PathBuf> = OnceLock::new();
+    LOGS_DIR.get_or_init(|| {
+        if cfg!(target_os = "macos") {
+            paths::home_dir().join("Library/Logs").join(APP_NAME)
+        } else {
+            application_support_dir().join("logs")
+        }
+    })
+}
+
+pub fn log_file() -> &'static PathBuf {
+    static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
+    LOG_FILE.get_or_init(|| logs_dir().join(format!("{APP_NAME}.log")))
+}
+
+pub fn old_log_file() -> &'static PathBuf {
+    static OLD_LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
+    OLD_LOG_FILE.get_or_init(|| logs_dir().join(format!("{APP_NAME}.log.old")))
 }
 
 fn notes_settings_path() -> PathBuf {
@@ -3693,6 +3714,20 @@ mod tests {
                 .join("zednotes")
         );
         assert!(!application_support_dir().starts_with(env!("CARGO_MANIFEST_DIR")));
+    }
+
+    #[test]
+    fn test_logs_are_isolated_from_upstream_zed() {
+        assert_eq!(
+            logs_dir(),
+            &paths::home_dir()
+                .join("Library")
+                .join("Logs")
+                .join("zednotes")
+        );
+        assert_eq!(log_file(), &logs_dir().join("zednotes.log"));
+        assert_eq!(old_log_file(), &logs_dir().join("zednotes.log.old"));
+        assert!(!log_file().starts_with(paths::logs_dir()));
     }
 
     #[test]

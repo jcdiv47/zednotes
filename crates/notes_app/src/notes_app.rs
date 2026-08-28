@@ -2860,6 +2860,15 @@ fn init_workspace_composition(
         workspace.register_action(|_, _: &Zoom, window, _| {
             window.zoom_window();
         });
+        workspace.register_action(|_, _: &zed_actions::IncreaseBufferFontSize, _, cx| {
+            theme_settings::increase_buffer_font_size(cx);
+        });
+        workspace.register_action(|_, _: &zed_actions::DecreaseBufferFontSize, _, cx| {
+            theme_settings::decrease_buffer_font_size(cx);
+        });
+        workspace.register_action(|_, _: &zed_actions::ResetBufferFontSize, _, cx| {
+            theme_settings::reset_buffer_font_size(cx);
+        });
         workspace.register_action(|workspace, _: &Search, window, cx| {
             ProjectSearchView::deploy_search(
                 workspace,
@@ -4603,6 +4612,27 @@ mod tests {
             format!("x{TEST_NOTE}"),
             "disabling Vim should make normal text input insert immediately"
         );
+    }
+
+    #[gpui::test]
+    async fn test_editor_font_size_shortcuts(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+        let font_size = |cx: &mut TestAppContext| {
+            cx.update(|cx| theme_settings::ThemeSettings::get_global(cx).buffer_font_size(cx))
+        };
+        let initial_font_size = font_size(cx);
+
+        test.cx.simulate_keystrokes("cmd-+");
+        assert_eq!(font_size(cx), initial_font_size + px(1.0));
+
+        test.cx.simulate_keystrokes("cmd--");
+        assert_eq!(font_size(cx), initial_font_size);
+
+        test.cx.simulate_keystrokes("cmd-=");
+        assert_eq!(font_size(cx), initial_font_size + px(1.0));
+
+        test.cx.simulate_keystrokes("cmd-0");
+        assert_eq!(font_size(cx), initial_font_size);
     }
 
     #[gpui::test]

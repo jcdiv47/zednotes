@@ -20,6 +20,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 assets.workspace = true
 client.workspace = true
+chrono.workspace = true
 command_palette.workspace = true
 db.workspace = true
 editor.workspace = true

@@ -11361,6 +11361,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "assets",
+ "chrono",
  "client",
  "command_palette",
  "command_palette_hooks",

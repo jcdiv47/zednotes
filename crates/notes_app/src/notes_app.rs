@@ -7,8 +7,8 @@ use std::{
     cell::Cell,
     cmp::Reverse,
     io::ErrorKind,
-    path::Path,
-    path::PathBuf,
+    ops::Range,
+    path::{Component, Path, PathBuf},
     rc::Rc,
     sync::{Arc, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -16,9 +16,10 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use assets::Assets;
+use chrono::{Local, NaiveDate, SecondsFormat, format::Item, format::StrftimeItems};
 use client::{Client, UserStore};
 use db::kvp::KeyValueStore;
-use editor::{Editor, EditorEvent};
+use editor::{Editor, EditorEvent, SelectionEffects, scroll::Autoscroll};
 use fs::{Fs, PathEventKind, RealFs};
 use futures::StreamExt as _;
 use git::GitHostingProviderRegistry;
@@ -101,6 +102,10 @@ const DEFAULT_PREVIEW_FONT_FAMILY: &str = ".SystemUIFont";
 const DEFAULT_PREVIEW_FONT_SIZE: f32 = 16.0;
 const DEFAULT_VIM_LEADER: &str = "space";
 const DEFAULT_WHICH_KEY_DELAY_MS: u64 = 500;
+const DEFAULT_DAILY_NOTES_DIRECTORY: &str = "journal";
+const DEFAULT_DAILY_NOTES_FILENAME_FORMAT: &str = "%Y-%m-%d.md";
+const DEFAULT_DAILY_NOTE_TEMPLATE: &str =
+    "---\ntitle: \"{{title}}\"\ndate: {{datetime}}\nlastUpdated: {{datetime}}\n---\n\n";
 const RECENT_NOTES_KEY: &str = "notes_recent_usage";
 const MAX_RECENT_NOTES: usize = 512;
 const INITIAL_SETTINGS_CONTENT: &str = r#"{
@@ -168,6 +173,13 @@ const INITIAL_SETTINGS_CONTENT: &str = r#"{
     "explorer": {
       "markdown_only": true,
     },
+    "daily_notes": {
+      "directory": "journal",
+      "filename_format": "%Y-%m-%d.md",
+      // Optional path relative to the notes folder. The template may use
+      // {{date}}, {{datetime}}, and {{title}} placeholders.
+      // "template": "templates/daily.md",
+    },
   },
 }
 "#;
@@ -220,6 +232,9 @@ actions!(
     [
         /// Creates a new Markdown note.
         New,
+        /// Opens today's note, creating it from the daily template when absent.
+        #[action(name = "Open Today")]
+        OpenToday,
         /// Creates a new directory in the notes workspace.
         NewDirectory,
         /// Renames the selected note or directory.
@@ -340,6 +355,13 @@ struct NotesWhichKeySettings {
     delay_ms: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DailyNotesSettings {
+    directory: String,
+    filename_format: String,
+    template: Option<String>,
+}
+
 impl Default for AutosaveSettings {
     fn default() -> Self {
         Self {
@@ -363,6 +385,16 @@ impl Default for NotesWhichKeySettings {
         Self {
             enabled: true,
             delay_ms: DEFAULT_WHICH_KEY_DELAY_MS,
+        }
+    }
+}
+
+impl Default for DailyNotesSettings {
+    fn default() -> Self {
+        Self {
+            directory: DEFAULT_DAILY_NOTES_DIRECTORY.to_owned(),
+            filename_format: DEFAULT_DAILY_NOTES_FILENAME_FORMAT.to_owned(),
+            template: None,
         }
     }
 }
@@ -405,6 +437,7 @@ struct NotesSettings {
     autosave: AutosaveSettings,
     explorer: ExplorerSettings,
     preview: PreviewSettings,
+    daily_notes: DailyNotesSettings,
 }
 
 impl Default for NotesSettings {
@@ -420,6 +453,7 @@ impl Default for NotesSettings {
             autosave: AutosaveSettings::default(),
             explorer: ExplorerSettings::default(),
             preview: PreviewSettings::default(),
+            daily_notes: DailyNotesSettings::default(),
         }
     }
 }
@@ -1147,6 +1181,7 @@ struct LegacyNotesSettingsContent {
     explorer: Option<ExplorerSettingsContent>,
     files: Option<FileSettingsContent>,
     preview: Option<PreviewSettingsContent>,
+    daily_notes: Option<DailyNotesSettingsContent>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1201,6 +1236,86 @@ struct PreviewSettingsContent {
     max_width: Option<u32>,
     allow_remote_images: Option<bool>,
     max_file_size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DailyNotesSettingsContent {
+    directory: Option<String>,
+    filename_format: Option<String>,
+    template: Option<String>,
+}
+
+fn validate_vault_relative_path(value: &str, setting_name: &str, allow_empty: bool) -> Result<()> {
+    anyhow::ensure!(
+        allow_empty || !value.trim().is_empty(),
+        "{setting_name} cannot be empty"
+    );
+    let path = Path::new(value);
+    anyhow::ensure!(
+        !path.is_absolute()
+            && path
+                .components()
+                .all(|component| matches!(component, Component::Normal(_))),
+        "{setting_name} must stay inside the notes folder"
+    );
+    Ok(())
+}
+
+fn validate_daily_notes_settings(settings: &DailyNotesSettings) -> Result<()> {
+    validate_vault_relative_path(&settings.directory, "zednotes.daily_notes.directory", true)?;
+    anyhow::ensure!(
+        !settings.filename_format.trim().is_empty(),
+        "zednotes.daily_notes.filename_format cannot be empty"
+    );
+    anyhow::ensure!(
+        !StrftimeItems::new(&settings.filename_format).any(|item| matches!(item, Item::Error)),
+        "zednotes.daily_notes.filename_format contains an invalid date directive"
+    );
+    let validation_date = NaiveDate::from_ymd_opt(2000, 1, 2)
+        .context("failed to construct the daily notes validation date")?;
+    let example_filename = validation_date
+        .format(&settings.filename_format)
+        .to_string();
+    validate_vault_relative_path(
+        &example_filename,
+        "zednotes.daily_notes.filename_format",
+        false,
+    )?;
+    anyhow::ensure!(
+        Path::new(&example_filename).components().count() == 1,
+        "zednotes.daily_notes.filename_format must produce one filename"
+    );
+    anyhow::ensure!(
+        is_markdown_path(Path::new(&example_filename)),
+        "zednotes.daily_notes.filename_format must produce a Markdown filename"
+    );
+    if let Some(template) = &settings.template {
+        validate_vault_relative_path(template, "zednotes.daily_notes.template", false)?;
+    }
+    Ok(())
+}
+
+fn daily_note_relative_path(settings: &DailyNotesSettings, date: NaiveDate) -> Result<PathBuf> {
+    validate_daily_notes_settings(settings)?;
+    let filename = date.format(&settings.filename_format).to_string();
+    Ok(Path::new(&settings.directory).join(filename))
+}
+
+fn render_daily_note_template(
+    template: &str,
+    date: NaiveDate,
+    datetime: &str,
+    note_path: &Path,
+) -> String {
+    let date = date.format("%Y-%m-%d").to_string();
+    let title = note_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(&date);
+    template
+        .replace("{{date}}", &date)
+        .replace("{{datetime}}", datetime)
+        .replace("{{title}}", title)
 }
 
 fn parse_legacy_notes_settings(content: &str) -> Result<NotesSettings> {
@@ -1260,6 +1375,15 @@ fn parse_legacy_notes_settings(content: &str) -> Result<NotesSettings> {
             .max_file_size_bytes
             .or(settings.preview.max_file_size_bytes);
     }
+    if let Some(daily_notes) = content.daily_notes {
+        settings.daily_notes.directory = daily_notes
+            .directory
+            .unwrap_or(settings.daily_notes.directory);
+        settings.daily_notes.filename_format = daily_notes
+            .filename_format
+            .unwrap_or(settings.daily_notes.filename_format);
+        settings.daily_notes.template = daily_notes.template;
+    }
 
     anyhow::ensure!(
         !settings.ui.font_family.trim().is_empty(),
@@ -1303,6 +1427,7 @@ fn parse_legacy_notes_settings(content: &str) -> Result<NotesSettings> {
         settings.preview.max_width > 0,
         "preview.max_width must be positive"
     );
+    validate_daily_notes_settings(&settings.daily_notes)?;
     Ok(settings)
 }
 
@@ -1315,6 +1440,7 @@ struct ZednotesSettingsRoot {
 struct ZednotesSettingsContent {
     vim: Option<ZednotesVimSettingsContent>,
     explorer: Option<ZednotesExplorerSettingsContent>,
+    daily_notes: Option<DailyNotesSettingsContent>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1334,6 +1460,7 @@ fn validate_notes_settings(settings: &NotesSettings) -> Result<()> {
     );
     Keystroke::parse(&settings.vim.leader)
         .with_context(|| format!("invalid zednotes.vim.leader {:?}", settings.vim.leader))?;
+    validate_daily_notes_settings(&settings.daily_notes)?;
     Ok(())
 }
 
@@ -1359,6 +1486,15 @@ fn parse_notes_settings(content: &str) -> Result<NotesSettings> {
                 .markdown_only
                 .unwrap_or(settings.explorer.markdown_only);
         }
+        if let Some(daily_notes) = zednotes.daily_notes {
+            settings.daily_notes.directory = daily_notes
+                .directory
+                .unwrap_or(settings.daily_notes.directory);
+            settings.daily_notes.filename_format = daily_notes
+                .filename_format
+                .unwrap_or(settings.daily_notes.filename_format);
+            settings.daily_notes.template = daily_notes.template;
+        }
     }
     validate_notes_settings(&settings)?;
     Ok(settings)
@@ -1369,9 +1505,16 @@ fn is_legacy_settings(root: &serde_json::Map<String, serde_json::Value>) -> bool
         theme
             .as_str()
             .is_some_and(|theme| matches!(theme, "system" | "light" | "dark"))
-    }) || ["ui", "editor", "explorer", "files", "preview"]
-        .iter()
-        .any(|key| root.contains_key(*key))
+    }) || [
+        "ui",
+        "editor",
+        "explorer",
+        "files",
+        "preview",
+        "daily_notes",
+    ]
+    .iter()
+    .any(|key| root.contains_key(*key))
         || root.get("autosave").is_some_and(|autosave| {
             autosave.as_object().is_some_and(|autosave| {
                 autosave.contains_key("enabled") || autosave.contains_key("delay_ms")
@@ -1413,7 +1556,14 @@ fn migrate_legacy_settings_content(content: &str) -> Result<Option<String>> {
     }
 
     let settings = parse_legacy_notes_settings(content)?;
-    for legacy_key in ["ui", "editor", "explorer", "files", "preview"] {
+    for legacy_key in [
+        "ui",
+        "editor",
+        "explorer",
+        "files",
+        "preview",
+        "daily_notes",
+    ] {
         root.remove(legacy_key);
     }
 
@@ -1533,6 +1683,18 @@ fn migrate_legacy_settings_content(content: &str) -> Result<Option<String>> {
         "markdown_only".to_owned(),
         settings.explorer.markdown_only.into(),
     );
+    let daily_notes = nested_object(zednotes, "daily_notes");
+    daily_notes.insert(
+        "directory".to_owned(),
+        settings.daily_notes.directory.clone().into(),
+    );
+    daily_notes.insert(
+        "filename_format".to_owned(),
+        settings.daily_notes.filename_format.clone().into(),
+    );
+    if let Some(template) = &settings.daily_notes.template {
+        daily_notes.insert("template".to_owned(), template.clone().into());
+    }
 
     let mut migrated = serde_json::to_string_pretty(&document)?;
     migrated.push('\n');
@@ -1788,6 +1950,84 @@ fn is_markdown_path(path: &Path) -> bool {
         .is_some_and(|extension| {
             extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown")
         })
+}
+
+fn frontmatter_last_updated_range(text: &str) -> Option<(Range<usize>, Option<char>)> {
+    let mut lines = text.split_inclusive('\n');
+    let first_line = lines.next()?;
+    if first_line.trim_end_matches(['\r', '\n']) != "---" {
+        return None;
+    }
+
+    let mut offset = first_line.len();
+    let mut last_updated = None;
+    for line in lines {
+        let content = line.trim_end_matches(['\r', '\n']);
+        if content == "---" {
+            return last_updated;
+        }
+
+        if let Some(value) = content.strip_prefix("lastUpdated:") {
+            if last_updated.is_some() {
+                return None;
+            }
+
+            let leading_whitespace = value.len() - value.trim_start().len();
+            let trailing_whitespace = value.len() - value.trim_end().len();
+            let value_start = offset + "lastUpdated:".len() + leading_whitespace;
+            let value_end = offset + content.len() - trailing_whitespace;
+            let old_value = &text[value_start..value_end];
+            let quote = match (old_value.chars().next(), old_value.chars().last()) {
+                (Some(start), Some(end)) if start == end && matches!(start, '\'' | '"') => {
+                    Some(start)
+                }
+                _ => None,
+            };
+            last_updated = Some((value_start..value_end, quote));
+        }
+
+        offset += line.len();
+    }
+    None
+}
+
+fn update_last_updated_before_save(buffer: &Entity<Buffer>, cx: &mut App) {
+    let edit = {
+        let buffer = buffer.read(cx);
+        if !buffer.is_dirty() {
+            return;
+        }
+        let Some(path) = buffer
+            .file()
+            .and_then(|file| file.as_local().map(|file| file.abs_path(cx)))
+        else {
+            return;
+        };
+        if !is_markdown_path(&path) {
+            return;
+        }
+
+        frontmatter_last_updated_range(&buffer.snapshot().text())
+    };
+    let Some((range, quote)) = edit else {
+        return;
+    };
+
+    let timestamp = Local::now().to_rfc3339_opts(SecondsFormat::Secs, false);
+    let replacement = quote
+        .map(|quote| format!("{quote}{timestamp}{quote}"))
+        .unwrap_or(timestamp);
+    buffer.update(cx, |buffer, cx| {
+        if !buffer.is_dirty() {
+            return;
+        }
+        buffer.finalize_last_transaction();
+        buffer.start_transaction();
+        buffer.edit([(range, replacement)], None, cx);
+        if let Some(transaction_id) = buffer.end_transaction(cx) {
+            buffer.forget_transaction(transaction_id);
+        }
+    });
 }
 
 fn markdown_note_filename(filename: &str) -> String {
@@ -2066,6 +2306,7 @@ fn notes_vim_key_bindings(leader: &str) -> Vec<KeyBinding> {
         KeyBinding::new(&keys("f g"), Search, CONTEXT),
         KeyBinding::new(&keys("f n"), New, CONTEXT),
         KeyBinding::new(&keys("f r"), OpenRecentNote, CONTEXT),
+        KeyBinding::new(&keys("n d"), OpenToday, CONTEXT),
         KeyBinding::new(&keys("p"), zed_actions::command_palette::Toggle, CONTEXT),
         KeyBinding::new(&keys("e"), ToggleExplorer, CONTEXT),
         KeyBinding::new(&keys("v"), TogglePreview, CONTEXT),
@@ -2145,6 +2386,7 @@ fn bind_default_editor_keymaps(cx: &mut App) -> Result<()> {
         KeyBinding::new("cmd-e", OpenRecentNote, Some("ProjectPanel")),
         KeyBinding::new("cmd-e", OpenRecentNote, Some("Workspace")),
         KeyBinding::new("cmd-n", New, Some("Workspace")),
+        KeyBinding::new("cmd-shift-j", OpenToday, Some("Workspace")),
         KeyBinding::new("cmd-b", ToggleExplorer, Some("Workspace")),
         KeyBinding::new("cmd-shift-enter", ToggleFocusMode, Some("Workspace")),
         KeyBinding::new("cmd-shift-f", Search, Some("Pane")),
@@ -2291,6 +2533,7 @@ fn notes_menus() -> Vec<Menu> {
         Menu::new(APP_NAME).items(application_items),
         Menu::new("File").items([
             MenuItem::action("New Note…", New),
+            MenuItem::action("Open Today", OpenToday),
             MenuItem::action("Open Folder…", OpenFolder),
             MenuItem::action("Switch Project…", OpenRecentWorkspace),
             MenuItem::separator(),
@@ -2355,6 +2598,7 @@ fn init_editor_subsystems(cx: &mut App) -> Result<()> {
     zed_actions::init();
     command_palette::init(cx);
     editor::init(cx);
+    editor::register_before_save_buffer_hook(update_last_updated_before_save, cx);
     language_model::init(cx);
     file_finder::init_with_file_filter_file_creation_and_history_ranker(
         Arc::new(is_markdown_path),
@@ -3140,6 +3384,115 @@ fn open_preview(workspace: &mut Workspace, window: &mut Window, cx: &mut gpui::C
     MarkdownPreviewView::open_preview_in_pane(workspace, editor, pane, window, cx);
 }
 
+fn active_notes_root(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
+    let project = workspace.project().read(cx);
+    let active_worktree = workspace
+        .active_item(cx)
+        .and_then(|item| item.project_path(cx))
+        .and_then(|path| project.worktree_for_id(path.worktree_id, cx));
+    active_worktree
+        .or_else(|| project.visible_worktrees(cx).next())
+        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+}
+
+fn open_today(workspace: &mut Workspace, window: &mut Window, cx: &mut gpui::Context<Workspace>) {
+    let Some(notes_root) = active_notes_root(workspace, cx) else {
+        workspace.show_toast(
+            Toast::new(
+                NotificationId::Named("notes-daily-note-no-worktree".into()),
+                "Open a notes folder before opening today's note",
+            )
+            .autohide(),
+            cx,
+        );
+        return;
+    };
+    let settings = cx.global::<CurrentNotesSettings>().0.daily_notes.clone();
+    let now = Local::now();
+    let date = now.date_naive();
+    let datetime = now.to_rfc3339_opts(SecondsFormat::Secs, false);
+    let relative_path = match daily_note_relative_path(&settings, date) {
+        Ok(path) => path,
+        Err(error) => {
+            log::error!("invalid daily notes settings: {error:#}");
+            workspace.show_toast(
+                Toast::new(
+                    NotificationId::Named("notes-invalid-daily-note-settings".into()),
+                    format!("Invalid daily notes settings: {error}"),
+                )
+                .autohide(),
+                cx,
+            );
+            return;
+        }
+    };
+    let note_path = notes_root.join(relative_path);
+    let template_path = settings
+        .template
+        .as_deref()
+        .map(|template| notes_root.join(template));
+    let fs = workspace.app_state().fs.clone();
+
+    cx.spawn_in(window, async move |workspace, cx| {
+        let created = !fs.is_file(&note_path).await;
+        if created {
+            let template = if let Some(template_path) = template_path {
+                fs.load(&template_path).await.with_context(|| {
+                    format!(
+                        "failed to read daily note template {}",
+                        template_path.display()
+                    )
+                })?
+            } else {
+                DEFAULT_DAILY_NOTE_TEMPLATE.to_owned()
+            };
+            let content = render_daily_note_template(&template, date, &datetime, &note_path);
+            let parent = note_path
+                .parent()
+                .context("the daily note path has no parent directory")?;
+            fs.create_dir(parent)
+                .await
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+            fs.save(&note_path, &content.as_str().into(), Default::default())
+                .await
+                .with_context(|| format!("failed to create {}", note_path.display()))?;
+        }
+
+        let item = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    note_path,
+                    OpenOptions {
+                        visible: Some(OpenVisible::None),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })?
+            .await?;
+
+        if created && let Some(editor) = item.downcast::<Editor>() {
+            editor.update_in(cx, |editor, window, cx| {
+                let end = editor.buffer().read(cx).len(cx);
+                editor.change_selections(
+                    SelectionEffects::scroll(Autoscroll::center()),
+                    window,
+                    cx,
+                    |selections| selections.select_ranges([end..end]),
+                );
+            })?;
+            workspace.update_in(cx, |_, window, cx| {
+                editor.focus_handle(cx).focus(window, cx);
+                window.dispatch_action(vim::SwitchToInsertMode.boxed_clone(), cx);
+            })?;
+        }
+
+        anyhow::Ok(())
+    })
+    .detach_and_prompt_err("Failed to open today's note", window, cx, |_, _, _| None);
+}
+
 fn follow_link(workspace: &mut Workspace, window: &mut Window, cx: &mut gpui::Context<Workspace>) {
     let Some(editor) = workspace.active_item_as::<Editor>(cx) else {
         return;
@@ -3440,6 +3793,9 @@ fn init_workspace_composition(
         });
         workspace.register_action(|workspace, _: &New, window, cx| {
             dispatch_project_panel_action(workspace, "project_panel::NewFile", window, cx);
+        });
+        workspace.register_action(|workspace, _: &OpenToday, window, cx| {
+            open_today(workspace, window, cx);
         });
         workspace.register_action(|workspace, _: &NewDirectory, window, cx| {
             dispatch_project_panel_action(workspace, "project_panel::NewDirectory", window, cx);
@@ -3995,6 +4351,7 @@ mod tests {
 
     const TEST_NOTE_PATH: &str = "/notes/spike.md";
     const TEST_NOTE: &str = "# Spike\n\n- **fast** editing\n";
+    const TEST_TRACKED_NOTE: &str = "---\ntitle: \"Spike\"\ndate: 2000-01-01T00:00:00+08:00\nlastUpdated: 2000-01-01T00:00:00+08:00\n---\n\n# Spike\n";
 
     struct TestWindow {
         fs: Arc<FakeFs>,
@@ -4157,6 +4514,31 @@ mod tests {
                     .expect("an editor should be active")
             })
             .expect("failed to read the notes window")
+    }
+
+    fn active_buffer(test: &TestWindow, cx: &TestAppContext) -> gpui::Entity<Buffer> {
+        active_editor(test, cx).read_with(cx, |editor, cx| {
+            editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .expect("the active editor should have one buffer")
+        })
+    }
+
+    fn append_to_active_buffer(test: &TestWindow, text: &str, cx: &mut TestAppContext) {
+        active_buffer(test, cx).update(cx, |buffer, cx| {
+            let end = buffer.snapshot().text().len();
+            buffer.start_transaction();
+            buffer.edit([(end..end, text)], None, cx);
+            buffer.end_transaction(cx);
+        });
+    }
+
+    fn last_updated_value(content: &str) -> &str {
+        let (range, _) = frontmatter_last_updated_range(content)
+            .expect("the note should have a lastUpdated front matter field");
+        &content[range]
     }
 
     fn workspace(test: &TestWindow, cx: &TestAppContext) -> gpui::Entity<Workspace> {
@@ -5237,6 +5619,11 @@ mod tests {
                 "zednotes": {
                     "vim": { "leader": "ctrl-space" },
                     "explorer": { "markdown_only": false },
+                    "daily_notes": {
+                        "directory": "log",
+                        "filename_format": "%Y%m%d.md",
+                        "template": "templates/log.md",
+                    },
                 },
             }"#,
         )
@@ -5244,12 +5631,56 @@ mod tests {
 
         assert_eq!(settings.vim.leader, "ctrl-space");
         assert!(!settings.explorer.markdown_only);
+        assert_eq!(settings.daily_notes.directory, "log");
+        assert_eq!(settings.daily_notes.filename_format, "%Y%m%d.md");
+        assert_eq!(
+            settings.daily_notes.template.as_deref(),
+            Some("templates/log.md")
+        );
         assert!(
             settings.vim_mode,
             "standard settings are owned by SettingsStore rather than the notes policy parser"
         );
         assert_eq!(settings.editor.font_size, DEFAULT_EDITOR_FONT_SIZE);
         assert!(parse_notes_settings(r#"{ "zednotes": { "vim": { "leader": "g g" } } }"#).is_err());
+    }
+
+    #[test]
+    fn test_daily_note_path_and_template_placeholders() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 29).unwrap();
+        let settings = DailyNotesSettings {
+            directory: "journal".to_owned(),
+            filename_format: "%Y-%m-%d.md".to_owned(),
+            template: None,
+        };
+        let path = daily_note_relative_path(&settings, date).unwrap();
+
+        assert_eq!(path, PathBuf::from("journal/2026-08-29.md"));
+        assert_eq!(
+            render_daily_note_template(
+                "---\ntitle: \"{{title}}\"\ndate: {{datetime}}\nlastUpdated: {{datetime}}\n---\n\nDate: {{date}}\n",
+                date,
+                "2026-08-29T10:01:02+08:00",
+                &path,
+            ),
+            "---\ntitle: \"2026-08-29\"\ndate: 2026-08-29T10:01:02+08:00\nlastUpdated: 2026-08-29T10:01:02+08:00\n---\n\nDate: 2026-08-29\n"
+        );
+    }
+
+    #[test]
+    fn test_daily_note_settings_cannot_escape_the_notes_folder() {
+        for content in [
+            r#"{ "zednotes": { "daily_notes": { "directory": "../outside" } } }"#,
+            r#"{ "zednotes": { "daily_notes": { "filename_format": "%Y/%m/%d.md" } } }"#,
+            r#"{ "zednotes": { "daily_notes": { "filename_format": "%Q.md" } } }"#,
+            r#"{ "zednotes": { "daily_notes": { "filename_format": "%Y.txt" } } }"#,
+            r#"{ "zednotes": { "daily_notes": { "template": "/tmp/daily.md" } } }"#,
+        ] {
+            assert!(
+                parse_notes_settings(content).is_err(),
+                "{content} should fail"
+            );
+        }
     }
 
     #[test]
@@ -5288,6 +5719,11 @@ mod tests {
                     "allow_remote_images": true,
                     "max_file_size_bytes": 2048,
                 },
+                "daily_notes": {
+                    "directory": "log",
+                    "filename_format": "%Y%m%d.md",
+                    "template": "templates/log.md",
+                },
             }"#,
         )
         .expect("legacy settings should be migratable")
@@ -5309,7 +5745,23 @@ mod tests {
         assert_eq!(document["markdown_preview"]["max_width"], 680);
         assert_eq!(document["zednotes"]["vim"]["leader"], "ctrl-space");
         assert_eq!(document["zednotes"]["explorer"]["markdown_only"], false);
-        for legacy_key in ["ui", "editor", "explorer", "files", "preview"] {
+        assert_eq!(document["zednotes"]["daily_notes"]["directory"], "log");
+        assert_eq!(
+            document["zednotes"]["daily_notes"]["filename_format"],
+            "%Y%m%d.md"
+        );
+        assert_eq!(
+            document["zednotes"]["daily_notes"]["template"],
+            "templates/log.md"
+        );
+        for legacy_key in [
+            "ui",
+            "editor",
+            "explorer",
+            "files",
+            "preview",
+            "daily_notes",
+        ] {
             assert!(document.get(legacy_key).is_none());
         }
         settings::parse_json_with_comments::<settings::UserSettingsContent>(&migrated)
@@ -6143,6 +6595,7 @@ mod tests {
         let _test = test_window(cx).await;
         for action_name in [
             "note::New",
+            "note::Open Today",
             "note::NewDirectory",
             "note::Rename",
             "note::Delete",
@@ -6187,6 +6640,202 @@ mod tests {
         assert_eq!(
             active_editor_path(&test, cx),
             PathBuf::from("/notes/from-palette.md")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_open_today_shortcut_creates_note_from_template_and_enters_insert_mode(
+        cx: &mut TestAppContext,
+    ) {
+        let mut test = test_window(cx).await;
+        test.fs
+            .create_dir(Path::new("/notes/templates"))
+            .await
+            .unwrap();
+        test.fs
+            .save(
+                Path::new("/notes/templates/daily.md"),
+                &"---\ntitle: \"{{title}}\"\ndate: {{datetime}}\nlastUpdated: {{datetime}}\n---\n\nStart here: ".into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let mut settings = cx.update(|cx| cx.global::<CurrentNotesSettings>().0.clone());
+        settings.daily_notes.filename_format = "today.md".to_owned();
+        settings.daily_notes.template = Some("templates/daily.md".to_owned());
+        cx.update(|cx| apply_notes_settings(settings, cx));
+
+        test.cx.simulate_keystrokes("cmd-shift-j");
+        test.cx.run_until_parked();
+
+        let note_path = Path::new("/notes/journal/today.md");
+        let content = test.fs.load(note_path).await.unwrap();
+        let lines = content.lines().collect::<Vec<_>>();
+        assert_eq!(lines.first().copied(), Some("---"));
+        assert_eq!(lines.get(1).copied(), Some("title: \"today\""));
+        let created_at = lines
+            .get(2)
+            .and_then(|line| line.strip_prefix("date: "))
+            .expect("the template should render its creation timestamp");
+        let last_updated = lines
+            .get(3)
+            .and_then(|line| line.strip_prefix("lastUpdated: "))
+            .expect("the template should render its update timestamp");
+        assert_eq!(created_at, last_updated);
+        chrono::DateTime::parse_from_rfc3339(created_at)
+            .expect("the rendered timestamp should include its UTC offset");
+        assert_eq!(lines.get(4).copied(), Some("---"));
+        assert!(content.ends_with("\n\nStart here: "));
+        assert_eq!(active_editor_path(&test, cx), note_path);
+        test.cx.simulate_keystrokes("x");
+        assert_eq!(
+            active_editor(&test, cx).read_with(cx, |editor, cx| editor.text(cx)),
+            format!("{content}x")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_open_today_does_not_overwrite_an_existing_note(cx: &mut TestAppContext) {
+        let mut test = test_window(cx).await;
+        test.fs
+            .create_dir(Path::new("/notes/journal"))
+            .await
+            .unwrap();
+        let note_path = Path::new("/notes/journal/today.md");
+        test.fs
+            .save(note_path, &"Existing entry\n".into(), Default::default())
+            .await
+            .unwrap();
+        let mut settings = cx.update(|cx| cx.global::<CurrentNotesSettings>().0.clone());
+        settings.daily_notes.filename_format = "today.md".to_owned();
+        cx.update(|cx| apply_notes_settings(settings, cx));
+
+        test.cx.dispatch_action(OpenToday);
+        test.cx.run_until_parked();
+
+        assert_eq!(test.fs.load(note_path).await.unwrap(), "Existing entry\n");
+        assert_eq!(active_editor_path(&test, cx), note_path);
+    }
+
+    #[gpui::test]
+    async fn test_save_updates_last_updated_when_note_content_changed(cx: &mut TestAppContext) {
+        let mut test = test_window_with_settings(
+            cx,
+            ExplorerSettings::default(),
+            AutosaveSettings {
+                enabled: false,
+                delay_ms: DEFAULT_AUTOSAVE_DELAY_MS,
+            },
+            json!({ "spike.md": TEST_TRACKED_NOTE }),
+            TEST_NOTE_PATH,
+        )
+        .await;
+
+        append_to_active_buffer(&test, "New thought\n", cx);
+        test.cx.simulate_keystrokes("cmd-s");
+        test.cx.run_until_parked();
+
+        let saved = test.fs.load(Path::new(TEST_NOTE_PATH)).await.unwrap();
+        let updated_at = last_updated_value(&saved);
+        assert_ne!(updated_at, "2000-01-01T00:00:00+08:00");
+        chrono::DateTime::parse_from_rfc3339(updated_at)
+            .expect("lastUpdated should remain an RFC 3339 timestamp");
+        assert!(saved.ends_with("# Spike\nNew thought\n"));
+    }
+
+    #[gpui::test]
+    async fn test_clean_save_does_not_update_last_updated(cx: &mut TestAppContext) {
+        let mut test = test_window_with_settings(
+            cx,
+            ExplorerSettings::default(),
+            AutosaveSettings {
+                enabled: false,
+                delay_ms: DEFAULT_AUTOSAVE_DELAY_MS,
+            },
+            json!({ "spike.md": TEST_TRACKED_NOTE }),
+            TEST_NOTE_PATH,
+        )
+        .await;
+
+        test.cx.simulate_keystrokes("cmd-s");
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            test.fs.load(Path::new(TEST_NOTE_PATH)).await.unwrap(),
+            TEST_TRACKED_NOTE
+        );
+    }
+
+    #[gpui::test]
+    async fn test_save_after_undoing_all_changes_does_not_update_last_updated(
+        cx: &mut TestAppContext,
+    ) {
+        let mut test = test_window_with_settings(
+            cx,
+            ExplorerSettings::default(),
+            AutosaveSettings {
+                enabled: false,
+                delay_ms: DEFAULT_AUTOSAVE_DELAY_MS,
+            },
+            json!({ "spike.md": TEST_TRACKED_NOTE }),
+            TEST_NOTE_PATH,
+        )
+        .await;
+
+        append_to_active_buffer(&test, "Temporary thought\n", cx);
+        active_buffer(&test, cx).update(cx, |buffer, cx| {
+            buffer.undo(cx);
+            assert!(!buffer.is_dirty());
+        });
+        test.cx.simulate_keystrokes("cmd-s");
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            test.fs.load(Path::new(TEST_NOTE_PATH)).await.unwrap(),
+            TEST_TRACKED_NOTE
+        );
+    }
+
+    #[gpui::test]
+    async fn test_autosave_updates_last_updated_when_note_content_changed(cx: &mut TestAppContext) {
+        let test = test_window_with_settings(
+            cx,
+            ExplorerSettings::default(),
+            AutosaveSettings {
+                enabled: true,
+                delay_ms: 2500,
+            },
+            json!({ "spike.md": TEST_TRACKED_NOTE }),
+            TEST_NOTE_PATH,
+        )
+        .await;
+
+        append_to_active_buffer(&test, "Autosaved thought\n", cx);
+        test.cx
+            .executor()
+            .advance_clock(Duration::from_millis(2500));
+        test.cx.run_until_parked();
+
+        let saved = test.fs.load(Path::new(TEST_NOTE_PATH)).await.unwrap();
+        let updated_at = last_updated_value(&saved);
+        assert_ne!(updated_at, "2000-01-01T00:00:00+08:00");
+        chrono::DateTime::parse_from_rfc3339(updated_at)
+            .expect("lastUpdated should remain an RFC 3339 timestamp");
+        assert!(saved.ends_with("# Spike\nAutosaved thought\n"));
+    }
+
+    #[test]
+    fn test_last_updated_field_must_be_unique_and_top_level() {
+        let quoted = "---\nlastUpdated: '2000-01-01T00:00:00+08:00'\n---\n";
+        let (range, quote) = frontmatter_last_updated_range(quoted).unwrap();
+        assert_eq!(&quoted[range], "'2000-01-01T00:00:00+08:00'");
+        assert_eq!(quote, Some('\''));
+
+        assert!(frontmatter_last_updated_range("# Note\nlastUpdated: old\n").is_none());
+        assert!(frontmatter_last_updated_range("---\n  lastUpdated: nested\n---\n").is_none());
+        assert!(
+            frontmatter_last_updated_range("---\nlastUpdated: first\nlastUpdated: second\n---\n")
+                .is_none()
         );
     }
 
@@ -6312,6 +6961,7 @@ mod tests {
             ("space f g", "workspace::Search"),
             ("space f n", "note::New"),
             ("space f r", "note::Open Recent"),
+            ("space n d", "note::Open Today"),
             ("space p", "command_palette::Toggle"),
             ("space e", "view::ToggleExplorer"),
             ("space v", "note::TogglePreview"),

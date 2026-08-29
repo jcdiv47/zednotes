@@ -1032,6 +1032,10 @@ impl Item for Editor {
                 }
             }
 
+            this.update_in(cx, |_, _, cx| {
+                crate::run_before_save_buffer_hooks(&buffers_to_save, cx);
+            })?;
+
             if !buffers_to_save.is_empty() {
                 project
                     .update(cx, |project, cx| {

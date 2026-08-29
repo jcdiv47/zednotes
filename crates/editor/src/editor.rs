@@ -348,7 +348,33 @@ impl Navigated {
     }
 }
 
+type BeforeSaveBufferHook = Arc<dyn Fn(&Entity<Buffer>, &mut App) + Send + Sync>;
+
+#[derive(Default)]
+struct BeforeSaveBufferHooks(Vec<BeforeSaveBufferHook>);
+
+impl Global for BeforeSaveBufferHooks {}
+
+/// Registers a hook that runs for each buffer after save-time formatting and
+/// immediately before the buffer is persisted.
+pub fn register_before_save_buffer_hook(
+    hook: impl Fn(&Entity<Buffer>, &mut App) + Send + Sync + 'static,
+    cx: &mut App,
+) {
+    cx.update_global::<BeforeSaveBufferHooks, _>(|hooks, _| hooks.0.push(Arc::new(hook)));
+}
+
+fn run_before_save_buffer_hooks(buffers: &HashSet<Entity<Buffer>>, cx: &mut App) {
+    let hooks = cx.global::<BeforeSaveBufferHooks>().0.clone();
+    for buffer in buffers {
+        for hook in &hooks {
+            hook(buffer, cx);
+        }
+    }
+}
+
 pub fn init(cx: &mut App) {
+    cx.set_global(BeforeSaveBufferHooks::default());
     cx.set_global(GlobalBlameRenderer(Arc::new(())));
     cx.set_global(breadcrumbs::RenderBreadcrumbText(render_breadcrumb_text));
 

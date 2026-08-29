@@ -2393,7 +2393,7 @@ fn bind_default_editor_keymaps(cx: &mut App) -> Result<()> {
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new(
             "cmd-shift-v",
-            TogglePreview,
+            OpenPreview,
             Some("Editor && extension == md"),
         ),
         KeyBinding::new("cmd-shift-v", TogglePreview, Some("MarkdownPreview")),
@@ -7400,7 +7400,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_cmd_shift_v_toggles_editor_preview_split(cx: &mut TestAppContext) {
+    async fn test_cmd_shift_v_opens_preview_in_the_editor_pane(cx: &mut TestAppContext) {
         let mut test = test_window(cx).await;
 
         test.cx.simulate_keystrokes("cmd-shift-v");
@@ -7412,7 +7412,7 @@ mod tests {
             .expect("failed to read the notes window");
         assert_eq!(
             workspace.read_with(cx, |workspace, _| workspace.panes().len()),
-            2
+            1
         );
         workspace.read_with(cx, |workspace, cx| {
             for pane in workspace.panes() {
@@ -7427,8 +7427,12 @@ mod tests {
                 .count()),
             1
         );
-        test.cx.update(|window, cx| {
-            assert!(test.editor.read(cx).focus_handle(cx).is_focused(window));
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(
+                workspace
+                    .active_item_as::<MarkdownPreviewView>(cx)
+                    .is_some()
+            );
         });
 
         test.cx.simulate_keystrokes("cmd-shift-v");
@@ -7444,6 +7448,9 @@ mod tests {
                 .count()),
             0
         );
+        test.cx.update(|window, cx| {
+            assert!(test.editor.read(cx).focus_handle(cx).is_focused(window));
+        });
     }
 
     #[gpui::test]

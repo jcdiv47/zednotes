@@ -2753,7 +2753,7 @@ fn apply_editor_settings(
             let gutter = content.editor.gutter.get_or_insert_default();
             gutter.runnables = Some(false);
             gutter.breakpoints = Some(false);
-            gutter.bookmarks = Some(false);
+            gutter.bookmarks = Some(true);
             gutter.folds = Some(false);
             let minimap = content.editor.minimap.get_or_insert_default();
             minimap.show = Some(ShowMinimap::Never);
@@ -5893,6 +5893,7 @@ mod tests {
             line_height,
             theme_mode,
             line_numbers,
+            bookmark_gutter,
             relative_line_numbers,
             toggle_relative_line_numbers,
             soft_wrap,
@@ -5916,6 +5917,7 @@ mod tests {
                 theme.buffer_line_height.value(),
                 theme.theme.mode(),
                 editor::EditorSettings::get_global(cx).gutter.line_numbers,
+                editor::EditorSettings::get_global(cx).gutter.bookmarks,
                 editor::EditorSettings::get_global(cx).relative_line_numbers,
                 cx.global::<SettingsStore>()
                     .raw_default_settings()
@@ -5960,6 +5962,7 @@ mod tests {
         assert_eq!(line_height, 1.4);
         assert_eq!(theme_mode, Some(ThemeAppearanceMode::Dark));
         assert!(line_numbers);
+        assert!(bookmark_gutter);
         assert_eq!(relative_line_numbers, RelativeLineNumbers::Wrapped);
         assert_eq!(toggle_relative_line_numbers, Some(true));
         assert_eq!(soft_wrap, SoftWrap::None);

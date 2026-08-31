@@ -7626,8 +7626,8 @@ mod tests {
             assert!(!workspace.right_dock().read(cx).is_open());
             assert_eq!(
                 workspace.panes().len(),
-                2,
-                "the preview layout is preserved"
+                1,
+                "the same-pane preview layout is preserved"
             );
             assert_eq!(
                 workspace.items_of_type::<MarkdownPreviewView>(cx).count(),
@@ -8390,8 +8390,7 @@ mod tests {
                 .count()),
             1
         );
-        test.cx.simulate_keystrokes("cmd-shift-v");
-        test.cx.run_until_parked();
+        execute_palette_command(&mut test, "note: toggle preview", cx);
 
         test.cx.simulate_keystrokes("i x escape");
         execute_palette_command(&mut test, "workspace: save", cx);

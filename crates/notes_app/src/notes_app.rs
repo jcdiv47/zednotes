@@ -21,7 +21,7 @@ use client::{Client, UserStore};
 use db::kvp::KeyValueStore;
 use editor::{Editor, EditorEvent, SelectionEffects, scroll::Autoscroll};
 use fs::{Fs, PathEventKind, RealFs};
-use futures::StreamExt as _;
+use futures::{FutureExt as _, StreamExt as _};
 use git::GitHostingProviderRegistry;
 use git_ui::git_panel::GitPanel;
 use git_ui_core::worktree_picker::WorktreePicker;
@@ -36,8 +36,8 @@ use gpui::{
 use http_client::BlockedHttpClient;
 use image_viewer::ImageViewToolbarControls;
 use language::{
-    Buffer, BufferEvent, Capability, DiskState, Language, LanguageConfig, LanguageMatcher,
-    LanguageRegistry,
+    Buffer, BufferEvent, Capability, DiskState, LanguageConfig, LanguageMatcher, LanguageQueries,
+    LanguageRegistry, LoadedLanguage,
 };
 use markdown_preview::markdown_preview_view::MarkdownPreviewView;
 use node_runtime::NodeRuntime;
@@ -2204,23 +2204,50 @@ fn markdown_entry_filter(markdown_only: bool) -> EntryFilter {
     })
 }
 
-fn built_in_language(name: &str, grammar: tree_sitter::Language) -> Result<Arc<Language>> {
-    let language = Language::new(grammars::load_config(name), Some(grammar))
-        .with_queries(grammars::load_queries(name))
-        .with_context(|| format!("failed to load Tree-sitter queries for {name}"))?;
-    Ok(Arc::new(language))
+fn register_lazy_language(
+    languages: &LanguageRegistry,
+    config: LanguageConfig,
+    load_queries: impl Fn() -> LanguageQueries + Send + Sync + 'static,
+) {
+    let load_queries = Arc::new(load_queries);
+    languages.register_language(
+        config.name.clone(),
+        config.grammar.clone(),
+        config.matcher.clone(),
+        config.hidden,
+        None,
+        Arc::new(move || {
+            let config = config.clone();
+            let load_queries = load_queries.clone();
+            async move {
+                Ok(LoadedLanguage {
+                    config,
+                    queries: load_queries(),
+                    context_provider: None,
+                    toolchain_provider: None,
+                    manifest_name: None,
+                })
+            }
+            .boxed()
+        }),
+    );
 }
 
-fn bundled_preview_language(
+fn register_bundled_preview_language(
+    languages: &LanguageRegistry,
     name: &'static str,
+    grammar_name: &'static str,
     fence_aliases: &[&str],
     grammar: tree_sitter::Language,
-    highlights_query: &str,
-) -> Result<Arc<Language>> {
-    let language = Language::new(
+    highlights_query: &'static str,
+) {
+    languages.register_native_grammars([(grammar_name, grammar)]);
+    register_lazy_language(
+        languages,
         LanguageConfig {
             name: name.into(),
             code_fence_block_name: Some(name.to_lowercase().into()),
+            grammar: Some(grammar_name.into()),
             matcher: LanguageMatcher {
                 path_suffixes: fence_aliases
                     .iter()
@@ -2231,65 +2258,77 @@ fn bundled_preview_language(
             .into(),
             ..LanguageConfig::default()
         },
-        Some(grammar),
-    )
-    .with_highlights_query(highlights_query)
-    .with_context(|| format!("failed to load Tree-sitter highlights for {name}"))?;
-    Ok(Arc::new(language))
+        move || LanguageQueries {
+            highlights: Some(highlights_query.into()),
+            ..LanguageQueries::default()
+        },
+    );
 }
 
-fn register_built_in_languages(languages: &LanguageRegistry) -> Result<()> {
+fn register_built_in_languages(languages: &LanguageRegistry) {
     let native_grammars = grammars::native_grammars();
-    let tsx_grammar = native_grammars
-        .iter()
-        .find_map(|(name, grammar)| (*name == "tsx").then(|| grammar.clone()))
-        .context("bundled TSX grammar is unavailable")?;
-
-    for (name, grammar) in native_grammars {
-        languages.add(built_in_language(name, grammar)?);
+    languages.register_native_grammars(
+        native_grammars
+            .iter()
+            .map(|(name, grammar)| (*name, grammar.clone())),
+    );
+    for (name, _) in native_grammars {
+        let config = grammars::load_config(name);
+        register_lazy_language(languages, config, move || grammars::load_queries(name));
     }
 
     // JavaScript shares the TSX parser but has its own highlight queries and
     // file/fence aliases.
-    languages.add(built_in_language("javascript", tsx_grammar)?);
-    languages.add(bundled_preview_language(
+    register_lazy_language(languages, grammars::load_config("javascript"), || {
+        grammars::load_queries("javascript")
+    });
+    register_bundled_preview_language(
+        languages,
         "HTML",
+        "html",
         &["html", "htm", "shtml"],
         tree_sitter_html::LANGUAGE.into(),
         tree_sitter_html::HIGHLIGHTS_QUERY,
-    )?);
-    languages.add(bundled_preview_language(
+    );
+    register_bundled_preview_language(
+        languages,
         "SQL",
+        "sql",
         &["sql", "postgres", "postgresql", "mysql", "sqlite", "plsql"],
         tree_sitter_sequel::LANGUAGE.into(),
         tree_sitter_sequel::HIGHLIGHTS_QUERY,
-    )?);
-    languages.add(bundled_preview_language(
+    );
+    register_bundled_preview_language(
+        languages,
         "XML",
+        "xml",
         &["xml", "xsd", "xsl", "xslt", "svg"],
         tree_sitter_xml::LANGUAGE_XML.into(),
         tree_sitter_xml::XML_HIGHLIGHT_QUERY,
-    )?);
-    languages.add(bundled_preview_language(
+    );
+    register_bundled_preview_language(
+        languages,
         "DTD",
+        "dtd",
         &["dtd"],
         tree_sitter_xml::LANGUAGE_DTD.into(),
         tree_sitter_xml::DTD_HIGHLIGHT_QUERY,
-    )?);
-    languages.add(bundled_preview_language(
+    );
+    register_bundled_preview_language(
+        languages,
         "TOML",
+        "toml",
         &["toml"],
         tree_sitter_toml_ng::LANGUAGE.into(),
         tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
-    )?);
-    Ok(())
+    );
 }
 
-fn markdown_languages(cx: &App) -> Result<Arc<LanguageRegistry>> {
+fn markdown_languages(cx: &App) -> Arc<LanguageRegistry> {
     let languages = Arc::new(LanguageRegistry::new(cx.background_executor().clone()));
-    register_built_in_languages(&languages)?;
+    register_built_in_languages(&languages);
     languages.set_theme(cx.theme().clone());
-    Ok(languages)
+    languages
 }
 
 fn notes_vim_key_bindings(leader: &str) -> Vec<KeyBinding> {
@@ -3993,7 +4032,7 @@ pub fn init(session: Session, cx: &mut App) -> Result<Arc<AppState>> {
     client::init(&client, cx);
     Project::init(&client, cx);
 
-    let languages = markdown_languages(cx)?;
+    let languages = markdown_languages(cx);
     let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
     let workspace_store = cx.new(|cx| WorkspaceStore::new(client.clone(), cx));
     let session = cx.new(|cx| AppSession::new(session, cx));
@@ -4390,8 +4429,7 @@ mod tests {
         fs.insert_tree("/notes", tree).await;
         let project = Project::test(app_state.fs.clone(), [Path::new("/notes")], cx).await;
         project.read_with(cx, |project, cx| {
-            register_built_in_languages(project.languages())
-                .expect("failed to register built-in languages");
+            register_built_in_languages(project.languages());
             project.languages().set_theme(cx.theme().clone());
         });
 

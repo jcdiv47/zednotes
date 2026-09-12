@@ -467,6 +467,7 @@ impl Render for BacklinksPanel {
                                 Some(
                                     v_flex()
                                         .id(index)
+                                        .w_full()
                                         .px_3()
                                         .py_2()
                                         .gap_1()

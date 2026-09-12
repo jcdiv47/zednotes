@@ -1537,6 +1537,15 @@ impl CompletionProvider for Entity<Project> {
             return true;
         }
 
+        if matches!(text, "[" | "/" | "#")
+            && buffer
+                .file()
+                .is_some_and(|file| project::note_links::is_note(file.path().as_std_path()))
+            && markdown::wiki_links::completion_range(&buffer.text(), position.to_offset(&snapshot))
+                .is_some()
+        {
+            return true;
+        }
         buffer.completion_triggers().contains(text)
     }
 

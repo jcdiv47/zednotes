@@ -10,6 +10,37 @@ Markdown support is available natively in Zed.
 - Tree-sitter: [tree-sitter-markdown](https://github.com/tree-sitter-grammars/tree-sitter-markdown)
 - Language Server: N/A
 
+## Wiki Links and Backlinks {#wiki-links}
+
+Open your notes folder as a project to link Markdown files without a language
+server. Type `[[` to complete a note name. Follow a link with
+{#action editor::GoToDefinition} or click it in the Markdown preview.
+
+| Syntax                   | Target                                    |
+| ------------------------ | ----------------------------------------- |
+| `[[Note]]`               | A note named `Note.md` or `Note.markdown` |
+| `[[folder/Note]]`        | A note in a folder                        |
+| `[[/folder/Note.md]]`    | An exact path from the notes folder root  |
+| `[[../Note]]`            | A path relative to the current note       |
+| `[[Note\|Display text]]` | A note with custom link text              |
+| `[[Note#Heading]]`       | A heading in another note                 |
+| `[[#Heading]]`           | A heading in the current note             |
+
+Links resolve within the current project's root folder containing the note.
+Resolution checks the current note's folder, then the root, then a unique matching
+path elsewhere in that root. If multiple notes match, use a folder-qualified path.
+Paths are case-sensitive. Heading text and heading slugs are both supported.
+
+Run {#action markdown::ToggleBacklinks} to open the Backlinks panel. It lists wiki
+links from other notes to the active note, including links to its headings. Click
+an excerpt to select the link in its source note, or use the arrow keys and Enter.
+The panel follows the active editor or preview and updates after unsaved edits and
+file changes. Text inside code, math, and frontmatter does not create backlinks.
+
+Backlinks currently support local folders. Note embeds, block references,
+frontmatter aliases, and automatic rewriting of links after renaming a note are
+not supported.
+
 ## Syntax Highlighting Code Blocks
 
 Zed supports language-specific syntax highlighting of markdown code blocks by leveraging [tree-sitter language grammars](../extensions/languages.md#grammar). All [Zed supported languages](../languages.md), including those provided by official or community extensions, are available for use in markdown code blocks. All you need to do is provide a language name after the opening <kbd>```</kbd> code fence like so:

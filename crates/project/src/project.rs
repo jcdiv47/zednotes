@@ -12,6 +12,7 @@ pub mod image_store;
 pub mod lsp_command;
 pub mod lsp_store;
 pub mod manifest_tree;
+pub mod note_links;
 pub mod prettier_store;
 pub mod project_search;
 pub mod project_settings;
@@ -4371,6 +4372,23 @@ impl Project {
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<Vec<LocationLink>>>> {
         let position = position.to_point_utf16(buffer.read(cx));
+        if let Some(link) = note_links::link_at(buffer, position, cx)
+            && let Some(file) = buffer.read(cx).file()
+        {
+            let origin = Location {
+                buffer: buffer.clone(),
+                range: buffer.read(cx).anchor_before(link.range.start)
+                    ..buffer.read(cx).anchor_after(link.range.end),
+            };
+            let source = ProjectPath::from_file(file.as_ref(), cx);
+            let task = self.resolve_note_link(&source, &link.target, cx);
+            return cx.background_spawn(async move {
+                Ok(Some(vec![LocationLink {
+                    origin: Some(origin),
+                    target: task.await?,
+                }]))
+            });
+        }
         let guard = self.retain_remotely_created_models(cx);
         let task = self.lsp_store.update(cx, |lsp_store, cx| {
             lsp_store.definitions(buffer, position, cx)
@@ -4631,6 +4649,11 @@ impl Project {
         context: CompletionContext,
         cx: &mut Context<Self>,
     ) -> Task<Result<Vec<CompletionResponse>>> {
+        if let Some(completions) =
+            self.note_link_completions(buffer, position.to_offset(buffer.read(cx)), cx)
+        {
+            return Task::ready(Ok(vec![completions]));
+        }
         let position = position.to_point_utf16(buffer.read(cx));
         self.lsp_store.update(cx, |lsp_store, cx| {
             lsp_store.completions(buffer, position, context, cx)

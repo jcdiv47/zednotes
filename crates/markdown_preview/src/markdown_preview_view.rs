@@ -1123,6 +1123,13 @@ impl MarkdownPreviewView {
                     );
                 }
             })
+            .on_wiki_link_click({
+                let view = cx.entity().downgrade();
+                let workspace = self.workspace.clone();
+                move |target, window, cx| {
+                    handle_wiki_link_click(target, &view, &workspace, window, cx);
+                }
+            })
             .on_url_hover({
                 let view_handle = cx.entity().downgrade();
                 move |hovered_url, _window, cx| {
@@ -1210,6 +1217,73 @@ impl MarkdownPreviewView {
             });
         }
     }
+}
+
+fn handle_wiki_link_click(
+    target: SharedString,
+    view: &WeakEntity<MarkdownPreviewView>,
+    workspace: &WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(source) = view.upgrade().and_then(|view| {
+        let editor = &view.read(cx).active_editor.as_ref()?.editor;
+        MarkdownPreviewView::project_path_for_active_editor(editor.read(cx), cx)
+    }) else {
+        return;
+    };
+    let Some(project) = workspace
+        .upgrade()
+        .map(|workspace| workspace.read(cx).project().clone())
+    else {
+        return;
+    };
+    let task = project.update(cx, |project, cx| {
+        project.resolve_note_link(&source, &target, cx)
+    });
+    let workspace_for_error = workspace.clone();
+    let workspace = workspace.clone();
+    let view = view.clone();
+    let task = window.spawn(cx, async move |cx| {
+        let location = task.await?;
+        workspace.update_in(cx, |workspace, window, cx| {
+            let offset = location
+                .buffer
+                .read(cx)
+                .summary_for_anchor::<usize>(&location.range.start);
+            let preview = if let Some(view) = view
+                .upgrade()
+                .filter(|view| view.read(cx).is_previewing(&location.buffer, cx))
+            {
+                view
+            } else {
+                let project = workspace.project().clone();
+                let editor = cx.new(|cx| {
+                    Editor::for_buffer(location.buffer.clone(), Some(project), window, cx)
+                });
+                let pane = workspace.active_pane().clone();
+                MarkdownPreviewView::activate_or_add_preview(
+                    workspace, editor, pane, true, true, window, cx,
+                )
+            };
+            preview.update(cx, |preview, cx| {
+                preview.markdown.update(cx, |markdown, cx| {
+                    markdown.request_autoscroll_to_source_index(offset, cx)
+                });
+                if let Some(editor) = &preview.active_editor {
+                    MarkdownPreviewView::change_selection_to_source_index(
+                        &editor.editor,
+                        offset,
+                        false,
+                        window,
+                        cx,
+                    );
+                }
+            });
+        })?;
+        anyhow::Ok(())
+    });
+    task.detach_and_notify_err(workspace_for_error, window, cx);
 }
 
 fn handle_url_click(
@@ -2234,6 +2308,84 @@ mod tests {
             filter_non_rendered_matches(matches, &non_rendered_ranges),
             vec![1..9, 58..65]
         );
+    }
+
+    #[gpui::test]
+    async fn wiki_links_share_editor_and_preview_heading_resolution(cx: &mut TestAppContext) {
+        let (project, workspace, window) = markdown_workspace(
+            cx,
+            json!({
+                "Source.md": "[[folder/Target#A heading|label]]",
+                "folder": {"Target.md": "# Target\n\n## A **heading**\nbody\n"}
+            }),
+            false,
+        )
+        .await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project.visible_worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let source = project
+            .update(cx, |project, cx| {
+                project.open_buffer(
+                    ProjectPath {
+                        worktree_id,
+                        path: rel_path("Source.md").into(),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let links = project
+            .update(cx, |project, cx| {
+                project.definitions(&source, Point::new(0, 4), cx)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(links.len(), 1);
+        links[0].target.buffer.read_with(cx, |buffer, _| {
+            assert_eq!(
+                buffer.file().unwrap().path().as_ref(),
+                rel_path("folder/Target.md")
+            );
+            assert_eq!(
+                buffer.summary_for_anchor::<Point>(&links[0].target.range.start),
+                Point::new(2, 0)
+            );
+        });
+        window
+            .update(cx, |_, window, cx| {
+                let preview = workspace.update(cx, |workspace, cx| {
+                    let editor = cx.new(|cx| {
+                        Editor::for_buffer(source.clone(), Some(project.clone()), window, cx)
+                    });
+                    let pane = workspace.active_pane().clone();
+                    MarkdownPreviewView::activate_or_add_preview(
+                        workspace, editor, pane, true, true, window, cx,
+                    )
+                });
+                super::handle_wiki_link_click(
+                    "folder/Target#A heading".into(),
+                    &preview.downgrade(),
+                    &workspace.downgrade(),
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            let preview = workspace.active_item_as::<MarkdownPreviewView>(cx).unwrap();
+            let editor = &preview.read(cx).active_editor.as_ref().unwrap().editor;
+            assert_eq!(
+                MarkdownPreviewView::project_path_for_active_editor(editor.read(cx), cx)
+                    .unwrap()
+                    .path
+                    .as_ref(),
+                rel_path("folder/Target.md")
+            );
+        });
     }
 
     #[test]

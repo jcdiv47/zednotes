@@ -441,34 +441,42 @@ pub fn show_link_definition(
                     let mut links = Vec::new();
                     let mut symbol_range = None;
 
-                    // LSP-provided document link wins over heuristic URL/file
-                    // detection at the same position: the server tells us the
-                    // exact range and target, while `find_url`/`find_file` are
-                    // best-effort text matches.
-                    if let Some((_, multi_buffer_range, Some(target), server_id)) =
-                        detected_document_link.clone()
-                    {
-                        symbol_range = Some(RangeInEditor::Text(multi_buffer_range));
-                        links.push(document_link_target_to_hover_link(&target, server_id));
-                    } else if let Some((url_range, url)) = find_url(&buffer, anchor, cx) {
-                        let snapshot =
-                            this.read_with(cx, |editor, cx| editor.buffer.read(cx).snapshot(cx))?;
-                        if let Some(range) = snapshot.buffer_anchor_range_to_anchor_range(url_range)
+                    let is_wiki_link = cx.update(|_, cx| {
+                        project::note_links::link_at(&buffer, anchor, cx).is_some()
+                    })?;
+                    // Wiki links use project note resolution below. URL/file heuristics
+                    // can choose a different target when a short note name is ambiguous.
+                    if !is_wiki_link {
+                        // LSP-provided document link wins over heuristic URL/file
+                        // detection at the same position: the server tells us the
+                        // exact range and target, while `find_url`/`find_file` are
+                        // best-effort text matches.
+                        if let Some((_, multi_buffer_range, Some(target), server_id)) =
+                            detected_document_link.clone()
                         {
-                            symbol_range = Some(RangeInEditor::Text(range));
-                        }
-                        links.push(HoverLink::Url(url));
-                    } else if let Some((filename_range, file_target)) =
-                        find_file(&buffer, project.clone(), anchor, cx).await
-                    {
-                        let snapshot =
-                            this.read_with(cx, |editor, cx| editor.buffer.read(cx).snapshot(cx))?;
-                        if let Some(range) =
-                            snapshot.buffer_anchor_range_to_anchor_range(filename_range)
+                            symbol_range = Some(RangeInEditor::Text(multi_buffer_range));
+                            links.push(document_link_target_to_hover_link(&target, server_id));
+                        } else if let Some((url_range, url)) = find_url(&buffer, anchor, cx) {
+                            let snapshot = this
+                                .read_with(cx, |editor, cx| editor.buffer.read(cx).snapshot(cx))?;
+                            if let Some(range) =
+                                snapshot.buffer_anchor_range_to_anchor_range(url_range)
+                            {
+                                symbol_range = Some(RangeInEditor::Text(range));
+                            }
+                            links.push(HoverLink::Url(url));
+                        } else if let Some((filename_range, file_target)) =
+                            find_file(&buffer, project.clone(), anchor, cx).await
                         {
-                            symbol_range = Some(RangeInEditor::Text(range));
+                            let snapshot = this
+                                .read_with(cx, |editor, cx| editor.buffer.read(cx).snapshot(cx))?;
+                            if let Some(range) =
+                                snapshot.buffer_anchor_range_to_anchor_range(filename_range)
+                            {
+                                symbol_range = Some(RangeInEditor::Text(range));
+                            }
+                            links.push(HoverLink::File(file_target));
                         }
-                        links.push(HoverLink::File(file_target));
                     }
 
                     // Always also collect LSP definitions so that cmd-click

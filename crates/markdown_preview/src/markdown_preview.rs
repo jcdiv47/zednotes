@@ -1,6 +1,7 @@
 use gpui::{App, actions};
 use workspace::Workspace;
 
+pub mod backlinks_panel;
 pub mod markdown_preview_settings;
 pub mod markdown_preview_view;
 
@@ -44,6 +45,7 @@ pub fn init(cx: &mut App) {
             return;
         };
         markdown_preview_view::MarkdownPreviewView::register(workspace, window, cx);
+        backlinks_panel::register(workspace, window, cx);
     })
     .detach();
 }

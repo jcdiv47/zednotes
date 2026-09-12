@@ -3,6 +3,7 @@ mod mermaid;
 pub mod parser;
 mod path_range;
 mod selection;
+pub mod wiki_links;
 
 use base64::Engine as _;
 
@@ -1621,6 +1622,7 @@ pub struct MarkdownElement {
     style: MarkdownStyle,
     code_block_renderer: CodeBlockRenderer,
     on_url_click: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App)>>,
+    on_wiki_link_click: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App)>>,
     on_url_hover: Option<UrlHoverCallback>,
     code_span_link: Option<CodeSpanLinkCallback>,
     on_source_click: Option<SourceClickCallback>,
@@ -1647,6 +1649,7 @@ impl MarkdownElement {
                 border: false,
             },
             on_url_click: None,
+            on_wiki_link_click: None,
             on_url_hover: None,
             code_span_link: None,
             on_source_click: None,
@@ -1699,6 +1702,14 @@ impl MarkdownElement {
         handler: impl Fn(SharedString, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_url_click = Some(Rc::new(handler));
+        self
+    }
+
+    pub fn on_wiki_link_click(
+        mut self,
+        handler: impl Fn(SharedString, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_wiki_link_click = Some(Rc::new(handler));
         self
     }
 
@@ -1782,7 +1793,7 @@ impl MarkdownElement {
         let chip_background = code_style.background_color.take();
 
         if let Some(url) = link_url {
-            builder.push_link(url.clone(), range.clone());
+            builder.push_link(url.clone(), range.clone(), false);
             let link_style = self
                 .style
                 .link_callback
@@ -1827,7 +1838,15 @@ impl MarkdownElement {
             {
                 let click_url = url.clone();
                 let markdown = self.markdown.clone();
-                let url_click = self.on_url_click.clone();
+                let is_wiki_link = builder
+                    .rendered_links
+                    .last()
+                    .is_some_and(|link| link.is_wiki_link);
+                let url_click = if is_wiki_link {
+                    self.on_wiki_link_click.clone()
+                } else {
+                    self.on_url_click.clone()
+                };
                 let bounds = Rc::new(Cell::new(None));
                 builder.push_image_link(url.clone(), bounds.clone());
                 wrapper
@@ -1846,7 +1865,7 @@ impl MarkdownElement {
                     .on_click(move |_, window, cx| {
                         if let Some(ref on_url_click) = url_click {
                             on_url_click(click_url.clone(), window, cx);
-                        } else {
+                        } else if !is_wiki_link {
                             cx.open_url(&click_url);
                         }
                     })
@@ -2185,6 +2204,7 @@ impl MarkdownElement {
         }
 
         let on_open_url = self.on_url_click.take();
+        let on_wiki_link_click = self.on_wiki_link_click.take();
         let on_url_hover = self.on_url_hover.take();
         let on_source_click = self.on_source_click.take();
 
@@ -2364,7 +2384,11 @@ impl MarkdownElement {
                         && source_index.and_then(|ix| rendered_text.link_for_source_index(ix))
                             == Some(&pressed_link)
                     {
-                        if let Some(open_url) = on_open_url.as_ref() {
+                        if pressed_link.is_wiki_link {
+                            if let Some(open_link) = on_wiki_link_click.as_ref() {
+                                open_link(pressed_link.destination_url, window, cx);
+                            }
+                        } else if let Some(open_url) = on_open_url.as_ref() {
                             open_url(pressed_link.destination_url, window, cx);
                         } else {
                             cx.open_url(&pressed_link.destination_url);
@@ -2825,10 +2849,18 @@ impl Element for MarkdownElement {
                                 ..Default::default()
                             })
                         }
-                        MarkdownTag::Link { dest_url, .. } => {
+                        MarkdownTag::Link {
+                            dest_url,
+                            link_type,
+                            ..
+                        } => {
                             if builder.code_block_stack.is_empty() {
                                 builder.link_depth += 1;
-                                builder.push_link(dest_url.clone(), range.clone());
+                                builder.push_link(
+                                    dest_url.clone(),
+                                    range.clone(),
+                                    matches!(link_type, pulldown_cmark::LinkType::WikiLink { .. }),
+                                );
                                 let style = self
                                     .style
                                     .link_callback
@@ -3901,8 +3933,14 @@ impl MarkdownElementBuilder {
         self.code_block_stack.pop();
     }
 
-    fn push_link(&mut self, destination_url: SharedString, source_range: Range<usize>) {
+    fn push_link(
+        &mut self,
+        destination_url: SharedString,
+        source_range: Range<usize>,
+        is_wiki_link: bool,
+    ) {
         self.rendered_links.push(RenderedLink {
+            is_wiki_link,
             source_range,
             destination_url,
         });
@@ -4576,6 +4614,7 @@ struct WrappedLineSegment {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct RenderedLink {
+    is_wiki_link: bool,
     source_range: Range<usize>,
     destination_url: SharedString,
 }
@@ -6460,6 +6499,60 @@ mod tests {
         cx.update(|_window, cx| {
             assert!(markdown.read(cx).context_menu_link().is_none());
         });
+    }
+
+    #[gpui::test]
+    fn wiki_links_render_aliases_and_dispatch_note_navigation(cx: &mut TestAppContext) {
+        struct LinkTestView {
+            markdown: Entity<Markdown>,
+            clicked: Rc<RefCell<Vec<SharedString>>>,
+        }
+        impl Render for LinkTestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let clicked = self.clicked.clone();
+                div().size_full().child(
+                    MarkdownElement::new(self.markdown.clone(), MarkdownStyle::default())
+                        .on_wiki_link_click(move |target, _, _| clicked.borrow_mut().push(target))
+                        .on_url_click(|_, _, _| panic!("A wiki link must not open as a URL")),
+                )
+            }
+        }
+        ensure_theme_initialized(cx);
+        let clicked = Rc::new(RefCell::new(Vec::new()));
+        let (_, cx) = cx.add_window_view({
+            let clicked = clicked.clone();
+            move |_, cx| LinkTestView {
+                markdown: cx
+                    .new(|cx| Markdown::new("[[数学#向量|vectors]]".into(), None, None, cx)),
+                clicked,
+            }
+        });
+        cx.run_until_parked();
+        cx.simulate_click(point(px(8.), px(8.)), gpui::Modifiers::default());
+        assert_eq!(
+            clicked.borrow().as_slice(),
+            &[SharedString::from("数学#向量")]
+        );
+    }
+
+    #[test]
+    fn wiki_links_preserve_math_as_literal_source() {
+        let source = "$[[not-a-link]]$ and $$x_1 + x_2$$";
+        let parsed = parse_markdown_with_options(source, false, false, false);
+        assert!(
+            !parsed
+                .events
+                .iter()
+                .any(|(_, event)| matches!(event, MarkdownEvent::Start(MarkdownTag::Link { .. })))
+        );
+        let text = parsed
+            .events
+            .iter()
+            .filter_map(|(range, event)| {
+                matches!(event, MarkdownEvent::Text).then(|| &source[range.clone()])
+            })
+            .collect::<String>();
+        assert_eq!(text, source);
     }
 
     #[gpui::test]

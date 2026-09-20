@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+UPSTREAM_REMOTE="${ZEDNOTES_UPSTREAM_REMOTE:-upstream}"
+UPSTREAM_BRANCH="${ZEDNOTES_UPSTREAM_BRANCH:-main}"
+PIN_FILE="zednotes.toml"
+
+usage() {
+    cat <<EOF
+Usage: script/zednotes-version [show|check]
+
+  show   Print the pinned fork version and the upstream base (default).
+  check  Fail when the pin differs from the merge base of HEAD and ${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}.
+EOF
+}
+
+# Parse through a real TOML parser so `zednotes.toml` stays the single source of
+# truth instead of being re-interpreted by ad-hoc shell.
+read_pin() {
+    python3 - "$PIN_FILE" <<'PY'
+import sys, tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    pin = tomllib.load(handle)
+
+values = [pin["zednotes"]["version"], pin["upstream"]["zed_version"], pin["upstream"]["commit"]]
+if any(not isinstance(value, str) or not value or any(character.isspace() for character in value) for value in values):
+    sys.exit("pin values must be nonempty strings without whitespace")
+print(*values)
+PY
+}
+
+subcommand="${1:-show}"
+if [[ $# -gt 1 ]]; then
+    usage >&2
+    exit 2
+fi
+case "$subcommand" in
+-h | --help) usage; exit 0 ;;
+show | check) ;;
+*) usage >&2; exit 2 ;;
+esac
+
+pin="$(read_pin)"
+read -r FORK_VERSION UPSTREAM_ZED_VERSION UPSTREAM_COMMIT <<<"$pin"
+SHORT_COMMIT="${UPSTREAM_COMMIT:0:7}"
+
+case "$subcommand" in
+show)
+    printf 'zednotes %s\n' "$FORK_VERSION"
+    printf 'based on zed %s (%s)\n' "$UPSTREAM_ZED_VERSION" "$SHORT_COMMIT"
+    ;;
+check)
+    if ! git rev-parse --verify --quiet "refs/remotes/${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}" >/dev/null; then
+        printf 'error: no refs/remotes/%s/%s; run `git fetch %s` first\n' \
+            "$UPSTREAM_REMOTE" "$UPSTREAM_BRANCH" "$UPSTREAM_REMOTE" >&2
+        exit 1
+    fi
+
+    merge_base="$(git merge-base HEAD "refs/remotes/${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}")"
+    if [[ "$merge_base" != "$UPSTREAM_COMMIT" ]]; then
+        cat >&2 <<EOF
+error: ${PIN_FILE} is stale.
+
+  pinned upstream commit: $UPSTREAM_COMMIT
+  actual merge base:      $merge_base
+
+Run \`script/merge-upstream\` to merge ${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH} and refresh the pin.
+EOF
+        exit 1
+    fi
+
+    # The commit is the ground truth; `zed_version` is only a readable label, so
+    # derive it back from the commit to catch a hand-edited pin.
+    pinned_zed_version="$(
+        git show "${UPSTREAM_COMMIT}:crates/zed/Cargo.toml" |
+            python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])'
+    )"
+    if [[ "$pinned_zed_version" != "$UPSTREAM_ZED_VERSION" ]]; then
+        cat >&2 <<EOF
+error: ${PIN_FILE} disagrees with its own pin.
+
+  upstream.zed_version:             $UPSTREAM_ZED_VERSION
+  zed version at the pinned commit: $pinned_zed_version
+EOF
+        exit 1
+    fi
+
+    printf 'pin is current: zednotes %s on zed %s (%s)\n' \
+        "$FORK_VERSION" "$UPSTREAM_ZED_VERSION" "$SHORT_COMMIT"
+    ;;
+*)
+    usage >&2
+    exit 2
+    ;;
+esac

@@ -39,6 +39,8 @@ fn main() {
         println!("cargo:rustc-link-arg=-Wl,-weak_framework,ScreenCaptureKit");
     }
 
+    emit_zednotes_pin();
+
     // Populate git sha environment variable if git is available
     println!("cargo:rerun-if-changed=../../.git/logs/HEAD");
     println!(
@@ -258,4 +260,80 @@ fn prepare_app_icon_x11() {
 
     println!("cargo:rerun-if-env-changed=RELEASE_CHANNEL");
     println!("cargo:rerun-if-changed={}", icon_path().to_string_lossy());
+}
+
+/// The fork's own version and the upstream release it is based on.
+struct ZednotesPin {
+    version: String,
+    upstream_zed_version: String,
+    upstream_commit: String,
+}
+
+/// Emit the fork's version pin as compile-time environment variables.
+///
+/// Reading the pin at build time rather than at runtime means a released binary
+/// keeps reporting the pin it was built from, even once the checkout has moved on.
+fn emit_zednotes_pin() {
+    let path = std::path::Path::new("../../zednotes.toml");
+    println!("cargo:rerun-if-changed={}", path.display());
+
+    if !path.exists() {
+        // No pin present: callers fall back to the upstream crate version.
+        return;
+    }
+
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) => {
+            println!("cargo::error=failed to read {}: {error}", path.display());
+            std::process::exit(1);
+        }
+    };
+
+    let pin = match parse_zednotes_pin(&contents) {
+        Ok(pin) => pin,
+        Err(error) => {
+            println!("cargo::error=invalid {}: {error}", path.display());
+            std::process::exit(1);
+        }
+    };
+
+    println!("cargo:rustc-env=ZEDNOTES_VERSION={}", pin.version);
+    println!(
+        "cargo:rustc-env=ZEDNOTES_UPSTREAM_ZED_VERSION={}",
+        pin.upstream_zed_version
+    );
+    println!(
+        "cargo:rustc-env=ZEDNOTES_UPSTREAM_COMMIT={}",
+        pin.upstream_commit
+    );
+}
+
+fn parse_zednotes_pin(contents: &str) -> Result<ZednotesPin, String> {
+    let table: toml::Table = toml::from_str(contents).map_err(|error| error.to_string())?;
+
+    let (Some(version), Some(upstream_zed_version), Some(upstream_commit)) = (
+        lookup(&table, &["zednotes", "version"]),
+        lookup(&table, &["upstream", "zed_version"]),
+        lookup(&table, &["upstream", "commit"]),
+    ) else {
+        return Err(
+            "expected `zednotes.version`, `upstream.zed_version` and `upstream.commit`".to_string(),
+        );
+    };
+
+    Ok(ZednotesPin {
+        version: version.to_string(),
+        upstream_zed_version: upstream_zed_version.to_string(),
+        upstream_commit: upstream_commit.to_string(),
+    })
+}
+
+fn lookup<'a>(table: &'a toml::Table, keys: &[&str]) -> Option<&'a str> {
+    let (first, rest) = keys.split_first()?;
+    let mut value = table.get(*first)?;
+    for key in rest {
+        value = value.get(*key)?;
+    }
+    value.as_str()
 }

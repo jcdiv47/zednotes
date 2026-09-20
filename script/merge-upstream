@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+UPSTREAM_REMOTE="${ZEDNOTES_UPSTREAM_REMOTE:-upstream}"
+UPSTREAM_BRANCH="${ZEDNOTES_UPSTREAM_BRANCH:-main}"
+INTEGRATION_BRANCH="${ZEDNOTES_INTEGRATION_BRANCH:-main}"
+FORK_BRANCH="${ZEDNOTES_FORK_BRANCH:-dev}"
+PIN_FILE="zednotes.toml"
+
+STASH=0
+LEAVE_CONFLICTS=0
+COMMIT_PIN=1
+STASH_COMMIT=""
+ROLLBACK=1
+
+usage() {
+    cat <<EOF
+Usage: script/merge-upstream [options]
+
+Merge ${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH} into ${INTEGRATION_BRANCH}, merge that into
+${FORK_BRANCH}, then refresh the upstream pin in ${PIN_FILE}.
+
+Failures before completion roll the run back: the merge is aborted, ${FORK_BRANCH}
+and ${INTEGRATION_BRANCH} are reset, and the original checkout and stash are restored.
+Successful runs also return to the original checkout. If restoring the stash
+conflicts, the completed merge is kept and the stash is retained for recovery.
+
+Options:
+  --stash            Stash local changes (including untracked files) first.
+  --leave-conflicts  On conflict, keep the in-progress merge for manual
+                     resolution instead of rolling back.
+  --no-commit        Update ${PIN_FILE} but do not commit the refresh.
+                     Requires starting on ${FORK_BRANCH}.
+  -h, --help         Show this message.
+EOF
+}
+
+die() {
+    printf 'error: %s\n' "$1" >&2
+    exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --stash) STASH=1 ;;
+    --leave-conflicts) LEAVE_CONFLICTS=1 ;;
+    --no-commit) COMMIT_PIN=0 ;;
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+    esac
+    shift
+done
+
+restore_checkout() {
+    if ! git checkout --quiet "$original_checkout"; then
+        printf 'warning: could not restore checkout %s\n' "$original_checkout" >&2
+        return 1
+    fi
+
+    if [[ -n "$STASH_COMMIT" ]]; then
+        if ! git stash apply --index --quiet "$STASH_COMMIT"; then
+            printf 'warning: could not reapply autostash %s; it remains in `git stash list`\n' "$STASH_COMMIT" >&2
+            return 1
+        fi
+        local reference commit
+        while read -r reference commit; do
+            if [[ "$commit" == "$STASH_COMMIT" ]]; then
+                git stash drop --quiet "$reference" || return 1
+                STASH_COMMIT=""
+                return 0
+            fi
+        done <<<"$(git stash list --format='%gd %H')"
+        printf 'warning: restored autostash %s but could not find its stash entry\n' "$STASH_COMMIT" >&2
+        return 1
+    fi
+}
+
+for branch in "$FORK_BRANCH" "$INTEGRATION_BRANCH"; do
+    if ! git rev-parse --verify --quiet "refs/heads/${branch}" >/dev/null; then
+        die "no local branch ${branch}"
+    fi
+done
+
+[[ "$FORK_BRANCH" != "$INTEGRATION_BRANCH" ]] || die "fork and integration branches must differ"
+python3 -c 'import tomllib' || die "Python 3.11 or newer is required"
+
+original_checkout="$(git symbolic-ref --quiet --short HEAD || git rev-parse HEAD)"
+if [[ "$COMMIT_PIN" == 0 && "$original_checkout" != "$FORK_BRANCH" ]]; then
+    die "--no-commit requires starting on ${FORK_BRANCH}"
+fi
+
+git_dir="$(git rev-parse --git-dir)"
+for marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply sequencer; do
+    if [[ -e "${git_dir}/${marker}" ]]; then
+        die "a ${marker} is already in progress; finish it first"
+    fi
+done
+
+original_fork_sha="$(git rev-parse "$FORK_BRANCH")"
+original_integration_sha="$(git rev-parse "$INTEGRATION_BRANCH")"
+
+if [[ -n "$(git status --porcelain)" ]]; then
+    if [[ "$STASH" == 1 ]]; then
+        printf 'stashing local changes...\n'
+        git stash push --include-untracked --message "merge-upstream: autostash" >/dev/null
+        STASH_COMMIT="$(git rev-parse refs/stash)"
+    else
+        die "working tree is dirty; commit your work or pass --stash"
+    fi
+fi
+
+rollback() {
+    if [[ -e "${git_dir}/MERGE_HEAD" ]]; then
+        git merge --abort || return 1
+    fi
+
+    # Detach before moving named refs so a failed checkout can never reset the
+    # branch that happens to be checked out. Local work is already stashed.
+    git checkout --quiet --force --detach "$original_fork_sha" || return 1
+    git branch --force "$FORK_BRANCH" "$original_fork_sha" || return 1
+    git branch --force "$INTEGRATION_BRANCH" "$original_integration_sha" || return 1
+    restore_checkout || return 1
+    printf '\nrolled back: %s -> %s, %s -> %s\n' \
+        "$FORK_BRANCH" "${original_fork_sha:0:7}" \
+        "$INTEGRATION_BRANCH" "${original_integration_sha:0:7}"
+}
+
+finish() {
+    local status=$?
+    trap - EXIT INT TERM
+    if [[ "$status" != 0 && "$ROLLBACK" == 1 ]]; then
+        if ! rollback; then
+            printf 'warning: rollback incomplete; original refs: %s=%s, %s=%s; original checkout: %s\n' \
+                "$FORK_BRANCH" "$original_fork_sha" \
+                "$INTEGRATION_BRANCH" "$original_integration_sha" "$original_checkout" >&2
+        fi
+    fi
+    if [[ -n "$STASH_COMMIT" ]]; then
+        printf 'autostash retained: %s (restore on %s)\n' "$STASH_COMMIT" "$original_checkout" >&2
+    fi
+    exit "$status"
+}
+trap finish EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+printf 'fetching %s...\n' "$UPSTREAM_REMOTE"
+git fetch --quiet "$UPSTREAM_REMOTE"
+new_commit="$(git rev-parse --verify "refs/remotes/${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}^{commit}")"
+
+if ! git merge-base --is-ancestor "$original_integration_sha" "$new_commit"; then
+    die "${INTEGRATION_BRANCH} has commits not on ${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}; refusing to fast-forward"
+fi
+git checkout --quiet "$INTEGRATION_BRANCH"
+if ! git merge --ff-only --quiet "$new_commit"; then
+    die "${INTEGRATION_BRANCH} has commits not on ${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}; refusing to fast-forward"
+fi
+
+printf 'merging %s into %s...\n' "$INTEGRATION_BRANCH" "$FORK_BRANCH"
+git checkout --quiet "$FORK_BRANCH"
+if ! git merge --no-edit --quiet "$INTEGRATION_BRANCH"; then
+    if [[ "$LEAVE_CONFLICTS" == 1 && -e "${git_dir}/MERGE_HEAD" ]]; then
+        ROLLBACK=0
+        cat >&2 <<EOF
+conflicts left in place for manual resolution.
+
+Resolve them and commit the merge, then re-run this script to refresh ${PIN_FILE}.
+EOF
+        exit 1
+    fi
+    die "failed to merge ${INTEGRATION_BRANCH} into ${FORK_BRANCH}"
+fi
+
+new_zed_version="$(
+    git show "${new_commit}:crates/zed/Cargo.toml" |
+        python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])'
+)"
+
+# Rewrite only the `[upstream]` block, then re-parse to prove the file is still
+# valid TOML, so a bad write can never silently corrupt the pin.
+python3 - "$PIN_FILE" "$new_zed_version" "$new_commit" <<'PY'
+import sys, tomllib
+
+path, zed_version, commit = sys.argv[1], sys.argv[2], sys.argv[3]
+
+with open(path) as handle:
+    lines = handle.readlines()
+
+replacements = {"zed_version": zed_version, "commit": commit}
+seen = set()
+section = None
+
+for index, line in enumerate(lines):
+    stripped = line.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        section = stripped[1:-1]
+        continue
+    if section != "upstream" or "=" not in stripped:
+        continue
+
+    key = stripped.split("=", 1)[0].strip()
+    if key in replacements:
+        lines[index] = f'{key} = "{replacements[key]}"\n'
+        seen.add(key)
+
+missing = set(replacements) - seen
+if missing:
+    sys.exit(f"{path}: no {sorted(missing)} in the [upstream] section")
+
+# Validate the result in memory so a rejected pin never leaves a half-written file.
+updated = "".join(lines)
+pin = tomllib.loads(updated)
+expected = {"zed_version": zed_version, "commit": commit}
+actual = {key: pin["upstream"][key] for key in expected}
+if actual != expected:
+    sys.exit(f"{path}: expected {expected}, produced {actual}")
+
+with open(path, "w") as handle:
+    handle.write(updated)
+PY
+
+if [[ "$COMMIT_PIN" == 1 ]]; then
+    git add "$PIN_FILE"
+    if git diff --cached --quiet -- "$PIN_FILE"; then
+        printf '%s already carried this pin; nothing to commit\n' "$PIN_FILE"
+    else
+        git commit --quiet --message "Pin upstream zed ${new_zed_version} @ ${new_commit:0:7}"
+    fi
+fi
+
+# A stash conflict must not undo a completed merge or discard partially restored work.
+ROLLBACK=0
+restore_checkout
+
+printf '\nmerged %s into %s\n' "$INTEGRATION_BRANCH" "$FORK_BRANCH"
+printf 'pinned upstream zed %s (%s)\n' "$new_zed_version" "${new_commit:0:7}"
+printf 'bump the fork version in %s when releasing\n' "$PIN_FILE"

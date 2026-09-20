@@ -1,0 +1,16 @@
+# Fork-owned version pin.
+#
+# Upstream has no such file, so this never conflicts when merging upstream/main.
+# `crates/zed/build.rs` injects these values as compile-time environment
+# variables, so a released binary always reports the pin it was built from.
+#
+# `script/zednotes-version check` asserts that `upstream.commit` still matches
+# `git merge-base HEAD upstream/main`, and `script/merge-upstream` rewrites this
+# file after a successful merge.
+
+[zednotes]
+version = "0.6.0"
+
+[upstream]
+zed_version = "1.22.0"
+commit = "526c95d474b2bf800e95aab30222fa0341f08e19"

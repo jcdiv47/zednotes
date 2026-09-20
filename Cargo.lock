@@ -23008,6 +23008,7 @@ dependencies = [
  "time",
  "time_format",
  "title_bar",
+ "toml 0.8.23",
  "toolchain_selector",
  "tracing",
  "ui",

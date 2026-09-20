@@ -182,7 +182,9 @@ prompt_store.workspace = true
 proto.workspace = true
 recent_projects.workspace = true
 release_channel.workspace = true
-remote.workspace = true
+# zednotes ships dev-channel release builds, and upstream publishes no prebuilt
+# remote servers for dev, so the server has to be buildable from source.
+remote = { workspace = true, features = ["build-remote-server-binary"] }
 repl.workspace = true
 reqwest.workspace = true
 reqwest_client.workspace = true
@@ -242,6 +244,7 @@ windows.workspace = true
 gpui = { workspace = true, features = ["profiler", "windows-manifest"] }
 
 [build-dependencies]
+toml.workspace = true
 windows_resources = { path = "../windows_resources" }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]

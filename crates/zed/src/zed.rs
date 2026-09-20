@@ -1522,6 +1522,24 @@ fn initialize_pane(
     });
 }
 
+/// The fork's own version, pinned in `zednotes.toml` and injected by `build.rs`.
+///
+/// Falls back to the upstream crate version when the pin is absent;
+/// [`AppVersion::load`] still allows `ZED_APP_VERSION` to override it at runtime.
+pub(crate) fn zednotes_version() -> &'static str {
+    option_env!("ZEDNOTES_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
+/// The upstream Zed release this fork was merged against, formatted for display.
+///
+/// `None` when the build carried no pin.
+pub(crate) fn zednotes_upstream_base() -> Option<String> {
+    let zed_version = option_env!("ZEDNOTES_UPSTREAM_ZED_VERSION")?;
+    let commit = option_env!("ZEDNOTES_UPSTREAM_COMMIT")?;
+    let short: String = commit.chars().take(7).collect();
+    Some(format!("zed {zed_version} @ {short}"))
+}
+
 fn open_about_window(cx: &mut App) {
     fn about_window_icon(release_channel: ReleaseChannel) -> Arc<Image> {
         let bytes = match release_channel {
@@ -1545,26 +1563,30 @@ fn open_about_window(cx: &mut App) {
         app_icon: Arc<Image>,
         message: SharedString,
         commit: Option<SharedString>,
+        upstream: Option<SharedString>,
         full_version: SharedString,
     }
 
     impl AboutWindow {
         fn new(cx: &mut Context<Self>) -> Self {
             let release_channel = ReleaseChannel::global(cx);
-            let release_channel_name = release_channel.display_name();
             let full_version: SharedString = AppVersion::global(cx).to_string().into();
-            let version = env!("CARGO_PKG_VERSION");
+            let version = zednotes_version();
+            let upstream: Option<SharedString> = zednotes_upstream_base().map(SharedString::from);
 
-            let debug = if cfg!(debug_assertions) {
-                "(debug)"
-            } else {
-                ""
-            };
-            let message: SharedString = format!("{release_channel_name} {version} {debug}").into();
             let commit = AppCommitSha::try_global(cx)
                 .map(|sha| sha.full())
                 .filter(|commit| !commit.is_empty())
                 .map(SharedString::from);
+            let mut message = format!("Zednotes {version}");
+            if let Some(commit) = commit.as_ref() {
+                let short: String = commit.chars().take(7).collect();
+                message.push_str(&format!(" @ {short}"));
+            }
+            if cfg!(debug_assertions) {
+                message.push_str(" (debug)");
+            }
+            let message: SharedString = message.into();
 
             Self {
                 focus_handle: cx.focus_handle(),
@@ -1573,20 +1595,21 @@ fn open_about_window(cx: &mut App) {
                 app_icon: about_window_icon(release_channel),
                 message,
                 commit,
+                upstream,
                 full_version,
             }
         }
 
         fn copy_details(&self, window: &mut Window, cx: &mut Context<Self>) {
-            let content = match self.commit.as_ref() {
-                Some(commit) => {
-                    format!(
-                        "{}\nCommit: {}\nVersion: {}",
-                        self.message, commit, self.full_version
-                    )
-                }
-                None => format!("{}\nVersion: {}", self.message, self.full_version),
-            };
+            let mut content = self.message.to_string();
+            if let Some(commit) = self.commit.as_ref() {
+                content.push_str(&format!("\nCommit: {commit}"));
+            }
+            if let Some(upstream) = self.upstream.as_ref() {
+                content.push_str(&format!("\nBased on: {upstream}"));
+            }
+            content.push_str(&format!("\nVersion: {}", self.full_version));
+
             cx.write_to_clipboard(ClipboardItem::new_string(content));
             window.remove_window();
         }
@@ -1620,20 +1643,14 @@ fn open_about_window(cx: &mut App) {
                             .items_center()
                             .child(img(self.app_icon.clone()).size_16().flex_none())
                             .child(Headline::new(self.message.clone()))
-                            .when_some(self.commit.clone(), |this, commit| {
+                            .when_some(self.upstream.clone(), |this, upstream| {
                                 this.child(
-                                    Label::new("Commit")
+                                    Label::new("Based on")
                                         .color(Color::Muted)
                                         .size(LabelSize::XSmall),
                                 )
-                                .child(Label::new(commit).size(LabelSize::Small))
-                            })
-                            .child(
-                                Label::new("Version")
-                                    .color(Color::Muted)
-                                    .size(LabelSize::XSmall),
-                            )
-                            .child(Label::new(self.full_version.clone()).size(LabelSize::Small)),
+                                .child(Label::new(upstream).size(LabelSize::Small))
+                            }),
                     )
                     .child(
                         h_flex()
@@ -1714,7 +1731,7 @@ fn open_about_window(cx: &mut App) {
     cx.open_window(
         WindowOptions {
             titlebar: Some(TitlebarOptions {
-                title: Some("About Zed".into()),
+                title: Some("About Zednotes".into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(12.), px(12.))),
             }),

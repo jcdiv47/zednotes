@@ -305,7 +305,7 @@ fn main() {
     let version = option_env!("ZED_BUILD_ID");
     let app_commit_sha =
         option_env!("ZED_COMMIT_SHA").map(|commit_sha| AppCommitSha::new(commit_sha.to_string()));
-    let app_version = AppVersion::load(env!("CARGO_PKG_VERSION"), version, app_commit_sha.clone());
+    let app_version = AppVersion::load(zed::zednotes_version(), version, app_commit_sha.clone());
 
     if args.system_specs {
         let system_specs = system_specs::SystemSpecs::new_stateless(
@@ -327,13 +327,14 @@ fn main() {
         .unwrap();
 
     log::info!(
-        "========== starting zed version {}, sha {} ==========",
+        "========== starting zednotes version {}, sha {}, based on {} ==========",
         app_version,
         app_commit_sha
             .as_ref()
             .map(|sha| sha.short())
             .as_deref()
             .unwrap_or("unknown"),
+        zed::zednotes_upstream_base().unwrap_or_else(|| "unpinned".to_string()),
     );
 
     #[cfg(windows)]

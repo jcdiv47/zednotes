@@ -258,6 +258,8 @@ impl VsCodeSettings {
 
     fn editor_settings_content(&self) -> EditorSettingsContent {
         EditorSettingsContent {
+            insert_date_format: None,
+            insert_date_timezone: None,
             auto_signature_help: self.read_bool("editor.parameterHints.enabled"),
             language_detection: self.read_bool("workbench.editor.languageDetection"),
             autoscroll_on_clicks: None,

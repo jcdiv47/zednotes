@@ -283,6 +283,10 @@
   "use_system_prompts": true,
   // Whether the cursor blinks in the editor.
   "cursor_blink": true,
+  // Format used by editor: insert date. Use "%Y-%m-%dT%H:%M:%S%:z" for a timestamp with an offset.
+  "insert_date_format": "%Y-%m-%d",
+  // Timezone used by editor: insert date: "local", "UTC", or a fixed offset such as "+08:00".
+  "insert_date_timezone": "local",
   // Cursor shape for the default editor.
   //  1. A vertical bar
   //     "bar"

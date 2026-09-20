@@ -6360,6 +6360,47 @@ async fn test_newline_comments_with_block_comment(cx: &mut TestAppContext) {
     "});
 }
 
+#[test]
+fn test_format_insert_date() -> Result<()> {
+    let date = chrono::DateTime::parse_from_rfc3339("2026-04-27T00:53:33-05:00")?;
+    for (format, timezone, expected) in [
+        ("%Y-%m-%d", "local", "2026-04-27"),
+        (
+            "%Y-%m-%dT%H:%M:%S%:z",
+            "+08:00",
+            "2026-04-27T13:53:33+08:00",
+        ),
+        ("%+", "local", "2026-04-27T00:53:33-05:00"),
+        ("%+", "UTC", "2026-04-27T05:53:33+00:00"),
+        ("%+", "utc", "2026-04-27T05:53:33+00:00"),
+        ("%+", "-10:00", "2026-04-26T19:53:33-10:00"),
+        ("%+", "+05:30", "2026-04-27T11:23:33+05:30"),
+        ("%Y/%m/%d %%", "local", "2026/04/27 %"),
+    ] {
+        assert_eq!(
+            Editor::format_insert_date(date, format, timezone)?,
+            expected
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_format_insert_date_invalid_settings() -> Result<()> {
+    let date = chrono::DateTime::parse_from_rfc3339("2026-04-27T13:53:33+08:00")?;
+    for format in ["%", "%Q"] {
+        let error = Editor::format_insert_date(date, format, "local")
+            .expect_err("invalid date formats should return an error");
+        assert!(error.to_string().contains("insert_date_format"));
+    }
+    for timezone in ["invalid", "+25:00", "+08:60", "+08:00extra", ""] {
+        let error = Editor::format_insert_date(date, "%+", timezone)
+            .expect_err("invalid timezones should return an error");
+        assert!(error.to_string().contains("insert_date_timezone"));
+    }
+    Ok(())
+}
+
 #[gpui::test]
 fn test_insert_with_old_selections(cx: &mut TestAppContext) {
     init_test(cx, |_| {});

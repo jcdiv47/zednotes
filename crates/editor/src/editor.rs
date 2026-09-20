@@ -9138,6 +9138,45 @@ impl Editor {
         }
     }
 
+    pub fn insert_date(&mut self, _: &InsertDate, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only(cx) {
+            return;
+        }
+
+        let settings = EditorSettings::get_global(cx);
+        if let Some(date) = Self::format_insert_date(
+            chrono::Local::now().fixed_offset(),
+            &settings.insert_date_format,
+            &settings.insert_date_timezone,
+        )
+        .notify_app_err(cx)
+        {
+            self.insert(&date, window, cx);
+        }
+    }
+
+    fn format_insert_date(
+        date: chrono::DateTime<chrono::FixedOffset>,
+        format: &str,
+        timezone: &str,
+    ) -> Result<String> {
+        let date = match timezone {
+            "local" => date,
+            "UTC" | "utc" => date.to_utc().fixed_offset(),
+            _ => match timezone.parse::<chrono::FixedOffset>() {
+                Ok(offset) if offset.to_string() == timezone => date.with_timezone(&offset),
+                _ => bail!(
+                    "Invalid insert_date_timezone {timezone:?}; use \"local\", \"UTC\", or an offset like \"+08:00\""
+                ),
+            },
+        };
+        let mut text = String::new();
+        date.format(format)
+            .write_to(&mut text)
+            .with_context(|| format!("Invalid insert_date_format {format:?}"))?;
+        Ok(text)
+    }
+
     pub fn insert_uuid_v4(
         &mut self,
         _: &InsertUuidV4,

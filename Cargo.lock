@@ -5578,6 +5578,7 @@ dependencies = [
  "base64 0.22.1",
  "breadcrumbs",
  "buffer_diff",
+ "chrono",
  "client",
  "clock",
  "collections",

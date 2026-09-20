@@ -17,6 +17,8 @@ use ui::scrollbars::ShowScrollbar;
 /// https://code.visualstudio.com/docs/reference/default-settings
 #[derive(Clone, RegisterSetting)]
 pub struct EditorSettings {
+    pub insert_date_format: String,
+    pub insert_date_timezone: String,
     pub cursor_blink: bool,
     pub cursor_shape: Option<CursorShape>,
     pub cursor_animation: CursorAnimationSettings,
@@ -226,6 +228,12 @@ impl Settings for EditorSettings {
         let sticky_scroll = editor.sticky_scroll.unwrap();
         let file_diff = content.git.as_ref().unwrap().file_diff.unwrap();
         Self {
+            insert_date_format: editor
+                .insert_date_format
+                .unwrap_or_else(|| "%Y-%m-%d".into()),
+            insert_date_timezone: editor
+                .insert_date_timezone
+                .unwrap_or_else(|| "local".into()),
             cursor_blink: editor.cursor_blink.unwrap(),
             cursor_shape: editor.cursor_shape.map(Into::into),
             cursor_animation: CursorAnimationSettings {

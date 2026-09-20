@@ -636,6 +636,8 @@ actions!(
         Hover,
         /// Increases indentation of selected lines.
         Indent,
+        /// Inserts the current date using the configured format and timezone at cursor position.
+        InsertDate,
         /// Inserts a UUID v4 at cursor position.
         InsertUuidV4,
         /// Inserts a UUID v7 at cursor position.

@@ -13,6 +13,16 @@ use crate::{
 #[with_fallible_options]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct EditorSettingsContent {
+    /// The strftime format used by the `editor: insert date` action.
+    /// Use "%Y-%m-%dT%H:%M:%S%:z" for a timestamp with a timezone offset.
+    ///
+    /// Default: "%Y-%m-%d"
+    pub insert_date_format: Option<String>,
+    /// The timezone used by the `editor: insert date` action.
+    /// Accepts "local", "UTC", or a fixed offset such as "+08:00" or "-05:00".
+    ///
+    /// Default: "local"
+    pub insert_date_timezone: Option<String>,
     /// Whether the cursor blinks in the editor.
     ///
     /// Default: true

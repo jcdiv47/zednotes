@@ -245,6 +245,7 @@ pub struct PdfView {
     scroll_handle: ScrollHandle,
     document: Option<Arc<LoadedPdf>>,
     image: Option<Arc<RenderImage>>,
+    image_page: usize,
     error: Option<String>,
     page: usize,
     zoom: f32,
@@ -273,6 +274,7 @@ impl PdfView {
             scroll_handle: ScrollHandle::new(),
             document: None,
             image: None,
+            image_page: 0,
             error: None,
             page: 0,
             zoom: 1.0,
@@ -355,7 +357,6 @@ impl PdfView {
         let Some(document) = self.document.clone() else {
             return;
         };
-        self.clear_image(window);
         self.error = None;
         self.loading = true;
         let page = self.page;
@@ -366,10 +367,14 @@ impl PdfView {
         // Replacing the task prevents an obsolete page or zoom result from updating this view.
         self.task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
-            this.update_in(cx, |this, _, cx| {
+            this.update_in(cx, |this, window, cx| {
                 this.loading = false;
                 match result {
-                    Ok(image) => this.image = Some(image),
+                    Ok(image) => {
+                        this.clear_image(window);
+                        this.image = Some(image);
+                        this.image_page = page;
+                    }
                     Err(error) => this.error = Some(format!("Unable to render PDF: {error:#}")),
                 }
                 cx.notify();
@@ -769,12 +774,12 @@ impl Render for PdfView {
             });
         if let Some(error) = &self.error {
             content = content.child(Label::new(error.clone()).color(Color::Error));
-        } else if self.loading {
+        } else if self.loading && self.image.is_none() {
             content = content.child(Label::new("Loading PDF…"));
         } else if self.continuous {
             content = content.child(self.render_continuous(cx));
         } else if let Some(image) = &self.image {
-            let page = img(image.clone());
+            let page = img(image.clone()).debug_selector(|| "pdf-page-image".into());
             if self.fit_page {
                 let image = image.clone();
                 content = content.child(
@@ -801,7 +806,7 @@ impl Render for PdfView {
             } else if let Some(dimensions) = self
                 .document
                 .as_ref()
-                .and_then(|document| document.document.page_size(self.page))
+                .and_then(|document| document.document.page_size(self.image_page))
             {
                 content = content.child(
                     page.w(px(dimensions.width * self.zoom))
@@ -971,6 +976,63 @@ mod tests {
         })
         .await
         .expect("open PDF item")
+    }
+
+    #[gpui::test]
+    #[ignore = "requires native Pdfium; run script/install-pdfium first"]
+    async fn keeps_previous_page_visible_while_rendering(cx: &mut gpui::TestAppContext) {
+        let item = open_test_pdf(cx).await;
+        let (view, cx) = cx.add_window_view(|window, cx| PdfView::new(item, window, cx));
+        cx.run_until_parked();
+
+        for fit_page in [true, false] {
+            for (forward, expected_page) in [(true, 1), (false, 0)] {
+                let previous_image = cx.update(|window, cx| {
+                    let previous_image = view.read(cx).image.clone().expect("rendered page");
+                    let previous_page = view.read(cx).page;
+                    view.update(cx, |view, cx| {
+                        view.fit_page = fit_page;
+                        view.change_page(forward, window, cx);
+                    });
+                    let viewer = view.read(cx);
+                    assert!(viewer.loading);
+                    assert_eq!(viewer.page, expected_page);
+                    assert_eq!(viewer.image_page, previous_page);
+                    assert!(Arc::ptr_eq(
+                        viewer.image.as_ref().expect("previous page stays visible"),
+                        &previous_image,
+                    ));
+                    window.refresh();
+                    window.draw(cx).clear(cx);
+                    previous_image
+                });
+                if !fit_page {
+                    let expected_size = if forward {
+                        size(px(200.0), px(300.0))
+                    } else {
+                        size(px(300.0), px(200.0))
+                    };
+                    assert_eq!(
+                        cx.debug_bounds("pdf-page-image")
+                            .expect("page image is drawn instead of loading text")
+                            .size,
+                        expected_size,
+                        "The previous page keeps its dimensions until the new page is ready",
+                    );
+                }
+                cx.run_until_parked();
+                cx.read(|cx| {
+                    let viewer = view.read(cx);
+                    assert!(!viewer.loading);
+                    assert!(viewer.error.is_none(), "{:?}", viewer.error);
+                    assert_eq!(viewer.image_page, expected_page);
+                    assert!(!Arc::ptr_eq(
+                        viewer.image.as_ref().expect("new page is ready"),
+                        &previous_image,
+                    ));
+                });
+            }
+        }
     }
 
     #[gpui::test]

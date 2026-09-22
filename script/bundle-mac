@@ -107,6 +107,7 @@ popd
 echo "Bundled ${app_path}"
 
 script/install-pdfium "${app_path}/Contents/MacOS/lib" "${target_triple%%-*}"
+mv "${app_path}/Contents/MacOS/lib/pdfium-licenses" "${app_path}/Contents/Resources/pdfium-licenses"
 
 # DocumentTypes.plist references CFBundleTypeIconFile "Document", so the bundle must contain Document.icns.
 # We use the app icon as a placeholder document icon for now.

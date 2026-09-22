@@ -1,4 +1,6 @@
 use std::{
+    collections::BTreeMap,
+    ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -6,7 +8,7 @@ use std::{
 use anyhow::{Context as _, Result, ensure};
 use gpui::{
     App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Render, RenderImage,
-    ScrollHandle, Task, Window, img, px,
+    ScrollHandle, Size, Task, Window, img, point, px, size,
 };
 use kkpdf_zed::{PdfDocument, PdfiumEngine, RasterizerOptions};
 use project::{Project, ProjectEntryId, ProjectPath};
@@ -18,6 +20,69 @@ use workspace::{
 };
 
 const MAX_RASTER_DIMENSION: f32 = 4096.0;
+const PAGE_GAP: f32 = 16.0;
+
+#[derive(Default)]
+struct ContinuousLayout {
+    pages: Vec<gpui::Bounds<gpui::Pixels>>,
+    size: Size<gpui::Pixels>,
+    zoom: f32,
+}
+
+impl ContinuousLayout {
+    fn new(dimensions: &[(f32, f32)], viewport_width: f32, zoom: f32, fit_width: bool) -> Self {
+        let widest = dimensions
+            .iter()
+            .map(|(width, _)| *width)
+            .fold(1.0, f32::max);
+        let zoom = if fit_width {
+            (viewport_width - PAGE_GAP * 2.0).max(1.0) / widest
+        } else {
+            zoom
+        };
+        let width = viewport_width.max(widest * zoom + PAGE_GAP * 2.0);
+        let mut top = PAGE_GAP;
+        let pages = dimensions
+            .iter()
+            .map(|(page_width, page_height)| {
+                let page_width = page_width * zoom;
+                let page_height = page_height * zoom;
+                let bounds = gpui::Bounds::new(
+                    point(px((width - page_width) / 2.0), px(top)),
+                    size(px(page_width), px(page_height)),
+                );
+                top += page_height + PAGE_GAP;
+                bounds
+            })
+            .collect();
+        Self {
+            pages,
+            size: size(px(width), px(top)),
+            zoom,
+        }
+    }
+
+    fn page_at(&self, offset: gpui::Pixels) -> usize {
+        self.pages
+            .partition_point(|page| page.bottom() <= offset + px(PAGE_GAP))
+            .min(self.pages.len().saturating_sub(1))
+    }
+
+    fn visible_pages(&self, offset: gpui::Pixels, height: gpui::Pixels) -> Range<usize> {
+        let first = self.pages.partition_point(|page| page.bottom() <= offset);
+        let end = self
+            .pages
+            .partition_point(|page| page.top() < offset + height);
+        first.saturating_sub(1)..end.saturating_add(1).min(self.pages.len())
+    }
+}
+
+#[derive(Default)]
+struct ContinuousPage {
+    image: Option<Arc<RenderImage>>,
+    error: Option<String>,
+    task: Option<Task<()>>,
+}
 
 pub fn init(cx: &mut App) {
     workspace::register_project_item::<PdfView>(cx);
@@ -86,6 +151,18 @@ impl LoadedPdf {
         );
         let document = engine.load_document_from_bytes(&bytes, Some(path))?;
         ensure!(!document.is_empty(), "This PDF contains no pages");
+        for page in 0..document.total_pages() {
+            let dimensions = document
+                .page_size(page)
+                .context("PDF page does not exist")?;
+            ensure!(
+                dimensions.width.is_finite()
+                    && dimensions.height.is_finite()
+                    && dimensions.width > 0.0
+                    && dimensions.height > 0.0,
+                "Invalid PDF page dimensions"
+            );
+        }
         Ok(Self {
             engine,
             bytes,
@@ -137,6 +214,11 @@ pub struct PdfView {
     page: usize,
     zoom: f32,
     fit_page: bool,
+    continuous: bool,
+    continuous_layout: ContinuousLayout,
+    continuous_pages: BTreeMap<usize, ContinuousPage>,
+    continuous_scroll_offset: Option<gpui::Pixels>,
+    viewport_size: Size<gpui::Pixels>,
     loading: bool,
     task: Option<Task<()>>,
 }
@@ -144,9 +226,8 @@ pub struct PdfView {
 impl PdfView {
     fn new(item: Entity<PdfItem>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.on_release_in(window, |this, window, _| {
-            if let Some(image) = this.image.take() {
-                window.drop_image(image).log_err();
-            }
+            this.clear_image(window);
+            this.clear_continuous_pages(window);
         })
         .detach();
         let mut view = Self {
@@ -159,6 +240,11 @@ impl PdfView {
             page: 0,
             zoom: 1.0,
             fit_page: true,
+            continuous: false,
+            continuous_layout: ContinuousLayout::default(),
+            continuous_pages: BTreeMap::new(),
+            continuous_scroll_offset: None,
+            viewport_size: Size::default(),
             loading: false,
             task: None,
         };
@@ -175,6 +261,8 @@ impl PdfView {
     fn load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.task = None;
         self.clear_image(window);
+        self.clear_continuous_pages(window);
+        self.continuous_layout = ContinuousLayout::default();
         self.document = None;
         self.error = None;
         let item = self.item.read(cx);
@@ -219,6 +307,10 @@ impl PdfView {
     }
 
     fn render_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.continuous {
+            self.reflow_continuous(window, cx);
+            return;
+        }
         let Some(document) = self.document.clone() else {
             return;
         };
@@ -258,15 +350,228 @@ impl PdfView {
         };
         if page != self.page {
             self.page = page;
-            self.scroll_handle.set_offset(gpui::Point::default());
-            self.render_page(window, cx);
+            if self.continuous {
+                self.scroll_to_page();
+                self.update_continuous_pages(window, cx);
+                cx.notify();
+            } else {
+                self.scroll_handle.set_offset(gpui::Point::default());
+                self.render_page(window, cx);
+            }
         }
     }
 
     fn change_zoom(&mut self, increase: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.continuous && self.fit_page {
+            self.zoom = self.continuous_layout.zoom;
+        }
         self.fit_page = false;
         self.zoom = (self.zoom * if increase { 1.25 } else { 0.8 }).clamp(0.25, 4.0);
         self.render_page(window, cx);
+    }
+
+    fn clear_continuous_pages(&mut self, window: &mut Window) {
+        for (_, page) in std::mem::take(&mut self.continuous_pages) {
+            if let Some(image) = page.image {
+                window.drop_image(image).log_err();
+            }
+        }
+    }
+
+    fn toggle_continuous(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.continuous = !self.continuous;
+        self.task = None;
+        self.clear_image(window);
+        self.clear_continuous_pages(window);
+        self.scroll_handle.set_offset(gpui::Point::default());
+        self.render_page(window, cx);
+    }
+
+    fn scroll_to_page(&mut self) {
+        self.continuous_scroll_offset = None;
+        if let Some(bounds) = self.continuous_layout.pages.get(self.page) {
+            self.scroll_handle.set_offset(point(
+                self.scroll_handle.offset().x,
+                -(bounds.top() - px(PAGE_GAP)),
+            ));
+        }
+    }
+
+    fn reflow_continuous(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        let dimensions = (0..document.document.total_pages())
+            .filter_map(|page| document.document.page_size(page))
+            .map(|dimensions| (dimensions.width, dimensions.height))
+            .collect::<Vec<_>>();
+        self.continuous_layout = ContinuousLayout::new(
+            &dimensions,
+            f32::from(self.viewport_size.width),
+            self.zoom,
+            self.fit_page,
+        );
+        self.clear_continuous_pages(window);
+        self.error = None;
+        self.loading = false;
+        self.scroll_to_page();
+        self.update_continuous_pages(window, cx);
+        cx.notify();
+    }
+
+    fn update_continuous_pages(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        if self.viewport_size.width <= px(0.0) || self.viewport_size.height <= px(0.0) {
+            return;
+        }
+        let offset = -self.scroll_handle.offset().y;
+        let range = self
+            .continuous_layout
+            .visible_pages(offset, self.viewport_size.height);
+        let mut changed = false;
+        self.continuous_pages.retain(|page, rendered| {
+            if range.contains(page) {
+                true
+            } else {
+                if let Some(image) = rendered.image.take() {
+                    window.drop_image(image).log_err();
+                }
+                changed = true;
+                false
+            }
+        });
+        for page in range {
+            if self.continuous_pages.contains_key(&page) {
+                continue;
+            }
+            let zoom = self.continuous_layout.zoom;
+            let scale_factor = window.scale_factor();
+            let task = cx.background_spawn({
+                let document = document.clone();
+                async move { document.render_page(page, zoom, scale_factor) }
+            });
+            let task = cx.spawn_in(window, async move |this, cx| {
+                let result = task.await;
+                this.update_in(cx, |this, _, cx| {
+                    if let Some(rendered) = this.continuous_pages.get_mut(&page) {
+                        match result {
+                            Ok(image) => rendered.image = Some(image),
+                            Err(error) => {
+                                rendered.error = Some(format!("Unable to render PDF: {error:#}"))
+                            }
+                        }
+                        rendered.task = None;
+                        cx.notify();
+                    }
+                })
+                .log_err();
+            });
+            self.continuous_pages.insert(
+                page,
+                ContinuousPage {
+                    task: Some(task),
+                    ..Default::default()
+                },
+            );
+            changed = true;
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn update_continuous_viewport(
+        &mut self,
+        viewport_size: Size<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.continuous {
+            return;
+        }
+        if self.viewport_size != viewport_size {
+            self.viewport_size = viewport_size;
+            self.reflow_continuous(window, cx);
+            return;
+        }
+        let offset = -self.scroll_handle.offset().y;
+        // Navigation can be clamped when a page is shorter than the viewport.
+        // Keep the selected page until the user scrolls.
+        if self
+            .continuous_scroll_offset
+            .is_some_and(|previous| previous != offset)
+        {
+            let page = if offset > px(0.0)
+                && offset + self.viewport_size.height >= self.continuous_layout.size.height
+            {
+                self.continuous_layout.pages.len().saturating_sub(1)
+            } else {
+                self.continuous_layout.page_at(offset)
+            };
+            if self.page != page {
+                self.page = page;
+                cx.notify();
+            }
+        }
+        self.continuous_scroll_offset = Some(offset);
+        self.update_continuous_pages(window, cx);
+    }
+
+    fn render_continuous(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut pages = div()
+            .relative()
+            .flex_shrink_0()
+            .w(self.continuous_layout.size.width)
+            .h(self.continuous_layout.size.height);
+        for (index, rendered) in &self.continuous_pages {
+            let Some(bounds) = self.continuous_layout.pages.get(*index) else {
+                continue;
+            };
+            let mut page = div()
+                .absolute()
+                .left(bounds.left())
+                .top(bounds.top())
+                .w(bounds.size.width)
+                .h(bounds.size.height)
+                .bg(gpui::white());
+            if let Some(image) = &rendered.image {
+                page = page.child(img(image.clone()).size_full());
+            } else if let Some(error) = &rendered.error {
+                page = page.child(Label::new(error.clone()).color(Color::Error));
+            } else {
+                page = page
+                    .child(Label::new(format!("Loading page {}…", index + 1)).color(Color::Muted));
+            }
+            pages = pages.child(page);
+        }
+        let view = cx.weak_entity();
+        div()
+            .id("pdf-continuous")
+            .debug_selector(|| "pdf-continuous".into())
+            .relative()
+            .size_full()
+            .overflow_scroll()
+            .track_scroll(&self.scroll_handle)
+            .child(pages)
+            .child(
+                gpui::canvas(
+                    move |bounds, window, cx| {
+                        window.defer(cx, move |window, cx| {
+                            view.update(cx, |view, cx| {
+                                view.update_continuous_viewport(bounds.size, window, cx);
+                            })
+                            .log_err();
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
     }
 }
 
@@ -356,13 +661,19 @@ impl Render for PdfView {
             .flex_1()
             .min_h_0()
             .w_full()
-            .overflow_scroll()
-            .track_scroll(&self.scroll_handle)
-            .p_4();
+            .overflow_hidden()
+            .when(!self.continuous, |content| {
+                content
+                    .overflow_scroll()
+                    .track_scroll(&self.scroll_handle)
+                    .p_4()
+            });
         if let Some(error) = &self.error {
             content = content.child(Label::new(error.clone()).color(Color::Error));
         } else if self.loading {
             content = content.child(Label::new("Loading PDF…"));
+        } else if self.continuous {
+            content = content.child(self.render_continuous(cx));
         } else if let Some(image) = &self.image {
             let page = img(image.clone());
             if self.fit_page {
@@ -436,7 +747,12 @@ impl Render for PdfView {
                         cx.listener(|this, _, window, cx| this.change_zoom(false, window, cx)),
                     ))
                     .child(Label::new(if self.fit_page {
-                        "Fit page".into()
+                        if self.continuous {
+                            "Fit width"
+                        } else {
+                            "Fit page"
+                        }
+                        .into()
                     } else {
                         format!("{:.0}%", self.zoom * 100.0)
                     }))
@@ -444,12 +760,27 @@ impl Render for PdfView {
                         cx.listener(|this, _, window, cx| this.change_zoom(true, window, cx)),
                     ))
                     .child(
-                        Button::new("fit-page", "Fit page")
+                        Button::new(
+                            "fit-page",
+                            if self.continuous {
+                                "Fit width"
+                            } else {
+                                "Fit page"
+                            },
+                        )
+                        .disabled(total == 0)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.fit_page = true;
+                            this.scroll_handle.set_offset(gpui::Point::default());
+                            this.render_page(window, cx);
+                        })),
+                    )
+                    .child(
+                        Button::new("continuous-scrolling", "Continuous")
+                            .toggle_state(self.continuous)
                             .disabled(total == 0)
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.fit_page = true;
-                                this.scroll_handle.set_offset(gpui::Point::default());
-                                this.render_page(window, cx);
+                                this.toggle_continuous(window, cx);
                             })),
                     )
                     .child(
@@ -562,6 +893,107 @@ mod tests {
             assert_eq!(view.read(cx).zoom, 1.25, "Reload preserves zoom");
             assert!(view.read(cx).image.is_some(), "{:?}", view.read(cx).error);
         });
+        view.update_in(cx, |view, window, cx| {
+            view.zoom = 4.0;
+            view.toggle_continuous(window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let viewer = view.read(cx);
+            assert!(viewer.continuous);
+            assert!(viewer.image.is_none());
+            assert_eq!(viewer.page, 1, "Changing mode preserves the page");
+            assert_eq!(viewer.continuous_pages.len(), 2);
+            assert!(
+                viewer
+                    .continuous_pages
+                    .values()
+                    .all(|page| page.image.is_some())
+            );
+            view.update(cx, |view, cx| view.change_page(false, window, cx));
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(view.read(cx).page, 0);
+            assert_eq!(view.read(cx).scroll_handle.offset().y, px(0.0));
+        });
+        let bounds = cx
+            .debug_bounds("pdf-continuous")
+            .expect("continuous viewport");
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: bounds.center(),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(-1232.0))),
+            ..Default::default()
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert_eq!(view.read(cx).page, 1, "Scrolling updates the page counter");
+            assert!(view.read(cx).scroll_handle.offset().y < px(0.0));
+            view.update(cx, |view, cx| view.load(window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(view.read(cx).continuous, "Reload preserves the mode");
+            assert_eq!(view.read(cx).page, 1);
+            view.update(cx, |view, cx| {
+                view.fit_page = true;
+                view.render_page(window, cx);
+            });
+            window.resize(size(px(800.0), px(600.0)));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let viewer = view.read(cx);
+            assert_eq!(viewer.page, 1, "Resizing preserves the selected page");
+            let widest = viewer.continuous_layout.pages.get(1).expect("second page");
+            assert_eq!(
+                widest.size.width + px(PAGE_GAP * 2.0),
+                viewer.viewport_size.width
+            );
+            view.update(cx, |view, cx| {
+                view.fit_page = false;
+                view.zoom = 0.25;
+                view.render_page(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert_eq!(
+                view.read(cx).page,
+                1,
+                "Short pages preserve explicit navigation"
+            );
+            assert_eq!(view.read(cx).scroll_handle.offset().y, px(0.0));
+            view.update(cx, |view, cx| view.toggle_continuous(window, cx));
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert!(!view.read(cx).continuous);
+            assert_eq!(view.read(cx).page, 1);
+            assert!(view.read(cx).continuous_pages.is_empty());
+            assert!(view.read(cx).image.is_some());
+        });
     }
 
     #[test]
@@ -576,5 +1008,43 @@ mod tests {
         assert!(is_pdf(Some("PDF"), None));
         assert!(!is_pdf(Some("pdf.bak"), None));
         assert!(!is_pdf(None, None));
+    }
+
+    #[test]
+    fn continuous_layout_fits_and_centers_mixed_page_sizes() {
+        let layout = ContinuousLayout::new(&[(200.0, 300.0), (300.0, 200.0)], 632.0, 1.0, true);
+        assert_eq!(layout.zoom, 2.0);
+        assert_eq!(layout.size, size(px(632.0), px(1048.0)));
+        assert_eq!(
+            layout.pages.first(),
+            Some(&gpui::Bounds::new(
+                point(px(116.0), px(16.0)),
+                size(px(400.0), px(600.0))
+            ))
+        );
+        assert_eq!(
+            layout.pages.get(1),
+            Some(&gpui::Bounds::new(
+                point(px(16.0), px(632.0)),
+                size(px(600.0), px(400.0))
+            ))
+        );
+        assert_eq!(layout.page_at(px(0.0)), 0);
+        assert_eq!(layout.page_at(px(616.0)), 1);
+    }
+
+    #[test]
+    fn continuous_layout_limits_rendering_to_visible_and_neighboring_pages() {
+        let dimensions = vec![(200.0, 300.0); 100];
+        let layout = ContinuousLayout::new(&dimensions, 232.0, 1.0, false);
+        assert_eq!(layout.visible_pages(px(0.0), px(300.0)), 0..2);
+        assert_eq!(layout.visible_pages(px(3160.0), px(300.0)), 9..12);
+        assert_eq!(layout.visible_pages(px(31284.0), px(316.0)), 98..100);
+        let zoomed = ContinuousLayout::new(&dimensions, 232.0, 2.0, false);
+        assert_eq!(zoomed.size.width, px(432.0));
+        assert_eq!(
+            zoomed.pages.first().map(|page| page.size.height),
+            Some(px(600.0))
+        );
     }
 }

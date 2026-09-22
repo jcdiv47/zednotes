@@ -1582,6 +1582,15 @@
     },
   },
   {
+    "context": "PdfViewer",
+    "bindings": {
+      "left": "pdf_viewer::PreviousPage",
+      "up": "pdf_viewer::PreviousPage",
+      "right": "pdf_viewer::NextPage",
+      "down": "pdf_viewer::NextPage",
+    },
+  },
+  {
     "context": "ImageViewer",
     "bindings": {
       "ctrl-=": "image_viewer::ZoomIn",

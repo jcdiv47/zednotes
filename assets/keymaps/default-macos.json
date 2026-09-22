@@ -1658,6 +1658,15 @@
     },
   },
   {
+    "context": "PdfViewer",
+    "bindings": {
+      "left": "pdf_viewer::PreviousPage",
+      "up": "pdf_viewer::PreviousPage",
+      "right": "pdf_viewer::NextPage",
+      "down": "pdf_viewer::NextPage",
+    },
+  },
+  {
     "context": "ImageViewer",
     "use_key_equivalents": true,
     "bindings": {

@@ -7,6 +7,12 @@ In this mode, **Fit width** fits the widest page to the viewport, the page count
 follows scrolling, and Previous/Next scroll to the corresponding page. Toggle
 Continuous off to return to single-page viewing.
 
+Click the PDF to focus it, then use Left/Up for the previous page and Right/Down
+for the next page in either mode. In single-page mode, touchpad swipes and mouse
+wheel scrolling turn pages; zoomed pages pan first and turn at the edge. Small
+movements are ignored, and gesture momentum cannot skip multiple pages.
+Continuous mode keeps smooth touchpad scrolling through the document.
+
 Parsing and rasterization run on the background executor. Continuous mode retains
 only visible pages and one neighboring page on either side; single-page mode
 retains the current page. Raster dimensions are capped at 4096 pixels per side.
@@ -56,6 +62,8 @@ out-of-range pages, and malformed-document rejection. A GPUI regression test
 opens a single-file worktree, clicks Next, changes zoom, switches viewing modes,
 scrolls across a page boundary, and verifies Reload preserves navigation state.
 Layout tests cover mixed page sizes, fit-to-width, and the visible page range.
+Input tests cover the default arrow bindings on all platforms, touchpad gesture
+thresholds and momentum, zoomed-page panning, and mouse wheel navigation.
 
 ## Current limits
 

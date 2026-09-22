@@ -3,12 +3,13 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context as _, Result, ensure};
 use gpui::{
     App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Render, RenderImage,
-    ScrollHandle, Size, Task, Window, img, point, px, size,
+    ScrollHandle, ScrollWheelEvent, Size, Task, TouchPhase, Window, actions, img, point, px, size,
 };
 use kkpdf_zed::{PdfDocument, PdfiumEngine, RasterizerOptions};
 use project::{Project, ProjectEntryId, ProjectPath};
@@ -21,6 +22,40 @@ use workspace::{
 
 const MAX_RASTER_DIMENSION: f32 = 4096.0;
 const PAGE_GAP: f32 = 16.0;
+const PAGE_SCROLL_THRESHOLD: f32 = 60.0;
+
+actions!(
+    pdf_viewer,
+    [
+        /// Show the previous PDF page.
+        PreviousPage,
+        /// Show the next PDF page.
+        NextPage,
+    ]
+);
+
+#[derive(Default)]
+struct PageScrollGesture {
+    accumulated: f32,
+    navigated: bool,
+}
+
+impl PageScrollGesture {
+    fn push(&mut self, delta: f32) -> Option<bool> {
+        if self.navigated || delta == 0.0 {
+            return None;
+        }
+        if self.accumulated.signum() != delta.signum() {
+            self.accumulated = 0.0;
+        }
+        self.accumulated += delta;
+        if self.accumulated.abs() < PAGE_SCROLL_THRESHOLD {
+            return None;
+        }
+        self.navigated = true;
+        Some(self.accumulated < 0.0)
+    }
+}
 
 #[derive(Default)]
 struct ContinuousLayout {
@@ -219,6 +254,8 @@ pub struct PdfView {
     continuous_pages: BTreeMap<usize, ContinuousPage>,
     continuous_scroll_offset: Option<gpui::Pixels>,
     viewport_size: Size<gpui::Pixels>,
+    page_scroll_gesture: PageScrollGesture,
+    scroll_reset_task: Option<Task<()>>,
     loading: bool,
     task: Option<Task<()>>,
 }
@@ -245,6 +282,8 @@ impl PdfView {
             continuous_pages: BTreeMap::new(),
             continuous_scroll_offset: None,
             viewport_size: Size::default(),
+            page_scroll_gesture: PageScrollGesture::default(),
+            scroll_reset_task: None,
             loading: false,
             task: None,
         };
@@ -259,6 +298,8 @@ impl PdfView {
     }
 
     fn load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.page_scroll_gesture = PageScrollGesture::default();
+        self.scroll_reset_task = None;
         self.task = None;
         self.clear_image(window);
         self.clear_continuous_pages(window);
@@ -370,6 +411,63 @@ impl PdfView {
         self.render_page(window, cx);
     }
 
+    fn handle_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.continuous || self.document.is_none() || event.modifiers.modified() {
+            return;
+        }
+        cx.stop_propagation();
+        if matches!(
+            event.touch_phase,
+            TouchPhase::Started | TouchPhase::Cancelled
+        ) {
+            self.page_scroll_gesture = PageScrollGesture::default();
+        }
+        if event.touch_phase == TouchPhase::Cancelled {
+            self.scroll_reset_task = None;
+            return;
+        }
+        // Momentum belongs to the same gesture after Ended. Only a new gesture or
+        // an idle interval unlocks navigation, including for wheels without phases.
+        let timer = cx.background_executor().timer(Duration::from_millis(250));
+        self.scroll_reset_task = Some(cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, _| {
+                this.page_scroll_gesture = PageScrollGesture::default();
+            })
+            .log_err();
+        }));
+        if self.page_scroll_gesture.navigated || self.loading {
+            return;
+        }
+        let delta = event.delta.pixel_delta(px(PAGE_SCROLL_THRESHOLD));
+        let horizontal = delta.x.abs() > delta.y.abs();
+        let movement = if horizontal { delta.x } else { delta.y };
+        if !self.fit_page {
+            let offset = self.scroll_handle.offset();
+            let maximum = self.scroll_handle.max_offset();
+            let mut next_offset = offset;
+            if horizontal {
+                next_offset.x = (offset.x + movement).clamp(-maximum.x, px(0.0));
+            } else {
+                next_offset.y = (offset.y + movement).clamp(-maximum.y, px(0.0));
+            }
+            if next_offset != offset {
+                self.scroll_handle.set_offset(next_offset);
+                self.page_scroll_gesture.accumulated = 0.0;
+                cx.notify();
+                return;
+            }
+        }
+        if let Some(forward) = self.page_scroll_gesture.push(f32::from(movement)) {
+            self.change_page(forward, window, cx);
+        }
+    }
+
     fn clear_continuous_pages(&mut self, window: &mut Window) {
         for (_, page) in std::mem::take(&mut self.continuous_pages) {
             if let Some(image) = page.image {
@@ -379,6 +477,8 @@ impl PdfView {
     }
 
     fn toggle_continuous(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.page_scroll_gesture = PageScrollGesture::default();
+        self.scroll_reset_task = None;
         self.continuous = !self.continuous;
         self.task = None;
         self.clear_image(window);
@@ -657,16 +757,15 @@ impl Render for PdfView {
             .map_or(0, |document| document.document.total_pages());
         let mut content = div()
             .id("pdf-page")
+            .debug_selector(|| "pdf-page".into())
             .relative()
             .flex_1()
             .min_h_0()
             .w_full()
             .overflow_hidden()
+            .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
             .when(!self.continuous, |content| {
-                content
-                    .overflow_scroll()
-                    .track_scroll(&self.scroll_handle)
-                    .p_4()
+                content.track_scroll(&self.scroll_handle).p_4()
             });
         if let Some(error) = &self.error {
             content = content.child(Label::new(error.clone()).color(Color::Error));
@@ -713,6 +812,19 @@ impl Render for PdfView {
         v_flex()
             .size_full()
             .track_focus(&self.focus_handle)
+            .key_context("PdfViewer")
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.focus_handle.focus(window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &PreviousPage, window, cx| {
+                this.change_page(false, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextPage, window, cx| {
+                this.change_page(true, window, cx);
+            }))
             .bg(cx.theme().colors().editor_background)
             .child(
                 h_flex()
@@ -826,9 +938,7 @@ mod tests {
         Ok(())
     }
 
-    #[gpui::test]
-    #[ignore = "requires native Pdfium; run script/install-pdfium first"]
-    async fn opens_and_navigates_single_file_pdf(cx: &mut gpui::TestAppContext) {
+    async fn open_test_pdf(cx: &mut gpui::TestAppContext) -> Entity<PdfItem> {
         use fs::{FakeFs, Fs as _};
         use project::ProjectItem as _;
         cx.update(|cx| {
@@ -844,25 +954,29 @@ mod tests {
         fs.insert_file(path, include_bytes!("../test_data/two-pages.pdf").to_vec())
             .await;
         let project = Project::test(fs, [path], cx).await;
-        let item = cx
-            .update(|cx| {
-                let worktree = project
-                    .read(cx)
-                    .worktrees(cx)
-                    .next()
-                    .expect("single-file worktree");
-                let worktree = worktree.read(cx);
-                assert!(worktree.is_single_file());
-                let project_path = ProjectPath {
-                    worktree_id: worktree.id(),
-                    path: worktree.root_entry().expect("root entry").path.clone(),
-                };
-                assert!(project_path.path.extension().is_none());
-                PdfItem::try_open(&project, &project_path, cx)
-                    .expect("PDF opener handles single files")
-            })
-            .await
-            .expect("open PDF item");
+        cx.update(|cx| {
+            let worktree = project
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .expect("single-file worktree");
+            let worktree = worktree.read(cx);
+            assert!(worktree.is_single_file());
+            let project_path = ProjectPath {
+                worktree_id: worktree.id(),
+                path: worktree.root_entry().expect("root entry").path.clone(),
+            };
+            assert!(project_path.path.extension().is_none());
+            PdfItem::try_open(&project, &project_path, cx).expect("PDF opener handles single files")
+        })
+        .await
+        .expect("open PDF item")
+    }
+
+    #[gpui::test]
+    #[ignore = "requires native Pdfium; run script/install-pdfium first"]
+    async fn opens_and_navigates_single_file_pdf(cx: &mut gpui::TestAppContext) {
+        let item = open_test_pdf(cx).await;
         let (view, cx) = cx.add_window_view(|window, cx| PdfView::new(item, window, cx));
         cx.run_until_parked();
         cx.update(|window, cx| {
@@ -994,6 +1108,134 @@ mod tests {
             assert!(view.read(cx).continuous_pages.is_empty());
             assert!(view.read(cx).image.is_some());
         });
+    }
+
+    #[gpui::test]
+    #[ignore = "requires native Pdfium; run script/install-pdfium first"]
+    async fn navigates_with_arrow_keys_and_scroll_gestures(cx: &mut gpui::TestAppContext) {
+        let item = open_test_pdf(cx).await;
+        cx.update(|cx| {
+            for keymap in [
+                "keymaps/default-macos.json",
+                "keymaps/default-linux.json",
+                "keymaps/default-windows.json",
+            ] {
+                let bindings = settings::KeymapFile::load_asset_allow_partial_failure(keymap, cx)
+                    .expect("load default keymap")
+                    .into_iter()
+                    .filter(|binding| {
+                        matches!(
+                            binding.action().name(),
+                            "pdf_viewer::PreviousPage" | "pdf_viewer::NextPage"
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(bindings.len(), 4, "PDF arrow bindings in {keymap}");
+                cx.bind_keys(bindings);
+            }
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| PdfView::new(item, window, cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        let position = cx.debug_bounds("pdf-page").expect("PDF viewport").center();
+        cx.simulate_click(position, gpui::Modifiers::none());
+        for (key, expected_page) in [
+            ("right", 1),
+            ("right", 1),
+            ("left", 0),
+            ("down", 1),
+            ("up", 0),
+            ("up", 0),
+        ] {
+            cx.simulate_keystrokes(key);
+            cx.read(|cx| assert_eq!(view.read(cx).page, expected_page, "{key}"));
+        }
+        let scroll = |delta, phase| ScrollWheelEvent {
+            position,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(delta))),
+            touch_phase: phase,
+            ..Default::default()
+        };
+        cx.simulate_event(scroll(-20.0, TouchPhase::Started));
+        cx.read(|cx| assert_eq!(view.read(cx).page, 0, "Small movements do not turn pages"));
+        cx.simulate_event(scroll(-45.0, TouchPhase::Moved));
+        cx.read(|cx| assert_eq!(view.read(cx).page, 1));
+        cx.simulate_event(scroll(0.0, TouchPhase::Ended));
+        cx.simulate_event(scroll(120.0, TouchPhase::Moved));
+        cx.read(|cx| assert_eq!(view.read(cx).page, 1, "Momentum cannot turn another page"));
+        cx.simulate_event(scroll(60.0, TouchPhase::Started));
+        cx.read(|cx| assert_eq!(view.read(cx).page, 0, "A new gesture can navigate back"));
+
+        view.update_in(cx, |view, window, cx| {
+            view.fit_page = false;
+            view.zoom = 4.0;
+            view.render_page(window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx.simulate_event(scroll(-80.0, TouchPhase::Started));
+        cx.read(|cx| {
+            assert_eq!(view.read(cx).page, 0, "Zoomed pages pan before navigating");
+            assert_eq!(view.read(cx).scroll_handle.offset().y, px(-80.0));
+        });
+        view.update_in(cx, |view, _, cx| {
+            let maximum = view.scroll_handle.max_offset();
+            view.scroll_handle.set_offset(point(px(0.0), -maximum.y));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_event(scroll(-60.0, TouchPhase::Started));
+        cx.read(|cx| {
+            assert_eq!(
+                view.read(cx).page,
+                1,
+                "Scrolling at the edge turns the page"
+            )
+        });
+
+        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: gpui::ScrollDelta::Lines(point(0.0, 1.0)),
+            ..Default::default()
+        });
+        cx.read(|cx| {
+            assert_eq!(
+                view.read(cx).page,
+                0,
+                "Wheels without phases unlock after idle"
+            )
+        });
+        view.update_in(cx, |view, window, cx| view.toggle_continuous(window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down");
+        cx.read(|cx| {
+            assert_eq!(
+                view.read(cx).page,
+                1,
+                "Arrow keys navigate in continuous mode"
+            );
+            assert!(view.read(cx).scroll_handle.offset().y < px(0.0));
+        });
+        cx.simulate_keystrokes("up");
+        cx.read(|cx| assert_eq!(view.read(cx).page, 0));
+    }
+
+    #[test]
+    fn scroll_gestures_accumulate_and_reset_on_direction_changes() {
+        let mut gesture = PageScrollGesture::default();
+        assert_eq!(gesture.push(-40.0), None);
+        assert_eq!(gesture.push(30.0), None);
+        assert_eq!(gesture.push(30.0), Some(false));
+        assert_eq!(gesture.push(-200.0), None);
+        assert_eq!(gesture.push(200.0), None);
     }
 
     #[test]

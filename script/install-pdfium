@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Pin both the native engine and its digest so builds never execute an unverified download.
+version=8066
+target_directory="${1:-${HOME}/.local/share/kkpdf-zed/lib}"
+target_architecture="${2:-$(uname -m)}"
+case "$(uname -s)-${target_architecture}" in
+    Darwin-arm64|Darwin-aarch64)
+        asset=pdfium-mac-arm64.tgz
+        digest=336219e80580b93c6523f44db7dc1de59cc497b13a7390ddac84223f68ca162b
+        library=libpdfium.dylib ;;
+    Darwin-x86_64)
+        asset=pdfium-mac-x64.tgz
+        digest=841ecac278cdd46288dd065873522cf72f3996560d8978f473d336f01d59942c
+        library=libpdfium.dylib ;;
+    Linux-aarch64|Linux-arm64)
+        asset=pdfium-linux-arm64.tgz
+        digest=0e6f90dccbc6b81fd5d7106abaf164c4222178f024c204d00d526b60fd2ad535
+        library=libpdfium.so ;;
+    Linux-x86_64)
+        asset=pdfium-linux-x64.tgz
+        digest=0b43f405477cf2cfc4dbff06905093c3309756c6bca1fb9da99234a2ca97fed2
+        library=libpdfium.so ;;
+    *) echo "Unsupported Pdfium target: $(uname -s)-${target_architecture}" >&2; exit 1 ;;
+esac
+
+temporary_directory=$(mktemp -d)
+trap 'rm -rf "$temporary_directory"' EXIT
+curl --fail --location --retry 3 \
+    "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F${version}/${asset}" \
+    --output "${temporary_directory}/pdfium.tgz"
+actual_digest=$(shasum -a 256 "${temporary_directory}/pdfium.tgz" | awk '{print $1}')
+if [[ "$actual_digest" != "$digest" ]]; then
+    echo "Pdfium checksum mismatch" >&2
+    exit 1
+fi
+tar -xzf "${temporary_directory}/pdfium.tgz" -C "$temporary_directory"
+mkdir -p "$target_directory"
+cp "${temporary_directory}/lib/${library}" "$target_directory/"
+# Pdfium includes third-party code; ship the binary distributor's complete notices.
+mkdir -p "${target_directory}/pdfium-licenses"
+cp -R "${temporary_directory}/licenses/." "${target_directory}/pdfium-licenses/"
+echo "Installed Pdfium ${version} in ${target_directory}"

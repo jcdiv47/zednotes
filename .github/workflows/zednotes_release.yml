@@ -1,0 +1,148 @@
+name: Zednotes release
+
+on:
+  push:
+    tags:
+    - zednotes-v*
+  # Manual runs build the DMG as a workflow artifact without creating a release.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zednotes-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'jcdiv47/zednotes'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.pin.outputs.version }}
+      zed_version: ${{ steps.pin.outputs.zed_version }}
+      upstream_commit: ${{ steps.pin.outputs.upstream_commit }}
+    steps:
+    - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      with:
+        fetch-depth: 0
+    - name: Fetch upstream Zed
+      run: |
+        git remote add upstream https://github.com/zed-industries/zed.git
+        git fetch --no-tags upstream main
+    - name: Check upstream pin
+      run: script/zednotes-version check
+    - name: Read pin
+      id: pin
+      run: |
+        python3 - >> "$GITHUB_OUTPUT" <<'PY'
+        import tomllib
+
+        with open("zednotes.toml", "rb") as handle:
+            pin = tomllib.load(handle)
+
+        print(f"version={pin['zednotes']['version']}")
+        print(f"zed_version={pin['upstream']['zed_version']}")
+        print(f"upstream_commit={pin['upstream']['commit']}")
+        PY
+    - name: Check tag
+      if: github.ref_type == 'tag'
+      env:
+        VERSION: ${{ steps.pin.outputs.version }}
+      run: |
+        if [[ "$GITHUB_REF_NAME" != "zednotes-v${VERSION}" ]]; then
+          echo "::error::tag $GITHUB_REF_NAME does not match zednotes.toml version $VERSION (expected zednotes-v${VERSION})"
+          exit 1
+        fi
+        if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/dev; then
+          echo "::error::tag $GITHUB_REF_NAME points at a commit that is not on dev"
+          exit 1
+        fi
+    - name: Write release notes
+      env:
+        VERSION: ${{ steps.pin.outputs.version }}
+        ZED_VERSION: ${{ steps.pin.outputs.zed_version }}
+        UPSTREAM_COMMIT: ${{ steps.pin.outputs.upstream_commit }}
+      run: |
+        previous_tag=$(git describe --tags --abbrev=0 --match 'zednotes-v*' "${GITHUB_SHA}^" 2>/dev/null || true)
+        range="$GITHUB_SHA"
+        if [[ -n "$previous_tag" ]]; then
+          range="${previous_tag}..${GITHUB_SHA}"
+        fi
+        {
+          echo "Based on Zed ${ZED_VERSION} ([\`${UPSTREAM_COMMIT:0:7}\`](https://github.com/zed-industries/zed/commit/${UPSTREAM_COMMIT}))."
+          echo
+          if [[ -n "$previous_tag" ]]; then
+            echo "## Changes since ${previous_tag}"
+          else
+            echo "## Changes"
+          fi
+          echo
+          # Excluding the pinned upstream commit leaves only Zednotes' own commits.
+          git log --no-merges --format='- %s' "$range" "^${UPSTREAM_COMMIT}"
+          echo
+          echo "## Installing"
+          echo
+          echo "This build is not notarized. After dragging Zednotes into Applications, run:"
+          echo
+          echo '```sh'
+          echo 'xattr -dr com.apple.quarantine /Applications/Zednotes.app'
+          echo '```'
+        } > release-notes.md
+        cat release-notes.md
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: release-notes
+        path: release-notes.md
+        if-no-files-found: error
+
+  bundle_mac_aarch64:
+    needs: verify
+    runs-on: macos-15
+    timeout-minutes: 240
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+    - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+    - name: Print toolchain
+      run: |
+        sw_vers
+        xcodebuild -version
+        xcrun -sdk macosx -f metal
+        df -h .
+    - name: Bundle
+      id: bundle
+      run: script/bundle-zednotes-mac aarch64-apple-darwin
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: zednotes-mac-aarch64
+        path: |
+          ${{ steps.bundle.outputs.dmg_path }}
+          ${{ steps.bundle.outputs.dmg_path }}.sha256
+        if-no-files-found: error
+
+  release:
+    needs: [verify, bundle_mac_aarch64]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        path: artifacts
+        merge-multiple: true
+    - name: Create draft release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        VERSION: ${{ needs.verify.outputs.version }}
+        ZED_VERSION: ${{ needs.verify.outputs.zed_version }}
+        UPSTREAM_COMMIT: ${{ needs.verify.outputs.upstream_commit }}
+      run: |
+        gh release create "$GITHUB_REF_NAME" \
+          --repo "$GITHUB_REPOSITORY" \
+          --draft \
+          --verify-tag \
+          --title "Zednotes ${VERSION} (Zed ${ZED_VERSION} @ ${UPSTREAM_COMMIT:0:7})" \
+          --notes-file artifacts/release-notes.md \
+          artifacts/*.dmg artifacts/*.dmg.sha256

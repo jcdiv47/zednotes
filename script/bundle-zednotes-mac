@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+PIN_FILE="zednotes.toml"
+local_install=false
+
+help_info() {
+  echo "
+Usage: ${0##*/} [options] [architecture=host]
+Build the Zednotes application bundle and DMG for macOS.
+
+Options:
+  -i    Install the resulting app into /Applications.
+  -h    Display this help and exit.
+  "
+}
+
+while getopts 'ih' flag
+do
+    case "${flag}" in
+        i) local_install=true;;
+        h)
+           help_info
+           exit 0
+           ;;
+        *)
+           help_info >&2
+           exit 2
+           ;;
+    esac
+done
+
+shift $((OPTIND-1))
+
+channel=$(<crates/zed/RELEASE_CHANNEL)
+# Zed's auto-updater is disabled on the dev channel. On any other channel it
+# would fetch upstream Zed from zed.dev and replace Zednotes with it.
+if [[ "$channel" != "dev" ]]; then
+    echo "error: crates/zed/RELEASE_CHANNEL is '${channel}'; Zednotes must ship on the dev channel" >&2
+    exit 1
+fi
+export ZED_RELEASE_CHANNEL="${channel}"
+export ZED_BUNDLE=true
+
+# Deal with versions of macOS that don't include libstdc++ headers
+export CXXFLAGS="-stdlib=libc++"
+
+pin="$(
+    python3 - "$PIN_FILE" <<'PY'
+import sys, tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    pin = tomllib.load(handle)
+
+print(pin["zednotes"]["version"], pin["upstream"]["zed_version"], pin["upstream"]["commit"])
+PY
+)"
+read -r zednotes_version zed_version upstream_commit <<<"$pin"
+
+version_info=$(rustc --version --verbose)
+host_line=$(echo "$version_info" | grep host)
+target_triple=${host_line#*: }
+if [[ $# -gt 0 && -n "$1" ]]; then
+    target_triple="$1"
+fi
+
+if [[ "$target_triple" = "x86_64-apple-darwin" ]]; then
+    arch_suffix="x86_64"
+elif [[ "$target_triple" = "aarch64-apple-darwin" ]]; then
+    arch_suffix="aarch64"
+else
+    echo "Unsupported architecture $target_triple"
+    exit 1
+fi
+
+# The Metal shader compiler ships with Xcode, not the Command Line Tools.
+if ! xcrun -sdk macosx -f metal &>/dev/null; then
+    echo "error: the Metal compiler was not found; select a full Xcode with \`sudo xcode-select -s /Applications/Xcode.app\` or set DEVELOPER_DIR" >&2
+    exit 1
+fi
+
+source_revision=$(git rev-parse HEAD)
+source_dirty=false
+if [[ -n "$(git status --porcelain)" ]]; then
+    source_dirty=true
+fi
+
+# Generate the licenses first, so they can be baked into the binaries
+script/generate-licenses
+
+rustup target add "$target_triple"
+
+echo "Compiling Zednotes binaries"
+cargo --config .cargo/bundle-config.toml build --release --package zed --package cli --target "$target_triple"
+
+build_directory="target/${target_triple}/release"
+bundle_directory="${build_directory}/zednotes"
+app_path="${bundle_directory}/Zednotes.app"
+
+echo "Creating application bundle"
+rm -rf "$bundle_directory"
+mkdir -p "${app_path}/Contents/MacOS" "${app_path}/Contents/Resources"
+
+cp "${build_directory}/zed" "${app_path}/Contents/MacOS/zed"
+cp "${build_directory}/cli" "${app_path}/Contents/MacOS/cli"
+strip -x "${app_path}/Contents/MacOS/zed" "${app_path}/Contents/MacOS/cli"
+
+# The launcher gives Zednotes its own settings, extensions, and history so it
+# never shares state with an installed Zed.
+cat > "${app_path}/Contents/MacOS/Zednotes" <<'EOF'
+#!/bin/sh
+set -e
+data_directory="$HOME/Library/Application Support/Zednotes"
+mkdir -p "$data_directory/config"
+exec "$(dirname "$0")/zed" --user-data-dir "$data_directory" "$@"
+EOF
+chmod +x "${app_path}/Contents/MacOS/Zednotes"
+
+cp crates/zed/resources/Zednotes.icns "${app_path}/Contents/Resources/Zednotes.icns"
+
+script/install-pdfium "${app_path}/Contents/MacOS/lib" "$arch_suffix"
+mv "${app_path}/Contents/MacOS/lib/pdfium-licenses" "${app_path}/Contents/Resources/pdfium-licenses"
+
+# The URL scheme and document types from crates/zed/resources/info are left out
+# on purpose, so Zednotes does not take over `zed://` links or file associations
+# from an installed Zed.
+cat > "${app_path}/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>Zednotes</string>
+    <key>CFBundleExecutable</key>
+    <string>Zednotes</string>
+    <key>CFBundleIconFile</key>
+    <string>Zednotes</string>
+    <key>CFBundleIdentifier</key>
+    <string>dev.jcdiv47.Zednotes</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Zednotes</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>${zednotes_version}</string>
+    <key>CFBundleVersion</key>
+    <string>${zednotes_version}</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.productivity</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>10.15.7</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>ZednotesSourceDirty</key>
+    <${source_dirty}/>
+    <key>ZednotesSourceRevision</key>
+    <string>${source_revision}</string>
+    <key>ZednotesUpstreamRevision</key>
+    <string>${upstream_commit}</string>
+</dict>
+</plist>
+EOF
+plutil -lint "${app_path}/Contents/Info.plist"
+
+echo "Signing application bundle (ad-hoc)"
+codesign --force --deep --sign - "$app_path"
+codesign --verify --deep --strict "$app_path"
+
+# GitHub rewrites special characters such as `+` in release asset names, so the
+# `0.7.0+zed.1.22.0` build metadata is spelled with dashes here.
+dmg_name="Zednotes-${zednotes_version}-zed-${zed_version}-${arch_suffix}.dmg"
+dmg_path="${build_directory}/${dmg_name}"
+dmg_source_directory="${bundle_directory}/dmg"
+
+echo "Creating DMG at ${dmg_path}"
+mkdir -p "$dmg_source_directory"
+ditto "$app_path" "${dmg_source_directory}/Zednotes.app"
+ln -s /Applications "${dmg_source_directory}/Applications"
+rm -f "$dmg_path"
+hdiutil create -volname Zednotes -srcfolder "$dmg_source_directory" -ov -format UDZO "$dmg_path"
+# Leaving the /Applications symlink inside the repository makes project scans
+# walk the whole Applications folder.
+rm -rf "$dmg_source_directory"
+
+(cd "$build_directory" && shasum -a 256 "$dmg_name" > "${dmg_name}.sha256")
+
+if [[ "$local_install" = true ]]; then
+    rm -rf /Applications/Zednotes.app
+    ditto "$app_path" /Applications/Zednotes.app
+    echo "Installed /Applications/Zednotes.app"
+fi
+
+if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    echo "dmg_path=${dmg_path}" >> "$GITHUB_OUTPUT"
+fi
+
+echo "Created ${dmg_path}"

@@ -1,0 +1,32 @@
+[package]
+name = "pdf_viewer"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/pdf_viewer.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+image.workspace = true
+kkpdf-zed = { git = "https://github.com/kk376/kkpdf-zed", rev = "4dbe33725a44161175fa38590e7860eaf73355b0" }
+project.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+fs = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+settings = { workspace = true, features = ["test-support"] }
+theme.workspace = true
+theme_settings.workspace = true
+workspace = { workspace = true, features = ["test-support"] }

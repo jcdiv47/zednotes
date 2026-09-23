@@ -106,6 +106,9 @@ mv Cargo.toml.backup Cargo.toml
 popd
 echo "Bundled ${app_path}"
 
+script/install-pdfium "${app_path}/Contents/MacOS/lib" "${target_triple%%-*}"
+mv "${app_path}/Contents/MacOS/lib/pdfium-licenses" "${app_path}/Contents/Resources/pdfium-licenses"
+
 # DocumentTypes.plist references CFBundleTypeIconFile "Document", so the bundle must contain Document.icns.
 # We use the app icon as a placeholder document icon for now.
 document_icon_source="crates/zed/resources/Document.icns"
@@ -200,6 +203,7 @@ function sign_app_binaries() {
 
     if [[ $can_code_sign = true ]]; then
         echo "Code signing binaries"
+        /usr/bin/codesign --force --timestamp --options runtime --sign "$IDENTITY" "${app_path}/Contents/MacOS/lib/libpdfium.dylib" -v
         # sequence of codesign commands modeled after this example: https://developer.apple.com/forums/thread/701514
         /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "${app_path}/Contents/MacOS/cli" -v
         /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "${app_path}/Contents/MacOS/git" -v
